@@ -19,7 +19,7 @@ Usage
 To use the library part of this crate, add the following to your `Cargo.toml`.
 ```toml
 [dependencies]
-cfr = "0.0.1"
+cfr = { version = "0.0.1", default-features = false }
 ```
 
 Then implement [`TerminalNode`](https://docs.rs/cfr/latest/cfr/trait.TerminalNode.html), [`ChanceNode`](https://docs.rs/cfr/latest/cfr/trait.ChanceNode.html), and [`PlayerNode`](https://docs.rs/cfr/latest/cfr/trait.PlayerNode.html) for your relevant
@@ -39,7 +39,7 @@ This package can also be used as a binary utilizing json format. To use first
 install it with
 
 ```bash
-$ cargo install cfr --features=binary
+$ cargo install cfr
 ```
 
 Game trees are defined using a JSON domain specific language that should be
@@ -60,10 +60,21 @@ $ cfr < game.json
 
 The DSL is defined by:
 ```bison
-node     ::= terminal || chance || player
-terminal ::= { "terminal": <number> }
-chance   ::= { "chance": { "<named outcome>": { "prob": <number>, "state": node }, ... } }
-player   ::= { "player": { "player_one": <bool>, "infoset": <string>, "actions": { "<named action>": node, ... } } }
+node      ::= terminal || chance || player
+terminal  ::= { "terminal": <number> }
+chance    ::= {
+                "chance": {
+                  "<named outcome>": { "prob": <number>, "state": node },
+                  ...
+                }
+              }
+player    ::= {
+                "player": {
+                  "player_one": <bool>,
+                  "infoset": <string>,
+                  "actions": { "<named action>": node, ... }
+                }
+              }
 ```
 
 A minimal example highlighting all types of nodes, but of an uninteresting game is:
