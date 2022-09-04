@@ -4,378 +4,360 @@
 //!
 //! # Usage
 //!
-//! To use this library first implement the traits [PlayerNode], [ChanceNode], and [TerminalNode]
-//! for the data of your choice to specify a game tree in a standard [extensive form
-//! game](https://en.wikipedia.org/wiki/Extensive-form_game). From there it can be turned into an
-//! efficient game representation with [Game::from_node]. That game can then be
-//! [solved](Game::solve), before adding the naming information back with [Game::name_strategy].
-//!
-//! If you want to tweak or create your own strategies, you can measure the regret of an arbitrary
-//! compact strategy with [Game::regret].
+//! To use this library, define the [IntoGameNode] trait for the representation of your [extensive
+//! form game](https://en.wikipedia.org/wiki/Extensive-form_game). See the trait for details on how
+//! to implement this. The use of [IntoIterator] allows this conversion to be zero-copy for
+//! expensive types. Once this trait is defined, a [Game] can be created with [Game::from_root].
+//! Compute an approximate equilibrium with `solve_*` methods likes [Game::solve_full]. You can
+//! then get information like utilities and regret from [Strategies::get_info].
 //!
 //! # Examples
 //!
 //! To compute a nash equilibrium, simply define a game by implementing the relevant traits on your
 //! input data, then execute the following functions:
+//!
 //! ```
-//! use cfr::{Game, Solution};
-//! # use cfr::{Node, PlayerNode, ChanceNode, Player, GameError};
-//! # use std::iter::{Empty, empty};
-//! # struct Chance;
-//! # impl ChanceNode for Chance {
-//! #     type PlayerNode = Play;
-//! #     type Outcomes = Empty<(f64, ExNode)>;
-//! #     fn into_outcomes(self) -> Self::Outcomes { empty() }
-//! # }
-//! # struct Play;
-//! # impl PlayerNode for Play {
-//! #     type Infoset = usize;
-//! #     type Action = usize;
-//! #     type ChanceNode = Chance;
-//! #     type Actions = Empty<(usize, ExNode)>;
-//! #     fn get_player(&self) -> Player { Player::One }
-//! #     fn get_infoset(&self) -> usize { 0 }
-//! #     fn into_actions(self) -> Self::Actions { empty() }
-//! # }
-//! # type ExNode = Node<Chance, Play>;
-//! # let my_game = ExNode::Terminal{ player_one_payoff: 0.0 };
-//! // my_game = ...
-//! let game = Game::from_node(my_game).unwrap();
-//! let Solution { regret, strategy } = game.solve_full(1000, 0.1);
-//! let tighter_regret = game.regret(&strategy).unwrap();
-//! let named_strategy = game.name_strategy(&strategy);
+//! use cfr::{GameNode, Game, IntoGameNode};
+//! struct ExData {
+//! }
+//! impl IntoGameNode for ExData {
+//! # type PlayerInfo = ();
+//! # type ChanceInfo = ();
+//! # type Action = ();
+//! # type Actions = Vec<((), ExData)>;
+//! # type Outcomes = Vec<(f64, ExData)>;
+//! # fn into_game_node(self) -> GameNode<Self> { GameNode::Terminal(0.0) }
+//! }
+//! let game = Game::from_root(ExData {
+//! }).unwrap();
+//! let (strats, reg_bounds) = game.solve_full(100, 0.0);
+//! let named = strats.as_named();
+//! let strat_info = strats.get_info();
+//! let regret = strat_info.regret();
 //! ```
 //!
 //! [^cfr]: [Zinkevich, Martin, et al. "Regret minimization in games with incomplete information."
 //!   Advances in neural information processing systems 20
 //!   (2007)](https://proceedings.neurips.cc/paper/2007/file/08d98638c6fcd194a4b1e6992063e944-Paper.pdf).
+//!
 //! [^mccfr]: [Lanctot, Marc, et al. "Monte Carlo sampling for regret minimization in extensive
 //!   games." Advances in neural information processing systems 22
 //!   (2009)](https://proceedings.neurips.cc/paper/2009/file/00411460f7c92d2124a67ea0f4cb5f85-Paper.pdf).
 #![warn(missing_docs)]
-use core::slice;
-use rand::thread_rng;
-use rand_distr::weighted_alias::WeightedAliasIndex;
-use rand_distr::{Distribution, WeightedError};
+
+mod compact;
+mod error;
+mod regret;
+mod solve;
+mod split;
+
+use compact::{Builder, OptBuilder};
+pub use error::{GameError, StratError};
+use solve::{external, vanilla};
+use split::{split_by, split_by_mut};
 use std::borrow::Borrow;
-use std::collections::hash_map::Entry;
+use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::iter::Zip;
-use std::ops::Deref;
-use std::vec;
-
-// ------ //
-// Public //
-// ------ //
-
-// FIXME generally rethink and reorganize these errors
-
-/// Errors that result from game definition errors
-///
-/// If the object passed into [Game::from_node] doesn't conform to necessary
-/// invariants, one of these will be returned.
-#[derive(Debug, PartialEq)]
-pub enum GameError<I, A> {
-    /// Returned when a chance node has no outcomes.
-    EmptyChance,
-    /// Returned when a chance node has a non-positive probability of happening
-    NonPositiveChance {
-        /// The degenerate probability
-        prob: f64,
-    },
-    /// Returned when a chance node has a single outcome.
-    DegenerateChance,
-    /// There are too many outcomes in a chance node
-    TooManyOutcomes,
-    /// Returned when a games infosets don't exhibit perfect recall
-    ///
-    /// If a game does have perfect recall, then a player's infosets must form a tree, that is for
-    /// all game nodes with a given infoset the players previous action node must also share the
-    /// same infoset.
-    ImperfectRecall {
-        /// The player with imperfect recall
-        player: Player,
-        /// The infoset with imperfect recall
-        infoset: I,
-    },
-    /// Returned when a player node has no actions.
-    EmptyPlayer,
-    /// Returned when a player node has a single action
-    DegeneratePlayer,
-    /// Returned when the actions of a player node didn't match the order and values of an earlier
-    /// information set.
-    ///
-    /// Make sure that all nodes with the same player and information set also have the same
-    /// actions in the same order.
-    ActionsNotEqual {
-        /// The player of the node in question.
-        player: Player,
-        /// The information set in question.
-        infoset: I,
-        /// The actions of the node that were different than expected.
-        actions: Vec<A>,
-    },
-    /// Returned when the actions of a player node weren't unique.
-    ///
-    /// Make sure that all actions of a player node are unique.
-    ActionsNotUnique {
-        /// The player of the node in question.
-        player: Player,
-        /// The information set in question.
-        infoset: I,
-        /// The actions of the node that contained at least one duplicate action.
-        actions: Vec<A>,
-    },
-}
-
-impl<I, A> From<WeightedError> for GameError<I, A> {
-    fn from(err: WeightedError) -> Self {
-        match err {
-            WeightedError::NoItem => Self::EmptyChance,
-            WeightedError::InvalidWeight => panic!("unexpected invalid weight"),
-            WeightedError::AllWeightsZero => Self::DegenerateChance,
-            WeightedError::TooMany => Self::TooManyOutcomes,
-        }
-    }
-}
-
-/// Errors that result from incompatible compact strategy representations
-///
-/// If a strategy object passed to a [Game] doesn't match the games information and action
-/// structure (notably [Game::regret]), one of these errors will be returned.
-#[derive(Debug, PartialEq)]
-pub enum CompactError {
-    /// The number of information sets in the the strategy didn't match the number in the game
-    ///
-    /// Make sure that the length of strategy is the same as the original game.
-    InfosetNum {
-        /// The number of information sets in the underlying game.
-        game_num: usize,
-        /// The number of information sets of the passed in strategy.
-        strategy_num: usize,
-    },
-    /// The number of actions in a strategy didn't match the number of actions in the associated
-    /// information set
-    ///
-    /// Make sure that the passed in strategy has the same number of actions as each information
-    /// set in the original game.
-    ActionNum {
-        /// The index where they differed
-        ind: usize,
-        /// The number of actions in the game's information set
-        infoset_actions: usize,
-        /// The number of actions in the passed in strategy
-        strategy_actions: usize,
-    },
-    /// The total probability of all actions in an information set didn't sum one
-    ///
-    /// Try making sure that all games information sets sum to one.
-    StratNotProbability {
-        /// The information set index that's strategies didn't sum to one.
-        ind: usize,
-        /// The total probability the information set's actions did sum to.
-        total_prob: f64,
-    },
-}
-
-/// Errors that result from incompatible strategy representation
-///
-/// If a strategy object passed to [Game::compact_strategy] doesn't match the games information and action
-/// structure, one of these errors will be returned.
-#[derive(Debug, PartialEq)]
-pub enum StratError<I, A> {
-    /// Returned when the game doesn't have an action for the infoset of the specified player
-    ///
-    /// The player may not ever see the infoset, or the action may be an invalid action for the
-    /// specified infoset.
-    InvalidInfosetAction {
-        /// The player corresponding to the invalid action
-        player: Player,
-        /// The invalid infoset
-        infoset: I,
-        /// The invalid action
-        action: A,
-    },
-    /// Returned when a probability for an action isn't in [0, 1]
-    InvalidProbability {
-        /// The player corresponding to the invalid probability
-        player: Player,
-        /// The valid infoset with the invalid probability
-        infoset: I,
-        /// The valid action with the invalid probability
-        action: A,
-        /// The invalid probability
-        prob: f64,
-    },
-    /// Returned when the total probability of each action in an infoset doesn't sum to one
-    InvalidInfosetProbability {
-        /// The player corresponding to the invalid infoset
-        player: Player,
-        /// The infoset where the probability doesn't sum to one
-        infoset: I,
-        /// The total probability of the infoset
-        total_prob: f64,
-    },
-}
+use std::iter::{self, FusedIterator, Once, Zip};
+use std::ptr;
+use std::slice;
 
 /// An enum indicating which player a state in the tree belongs to
 #[derive(Debug, Copy, Eq, Clone, PartialEq, Hash)]
-pub enum Player {
+pub enum PlayerNum {
     /// The first player
     One,
     /// The second player
     Two,
 }
 
-impl Player {
-    fn ind(&self) -> usize {
-        match self {
-            Player::One => 0,
-            Player::Two => 1,
+impl PlayerNum {
+    fn ind<'a, T>(&self, arr: &'a [T; 2]) -> &'a T {
+        match (self, arr) {
+            (PlayerNum::One, [first, _]) => first,
+            (PlayerNum::Two, [_, second]) => second,
+        }
+    }
+
+    fn ind_mut<'a, T>(&self, arr: &'a mut [T; 2]) -> &'a mut T {
+        match (self, arr) {
+            (PlayerNum::One, [first, _]) => first,
+            (PlayerNum::Two, [_, second]) => second,
         }
     }
 }
 
-/// An enum for distinguishing between game node types
+/// An intemediary representation of a node in a game tree
 ///
-/// A game node can be one of a terminal node with the payoff for player one, a chance node with a
-/// fixed probability of advancing, or a player node indicating a place where a player can make a
-/// decision.
+/// This enum represents a conversion type from custom data to a game node that can be turned
+/// into a full game representation. By implementing [IntoGameNode] on a custom tree-like object,
+/// you can specify a lazy allocation into the internal representation of a game, and then perform
+/// the conversion with [Game::from_root].
 #[derive(Debug)]
-pub enum Node<C, P> {
-    /// A terminal node, the game is over
-    Terminal {
-        /// The payoff to player one at this conclusion
-        ///
-        /// The payoff to player two is inherently the negative of this.
-        player_one_payoff: f64,
-    },
-    /// A chance node, the game advances independent of player action
-    Chance(C),
-    /// a node in the tree where the player can choose between different actions
-    Player(P),
-}
-
-/// A node with several outcomes, each which has a different probability of outcome
-///
-/// This node represents randomness in the game independent of player action. Each outcome should
-/// have a positive weight proportional to its probability of happening.
-pub trait ChanceNode: Sized {
-    type PlayerNode;
-    type Outcomes: IntoIterator<Item=(f64, Node<Self, Self::PlayerNode>)>;
-
-    fn into_outcomes(self) -> Self::Outcomes;
-}
-
-/// A node indicating a player decision point in the game
-///
-/// Nodes are iterables over an action the player can choose and future states. In addition, player
-/// nodes must have an assigned player who's acting, and a marker for the information set
-/// indicating what the player knows at this stage of the game.
-pub trait PlayerNode: Sized {
-    type Infoset;
-    type Action;
-    type ChanceNode;
-    type Actions: IntoIterator<Item = (Self::Action, Node<Self::ChanceNode, Self>)>;
-
-    /// Get the player who's acting at this node in the game tree
-    fn get_player(&self) -> Player;
-
-    /// Get the information set of this game node
+pub enum GameNode<T: IntoGameNode + ?Sized> {
+    /// A terminal node represents the end of a game, and should return the payoff to player one
+    Terminal(f64),
+    /// A chance node selects randomly between several outcomes
     ///
-    /// An information set serves as a comapct representation of the information that a player has
-    /// available when making a decision. A payer can not distinguish (and thus must play the same
-    /// strategy) at each node that has the same information set.
-    fn get_infoset(&self) -> Self::Infoset;
-
-    fn into_actions(self) -> Self::Actions;
+    /// The first element of the chance node is an optional infoset, if omitted its assumed this
+    /// chance node has a unique infoset. Chance nodes with the same infoset must have the same
+    /// outcome probabilities in the same order. When random sampling, chance nodes with the same
+    /// infoset will be sampled the same way.
+    ///
+    /// The second element should implement [IntoIterator] with an `Item` that's a tuple of outcome
+    /// probabilities, and a type that can be converted into a [GameNode].
+    Chance(Option<T::ChanceInfo>, T::Outcomes),
+    /// A player node indicate a place where agents make a strategic decision
+    ///
+    /// The first element is which player number this node corresponds to.
+    ///
+    /// The second element is the infoset of this node. Nodes with the same infoset must specify
+    /// the same actions in the same order.
+    ///
+    /// The final element should implement [IntoIterator] with an `Item` that's a tuple of an
+    /// action and a type that can be converted into a [GameNode].
+    Player(PlayerNum, T::PlayerInfo, T::Actions),
 }
 
-// --------- //
-// Internals //
-// --------- //
+/// A trait that defines how to convert game-tree-like data into a [Game]
+///
+/// Define this trait on your custom data type to allow zero-copy conversion into the internal game
+/// tree representation to enable game solving. There are a lot of associated types that define how
+/// your game is represented.
+///
+/// The trait ultimately resolves to converting each of your tree nodes into a coresponding
+/// [GameNode] that contains all the information necessary for the internal game structure.
+///
+/// # Examples
+///
+/// If you're constructing your data from scratch and don't have a custom representation then the
+/// easiest way to structure your data is with a custom singleton wrapper. Any data types that fix
+/// the required contracts should work in this scenario, but note that information sets are defined
+/// by the order of actions, so using a structure without consistent iteration order could cause
+/// exceptions when trying to create a full game.
+///
+/// ```
+/// # use cfr::{GameNode, IntoGameNode, Game, PlayerNum};
+/// struct Node(GameNode<Node>);
+///
+/// #[derive(Hash, PartialEq, Eq)]
+/// enum Impossible {}
+///
+/// impl IntoGameNode for Node {
+///     type PlayerInfo = u64;
+///     type Action = String;
+///     type ChanceInfo = Impossible;
+///     type Outcomes = Vec<(f64, Node)>;
+///     type Actions = Vec<(String, Node)>;
+///
+///     fn into_game_node(self) -> GameNode<Self> {
+///         self.0
+///     }
+/// }
+///
+/// let game = Game::from_root(
+///     Node(GameNode::Player(PlayerNum::One, 1, vec![
+///         ("fixed".into(), Node(GameNode::Terminal(0.0))),
+///         ("random".into(), Node(GameNode::Chance(None, vec![
+///             (0.5, Node(GameNode::Terminal(1.0))),
+///             (0.5, Node(GameNode::Terminal(-1.0))),
+///         ]))),
+///     ]))
+/// );
+/// ```
+///
+/// However, this can also be used to create more advanced games in a lazy manner. This example is
+/// only to illustrate how you would do that.
+///
+/// ```
+/// # use cfr::{GameNode, IntoGameNode, Game, PlayerNum};
+/// struct Node(u64);
+///
+/// #[derive(Hash, PartialEq, Eq)]
+/// enum Impossible {}
+///
+/// struct ActionIter(u64);
+///
+/// impl Iterator for ActionIter {
+///     type Item = (u64, Node);
+///
+///     fn next(&mut self) -> Option<Self::Item> {
+///         if self.0 > 2 {
+///             self.0 -= 2;
+///             Some((self.0, Node(self.0)))
+///         } else {
+///             None
+///         }
+///     }
+/// }
+///
+/// impl IntoGameNode for Node {
+///     type PlayerInfo = u64;
+///     type Action = u64;
+///     type ChanceInfo = Impossible;
+///     type Outcomes = [(f64, Node); 0];
+///     type Actions = ActionIter;
+///
+///     fn into_game_node(self) -> GameNode<Self> {
+///         if self.0 == 0 {
+///             GameNode::Terminal(0.0)
+///         } else {
+///             let num = if self.0 % 2 == 0 {
+///                 PlayerNum::One
+///             } else {
+///                 PlayerNum::Two
+///             };
+///             GameNode::Player(num, self.0, ActionIter(self.0 + 1))
+///         }
+///     }
+/// }
+///
+/// let game = Game::from_root(Node(6));
+/// ```
+pub trait IntoGameNode {
+    /// The type for player information sets
+    ///
+    /// All nodes that have the same player information set are indistinguishable from each other.
+    /// That means that they must have the same actions available in the same order. In addition,
+    /// this library only works for games with perfect recall, which means that a player can't
+    /// forget their own actions. Another way to states this is that all nodes with the same
+    /// infoset must all have follow the same infoset for that player.
+    type PlayerInfo: Eq;
+    /// The type of the player action
+    ///
+    /// Player nodes have an iterator of actions attached to future states. The actual action
+    /// representation isn't that important, but infosets must have the same actions in the same
+    /// order. When converting a set of strategies back into their named representations, these
+    /// will be used to represent them.
+    type Action: Eq;
+    /// The information set type for chance nodes
+    ///
+    /// Chance node information sets have the same identical actions restrictions that player
+    /// infosets do, but don't require perfect recall. The benefit of specifying chance infosets is
+    /// that sampling based methods can preserve the correlation in sampling which helps
+    /// convergence. For example if chance is revealing cards, later draws may be independent of
+    /// player actions, and so should be in the same infoset.
+    ///
+    /// Since these only help convergence, they are optional. If you know these are unspecified,
+    /// this should be set to the `!` type, or any empty type.
+    type ChanceInfo: Eq;
+    /// The type for iterating over the actions in a chance node
+    type Outcomes: IntoIterator<Item = (f64, Self)>;
+    /// The type for iterating over the actions in a player nodes
+    type Actions: IntoIterator<Item = (Self::Action, Self)>;
+
+    /// Convert this type into a `GameNode`
+    ///
+    /// Note that the GameNode is just an intemediary representation meant to convert custom types
+    /// into a [Game].
+    fn into_game_node(self) -> GameNode<Self>;
+}
 
 #[derive(Debug)]
-struct Random {
-    outcomes: Box<[(f64, Vertex)]>,
-    // NOTE that alias sampling will increase creation time and memory
-    sampler: WeightedAliasIndex<f64>,
-}
-
-impl Random {
-    fn new(data: impl Into<Box<[(f64, Vertex)]>>) -> Result<Random, WeightedError> {
-        let outcomes = data.into();
-        let sampler = WeightedAliasIndex::new(outcomes.iter().map(|(w, _)| *w).collect())?;
-        Ok(Random { outcomes, sampler })
-    }
-
-    fn sample_vertex(&self) -> &Vertex {
-        let ind = self.sampler.sample(&mut thread_rng());
-        let (_, vert) = &self.outcomes[ind];
-        vert
-    }
+enum Node {
+    /// A terminal node, the game is over the payoff to player one
+    Terminal(f64),
+    /// A chance node, the game advances independent of player action
+    Chance(Chance),
+    /// a node in the tree where the player can choose between different actions
+    Player(Player),
 }
 
 #[derive(Debug)]
-struct Agent {
-    player: Player,
+struct Chance {
+    outcomes: Box<[Node]>,
     infoset: usize,
-    actions: Box<[Vertex]>,
 }
 
-type Vertex = Node<Random, Agent>;
+impl Chance {
+    fn new(data: impl Into<Box<[Node]>>, infoset: usize) -> Chance {
+        let outcomes = data.into();
+        Chance { outcomes, infoset }
+    }
+}
 
 #[derive(Debug)]
-struct Infoset<I, A> {
-    player: Player,
+struct Player {
+    num: PlayerNum,
+    infoset: usize,
+    actions: Box<[Node]>,
+}
+
+#[derive(Debug)]
+struct ChanceInfosetData {
+    probs: Box<[f64]>,
+}
+
+impl ChanceInfosetData {
+    fn new(data: impl Into<Box<[f64]>>) -> ChanceInfosetData {
+        ChanceInfosetData { probs: data.into() }
+    }
+}
+
+/// This is a builder for played infosets
+///
+/// It omits the actual infoset because we need to as a key, when inpacking back into a vec we'll
+/// take ownership again.
+#[derive(Debug)]
+struct PlayerInfosetBuilder<A> {
+    actions: Box<[A]>,
+    prev_infoset: Option<usize>,
+}
+
+impl<A> PlayerInfosetBuilder<A> {
+    fn new(actions: impl Into<Box<[A]>>, prev_infoset: Option<usize>) -> Self {
+        PlayerInfosetBuilder {
+            actions: actions.into(),
+            prev_infoset,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlayerInfosetData<I, A> {
     infoset: I,
     actions: Box<[A]>,
-    prev_infoset: usize,
+    prev_infoset: Option<usize>,
 }
 
-impl<I, A> Infoset<I, A> {
-    fn new(
-        player: Player,
-        infoset: I,
-        actions: impl Into<Box<[A]>>,
-        prev_infoset: Option<usize>,
-    ) -> Infoset<I, A> {
-        assert_ne!(
-            prev_infoset,
-            Some(usize::MAX),
-            "can't process more than a machine word of infosets"
-        );
-        Infoset {
-            player,
+impl<I, A> PlayerInfosetData<I, A> {
+    fn new(infoset: I, builder: PlayerInfosetBuilder<A>) -> Self {
+        PlayerInfosetData {
             infoset,
-            actions: actions.into(),
-            prev_infoset: prev_infoset.unwrap_or(usize::MAX),
+            actions: builder.actions,
+            prev_infoset: builder.prev_infoset,
         }
-    }
-}
-
-trait AgnosticInfoset {
-    fn player(&self) -> Player;
-    fn num_actions(&self) -> usize;
-    fn prev_infoset(&self) -> Option<usize>;
-}
-
-impl<I, A> AgnosticInfoset for Infoset<I, A> {
-    fn player(&self) -> Player {
-        self.player
     }
 
     fn num_actions(&self) -> usize {
         self.actions.len()
     }
+}
+
+trait PlayerInfoset {
+    fn num_actions(&self) -> usize;
+
+    fn prev_infoset(&self) -> Option<usize>;
+}
+
+impl<I, A> PlayerInfoset for PlayerInfosetData<I, A> {
+    fn num_actions(&self) -> usize {
+        self.num_actions()
+    }
 
     fn prev_infoset(&self) -> Option<usize> {
-        if self.prev_infoset == usize::MAX {
-            None
-        } else {
-            Some(self.prev_infoset)
-        }
+        self.prev_infoset
+    }
+}
+
+trait ChanceInfoset {
+    fn probs(&self) -> &[f64];
+}
+
+impl ChanceInfoset for ChanceInfosetData {
+    fn probs(&self) -> &[f64] {
+        &self.probs
     }
 }
 
@@ -383,136 +365,208 @@ impl<I, A> AgnosticInfoset for Infoset<I, A> {
 /// and computing regret of strategies.
 #[derive(Debug)]
 pub struct Game<I, A> {
-    infosets: Box<[Infoset<I, A>]>,
-    start: Vertex,
+    chance_infosets: Box<[ChanceInfosetData]>,
+    player_infosets: [Box<[PlayerInfosetData<I, A>]>; 2],
+    single_infosets: [Box<[(I, A)]>; 2],
+    root: Node,
 }
 
-impl<I, A> Game<I, A> {
+impl<I, A> PartialEq for Game<I, A> {
+    fn eq(&self, other: &Self) -> bool {
+        ptr::eq(self, other)
+    }
+}
+
+impl<I, A> Eq for Game<I, A> {}
+
+impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
     /// Create a game from the root node of an arbitrary game tree
     ///
-    /// # Examples
-    ///
-    /// FIXME
-    pub fn from_node<C, P>(start: Node<C, P>) -> Result<Game<I, A>, GameError<I, A>>
+    /// To create a game from data, the data must implement [Into<GameNode<...>>].
+    pub fn from_root<T>(root: T) -> Result<Self, GameError>
     where
-        I: Hash + Eq + Clone,
-        A: Hash + Eq,
-        C: ChanceNode<PlayerNode=P>,
-        P: PlayerNode<Infoset=I, Action=A, ChanceNode=C>,
+        T: IntoGameNode<PlayerInfo = I, Action = A>,
+        T::ChanceInfo: Hash + Eq,
     {
-        let mut infosets = Vec::new();
-        let mut inds = HashMap::<(Player, I), usize>::new();
-        let start = Game::recurse_vertex_from_node(&mut infosets, &mut inds, start, [None; 2])?;
-
+        let mut chance_infosets = OptBuilder::new();
+        let mut player_infosets = [Builder::new(), Builder::new()];
+        let mut single_infosets = [HashMap::new(), HashMap::new()];
+        let [first_player, second_player] = &mut player_infosets;
+        let [first_single, second_single] = &mut single_infosets;
+        let root = Game::init_recurse(
+            &mut chance_infosets,
+            &mut [first_player, second_player],
+            &mut [first_single, second_single],
+            root,
+            [None; 2],
+        )?;
         Ok(Game {
-            infosets: infosets.into_boxed_slice(),
-            start,
+            chance_infosets: chance_infosets.into_iter().map(|(_, v)| v).collect(),
+            player_infosets: player_infosets.map(|pinfo| {
+                pinfo
+                    .into_iter()
+                    .map(|(infoset, builder)| PlayerInfosetData::new(infoset, builder))
+                    .collect()
+            }),
+            single_infosets: single_infosets.map(|sinfo| sinfo.into_iter().collect()),
+            root,
         })
     }
 
-    fn recurse_vertex_from_node<C, P>(
-        infosets: &mut Vec<Infoset<I, A>>,
-        inds: &mut HashMap<(Player, I), usize>,
-        node: Node<C, P>,
+    fn init_recurse<T>(
+        chance_infosets: &mut OptBuilder<T::ChanceInfo, ChanceInfosetData>,
+        player_infosets: &mut [&mut Builder<I, PlayerInfosetBuilder<A>>; 2],
+        single_infosets: &mut [&mut HashMap<I, A>; 2],
+        node: T,
         mut prev_infosets: [Option<usize>; 2],
-    ) -> Result<Vertex, GameError<I, A>>
+    ) -> Result<Node, GameError>
     where
-        I: Hash + Eq + Clone,
-        A: Hash + Eq,
-        C: ChanceNode<PlayerNode=P>,
-        P: PlayerNode<Infoset=I, Action=A, ChanceNode=C>,
+        T: IntoGameNode<PlayerInfo = I, Action = A>,
+        T::ChanceInfo: Hash + Eq,
     {
-        match node {
-            Node::Terminal { player_one_payoff } => Ok(Vertex::Terminal { player_one_payoff }),
-            Node::Chance(chance) => {
-                let mut total = 0.0;
+        match node.into_game_node() {
+            GameNode::Terminal(payoff) => Ok(Node::Terminal(payoff)),
+            GameNode::Chance(info, raw_outcomes) => {
+                let mut probs = Vec::new();
                 let mut outcomes = Vec::new();
-                for (prob, next) in chance.into_outcomes() {
-                    if prob <= 0.0 || !prob.is_finite() {
-                        Err(GameError::NonPositiveChance { prob })
+                for (prob, next) in raw_outcomes {
+                    if prob > 0.0 && prob.is_finite() {
+                        probs.push(prob);
+                        outcomes.push(Game::init_recurse(
+                            chance_infosets,
+                            player_infosets,
+                            single_infosets,
+                            next,
+                            prev_infosets,
+                        )?);
                     } else {
-                        let next_vert =
-                            Game::recurse_vertex_from_node(infosets, inds, next, prev_infosets)?;
-                        outcomes.push((prob, next_vert));
-                        total += prob;
-                        Ok(())
-                    }?;
+                        return Err(GameError::NonPositiveChance);
+                    };
                 }
-                if outcomes.is_empty() {
-                    Err(GameError::EmptyChance)
-                } else if outcomes.len() == 1 {
-                    Err(GameError::DegenerateChance)
-                } else {
-                    // renormalize to make sure consistency
-                    for (prob, _) in &mut outcomes {
-                        *prob /= total;
+
+                match outcomes.len() {
+                    0 => Err(GameError::EmptyChance),
+                    1 => Ok(outcomes.pop().unwrap()),
+                    _ => {
+                        // renormalize to make sure consistency
+                        let total: f64 = probs.iter().sum();
+                        for prob in &mut probs {
+                            *prob /= total;
+                        }
+                        let ind = match chance_infosets.entry(info) {
+                            compact::Entry::Vacant(ent) => {
+                                ent.insert(ChanceInfosetData::new(probs))
+                            }
+                            compact::Entry::Occupied(ent) => {
+                                let (ind, data) = ent.get();
+                                if *data.probs != *probs {
+                                    Err(GameError::ProbabilitiesNotEqual)
+                                } else {
+                                    Ok(ind)
+                                }?
+                            }
+                        };
+                        Ok(Node::Chance(Chance::new(outcomes, ind)))
                     }
-                    Ok(Vertex::Chance(Random::new(outcomes)?))
                 }
             }
-            Node::Player(play) => {
-                let player = play.get_player();
-                let infoset = play.get_infoset();
+            GameNode::Player(player_num, infoset, raw_actions) => {
                 let mut actions = Vec::new();
                 let mut nexts = Vec::new();
-                for (action, next) in play.into_actions() {
+                for (action, next) in raw_actions {
                     actions.push(action);
                     nexts.push(next);
                 }
                 match actions.len() {
                     0 => Err(GameError::EmptyPlayer),
-                    1 => Err(GameError::DegeneratePlayer),
-                    _ => Ok(()),
-                }?;
-                let info_ind = match inds.entry((player, infoset.clone())) {
-                    Entry::Occupied(ent) => {
-                        let ind = ent.get();
-                        let info = &mut infosets[*ind];
-                        if *info.actions != *actions {
-                            Err(GameError::ActionsNotEqual {
-                                player,
-                                infoset,
-                                actions,
-                            })
-                        } else if info.prev_infoset() != prev_infosets[player.ind()] {
-                            Err(GameError::ImperfectRecall { player, infoset })
-                        } else {
-                            Ok(*ind)
-                        }
+                    1 => {
+                        let action = actions.pop().unwrap();
+                        match player_num.ind_mut(single_infosets).entry(infoset) {
+                            hash_map::Entry::Occupied(ent) => {
+                                if ent.get() != &action {
+                                    return Err(GameError::ActionsNotEqual);
+                                }
+                            }
+                            hash_map::Entry::Vacant(ent) => {
+                                ent.insert(action);
+                            }
+                        };
+                        let next = nexts.pop().unwrap();
+                        Game::init_recurse(
+                            chance_infosets,
+                            player_infosets,
+                            single_infosets,
+                            next,
+                            prev_infosets,
+                        )
                     }
-                    Entry::Vacant(ent) => {
-                        let hash_names: HashSet<&A> = actions.iter().collect();
-                        if hash_names.len() == actions.len() {
-                            let info = infosets.len();
-                            infosets.push(Infoset::new(
-                                player,
-                                infoset,
-                                actions.into_boxed_slice(),
-                                prev_infosets[player.ind()],
-                            ));
-                            ent.insert(info);
-                            Ok(info)
-                        } else {
-                            Err(GameError::ActionsNotUnique {
-                                player,
-                                infoset,
-                                actions,
+                    _ => {
+                        let info_ind = match player_num.ind_mut(player_infosets).entry(infoset) {
+                            compact::Entry::Occupied(ent) => {
+                                let (ind, info) = ent.get();
+                                if *info.actions != *actions {
+                                    Err(GameError::ActionsNotEqual)
+                                } else if &info.prev_infoset != player_num.ind(&prev_infosets) {
+                                    Err(GameError::ImperfectRecall)
+                                } else {
+                                    Ok(ind)
+                                }
+                            }
+                            compact::Entry::Vacant(ent) => {
+                                let hash_names: HashSet<&A> = actions.iter().collect();
+                                if hash_names.len() == actions.len() {
+                                    Ok(ent.insert(PlayerInfosetBuilder::new(
+                                        actions,
+                                        *player_num.ind(&prev_infosets),
+                                    )))
+                                } else {
+                                    Err(GameError::ActionsNotUnique)
+                                }
+                            }
+                        }?;
+                        *player_num.ind_mut(&mut prev_infosets) = Some(info_ind);
+                        let next_verts: Result<Box<[_]>, _> = nexts
+                            .into_iter()
+                            .map(|next| {
+                                Game::init_recurse(
+                                    chance_infosets,
+                                    player_infosets,
+                                    single_infosets,
+                                    next,
+                                    prev_infosets,
+                                )
                             })
-                        }
+                            .collect();
+                        Ok(Node::Player(Player {
+                            num: player_num,
+                            infoset: info_ind,
+                            actions: next_verts?,
+                        }))
                     }
-                }?;
-                prev_infosets[player.ind()] = Some(info_ind);
-                let next_verts = nexts
-                    .into_iter()
-                    .map(|next| Game::recurse_vertex_from_node(infosets, inds, next, prev_infosets))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Vertex::Player(Agent {
-                    player,
-                    infoset: info_ind,
-                    actions: next_verts.into_boxed_slice(),
-                }))
+                }
             }
         }
+    }
+}
+
+impl<I, A> Game<I, A> {
+    /// Find an approximate Nash equilibrium of the current game
+    ///
+    /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
+    /// that it's found a solution with regret smaller than `max_reg`.
+    ///
+    /// This uses the full vanilla CFR algorithm which is deterministc, but tends to have worse
+    /// convergence than [Game::solve_sampled] or [Game::solve_external].
+    pub fn solve_full(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
+        let [first_player, second_player] = &self.player_infosets;
+        let (regrets, probs) = vanilla::solve_full(
+            &self.root,
+            &self.chance_infosets,
+            [first_player, second_player],
+            max_iter,
+            max_reg,
+        );
+        (Strategies { game: self, probs }, regrets)
     }
 
     /// Find an approximate Nash equilibrium of the current game
@@ -520,1570 +574,571 @@ impl<I, A> Game<I, A> {
     /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
     /// that it's found a solution with regret smaller than `max_reg`.
     ///
-    /// # Examples
-    ///
-    /// FIXME
-    pub fn solve_full(&self, max_iter: u64, max_reg: f64) -> Solution {
-        full::solve(&self.start, &self.infosets, max_iter, max_reg)
+    /// This uses the sampled CFR algorithm, where chance nodes are sampled, but both player nodes
+    /// are expanded each iteration.
+    pub fn solve_sampled(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
+        let [first_player, second_player] = &self.player_infosets;
+        let (regrets, probs) = vanilla::solve_sampled(
+            &self.root,
+            &self.chance_infosets,
+            [first_player, second_player],
+            max_iter,
+            max_reg,
+        );
+        (Strategies { game: self, probs }, regrets)
     }
 
-    /// FIXME document, also name this like the actual method it uses
-    /// Lanctot 2009
-    pub fn solve_external(&self, max_steps: u64, step_size: u64, max_reg: f64) -> Solution {
-        external::solve(&self.start, &self.infosets, max_steps, step_size, max_reg)
+    /// Find an approximate Nash equilibrium of the current game
+    ///
+    /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
+    /// that it's found a solution with regret smaller than `max_reg`.
+    ///
+    /// This uses the external CFR algorithm, where chance nodes and the oposing player's
+    /// strategies are sampled at each iteraton.
+    pub fn solve_external(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
+        let [first_player, second_player] = &self.player_infosets;
+        let (regrets, probs) = external::solve_external(
+            &self.root,
+            &self.chance_infosets,
+            [first_player, second_player],
+            max_iter,
+            max_reg,
+        );
+        (Strategies { game: self, probs }, regrets)
     }
+}
 
-    /// Compute the regret of a strategy like object
+impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
+    /// Convert a named strategy into [Strategies]
     ///
-    /// # Examples
+    /// # Example
     ///
-    /// FIXME
-    // FIXME I should change these strategy implementations to the minimum type required to
-    // actually do what this specific method needs, e.g. if it needs iterable, then iterable, if it
-    // needs index then that, etc. IT should be such that the dense strategy implementation works
-    // for all of them.
-    pub fn regret(&self, strategy: &[impl AsRef<[f64]>]) -> Result<EquilibriumInfo, CompactError> {
-        regret::regret(&self.start, &self.infosets, strategy)
-    }
-
-    /// attach player, infoset, and action information to a strategy
-    ///
-    /// # Examples
-    ///
-    /// FIXME
-    pub fn name_strategy<'a, R>(
-        &'a self,
-        strategy: &'a [R],
-    ) -> Result<NamedStrategies<'a, I, A, R>, CompactError>
-    where
-        R: AsRef<[f64]>,
-    {
-        validate_strategy(&self.infosets, strategy)?;
-        Ok((
-            NamedStrategyIter::new(Player::One, &self.infosets, strategy),
-            NamedStrategyIter::new(Player::Two, &self.infosets, strategy),
-        ))
-    }
-
-    /// convert a named strategy representation into a compact representation that can be used for
-    /// regret calculation
-    ///
-    /// # Examples
-    ///
-    /// FIXME
-    ///
-    /// # Remarks
-    ///
-    /// The clone attribute is only necessary for returning error messages with extra information.
-    /// In principle it's possible to avoid cloning, but at the cost of an uglier interface.
-    pub fn compact_strategy(
+    /// ```
+    /// use std::collections::HashMap;
+    /// # use cfr::{GameNode, Game, IntoGameNode, PlayerNum};
+    /// # struct Node(GameNode<Node>);
+    /// # impl IntoGameNode for Node {
+    /// # type PlayerInfo = &'static str;
+    /// # type Action = &'static str;
+    /// # type ChanceInfo = &'static str;
+    /// # type Outcomes = Vec<(f64, Node)>;
+    /// # type Actions = Vec<(&'static str, Node)>;
+    /// # fn into_game_node(self) -> GameNode<Self> { self.0 }
+    /// # }
+    /// let game = Game::from_root(
+    /// # Node(GameNode::Chance(None, vec![
+    /// #     (0.5, Node(GameNode::Player(PlayerNum::One, "info", vec![
+    /// #         ("A", Node(GameNode::Terminal(0.0))),
+    /// #         ("B", Node(GameNode::Terminal(0.0))),
+    /// #     ]))),
+    /// #     (0.5, Node(GameNode::Player(PlayerNum::Two, "info", vec![
+    /// #         ("1", Node(GameNode::Terminal(0.0))),
+    /// #         ("2", Node(GameNode::Terminal(0.0))),
+    /// #     ]))),
+    /// # ]))
+    /// ).unwrap();
+    /// let one: HashMap<&'static str, HashMap<&'static str, f64>> = [
+    ///     ("info", [("A", 0.2), ("B", 0.8)].into())
+    /// ].into();
+    /// let two: HashMap<&'static str, HashMap<&'static str, f64>> = [
+    ///     ("info", [("1", 0.5), ("2", 0.5)].into())
+    /// ].into();
+    /// let strat = game.from_named([one, two]).unwrap();
+    /// let info = strat.get_info();
+    /// info.regret();
+    /// ```
+    pub fn from_named(
         &self,
-        one: impl IntoIterator<Item = (impl Borrow<I>, impl Borrow<A>, impl Borrow<f64>)>,
-        two: impl IntoIterator<Item = (impl Borrow<I>, impl Borrow<A>, impl Borrow<f64>)>,
-    ) -> Result<DenseStrategy, StratError<I, A>>
-    where
-        I: Eq + Hash + Clone,
-        A: Eq + Hash + Clone,
-    {
-        let mut one_inds = HashMap::new();
-        let mut two_inds = HashMap::new();
-        for (ii, infoset) in self.infosets.iter().enumerate() {
-            let inds = match infoset.player {
-                Player::One => &mut one_inds,
-                Player::Two => &mut two_inds,
-            };
-            for (ai, act) in infoset.actions.iter().enumerate() {
-                inds.insert((&infoset.infoset, act), (ii, ai));
-            }
-        }
-
-        let mut strategy: Vec<_> = self
-            .infosets
-            .iter()
-            .map(|info| vec![0.0; info.actions.len()].into_boxed_slice())
-            .collect();
-        Self::assign_from_named(Player::One, one, one_inds, &mut strategy)?;
-        Self::assign_from_named(Player::Two, two, two_inds, &mut strategy)?;
-
-        for (strat, info) in strategy.iter_mut().zip(self.infosets.iter()) {
-            let total: f64 = strat.iter().sum();
-            if (total - 1.0).abs() > 1e-6 {
-                Err(StratError::InvalidInfosetProbability {
-                    player: info.player,
-                    infoset: info.infoset.clone(),
-                    total_prob: total,
-                })
-            } else {
-                // normalize
-                for prob in strat.iter_mut() {
-                    *prob /= total
-                }
-                Ok(())
-            }?;
-        }
-
-        Ok(DenseStrategy(strategy.into_boxed_slice()))
-    }
-
-    fn assign_from_named<'a>(
-        player: Player,
-        named_strat: impl IntoIterator<Item = (impl Borrow<I>, impl Borrow<A>, impl Borrow<f64>)>,
-        inds: HashMap<(&'a I, &'a A), (usize, usize)>,
-        strategy: &mut [Box<[f64]>],
-    ) -> Result<(), StratError<I, A>>
-    where
-        I: Eq + Hash + Clone,
-        A: Eq + Hash + Clone,
-    {
-        for (binfoset, baction, bprob) in named_strat {
-            let infoset = binfoset.borrow();
-            let action = baction.borrow();
-            let prob = bprob.borrow();
-            match inds.get(&(infoset, action)) {
-                Some(&(ii, ai)) if (0.0..=1.0).contains(prob) => {
-                    strategy[ii][ai] = *prob;
-                    Ok(())
-                }
-                None => Err(StratError::InvalidInfosetAction {
-                    player,
-                    infoset: infoset.clone(),
-                    action: action.clone(),
-                }),
-                _ => Err(StratError::InvalidProbability {
-                    player,
-                    infoset: infoset.clone(),
-                    action: action.clone(),
-                    prob: *prob,
-                }),
-            }?;
-        }
-        Ok(())
-    }
-}
-
-/// This is a module the implements the full vanilla counter-factual regret minimization algorithm
-mod full {
-    use super::{AgnosticInfoset, DenseStrategy, Node, Player, Solution, Vertex};
-
-    #[derive(Debug)]
-    struct RegretInfoset {
-        // TODO this could be updated to have one buffer of heap memory that we chunk since we know the
-        // chunks will have the same size.
-        cum_regret: Box<[f64]>,
-        utils: Box<[f64]>,
-        probs: Box<[f64]>,
-        cum_probs: Box<[f64]>,
-        prob_reach: f64,
-        cum_prob_reach: f64,
-    }
-
-    impl RegretInfoset {
-        fn new(num_actions: usize) -> RegretInfoset {
-            RegretInfoset {
-                cum_regret: vec![0.0; num_actions].into_boxed_slice(),
-                utils: vec![0.0; num_actions].into_boxed_slice(),
-                probs: vec![1.0 / num_actions as f64; num_actions].into_boxed_slice(),
-                cum_probs: vec![0.0; num_actions].into_boxed_slice(),
-                prob_reach: 0.0,
-                cum_prob_reach: 0.0,
-            }
-        }
-
-        fn update(&mut self, cardinal_iter: u64) -> f64 {
-            // compute expected utility
-            let expected_util: f64 = self
-                .utils
-                .iter()
-                .zip(self.probs.iter())
-                .map(|(util, prob)| util * prob)
-                .sum();
-            // use expected utility to update cumulative average regret
-            let mut avg_reg = 0.0;
-            for (cum_reg, util) in self.cum_regret.iter_mut().zip(self.utils.iter()) {
-                let reg = util - expected_util;
-                *cum_reg += (reg - *cum_reg) / cardinal_iter as f64;
-                avg_reg = f64::max(avg_reg, *cum_reg);
-            }
-            // update average probability proportional to reach probability
-            self.cum_prob_reach += self.prob_reach;
-            for (cum_prob, prob) in self.cum_probs.iter_mut().zip(self.probs.iter()) {
-                *cum_prob += (*prob - *cum_prob) * self.prob_reach / self.cum_prob_reach;
-            }
-            // set probabilities to cumulative regret
-            let mut total = 0.0;
-            for (prob, cum_reg) in self.probs.iter_mut().zip(self.cum_regret.iter()) {
-                *prob = f64::max(*cum_reg, 0.0);
-                total += *prob;
-            }
-            if total == 0.0 {
-                // FIXME alternate assignments
-                self.probs.fill(1.0 / self.utils.len() as f64);
-            } else {
-                for prob in self.probs.iter_mut() {
-                    *prob /= total;
-                }
-            }
-            // reset reach prob and utilities
-            self.utils.fill(0.0);
-            self.prob_reach = 0.0;
-            avg_reg
-        }
-    }
-
-    fn recurse(
-        infosets: &mut [RegretInfoset],
-        node: &Vertex,
-        p_chance: f64,
-        p_player: [f64; 2],
-    ) -> f64 {
-        match node {
-            Node::Terminal { player_one_payoff } => *player_one_payoff,
-            Node::Chance(rand) => {
-                let mut expected = 0.0;
-                for (prob, next) in rand.outcomes.iter() {
-                    expected += prob * recurse(infosets, next, p_chance * prob, p_player);
-                }
-                expected
-            }
-            Node::Player(agent) => {
-                // NOTE this uses zero-sum nature to compute payoff for player 2
-                let mult = match agent.player {
-                    Player::One => p_chance * p_player[1],
-                    Player::Two => -p_chance * p_player[0],
-                };
-                infosets[agent.infoset].prob_reach += p_player[agent.player.ind()];
-                let mut expected = 0.0;
-                for (i, next) in agent.actions.iter().enumerate() {
-                    let prob = infosets[agent.infoset].probs[i];
-                    let mut p_next = p_player;
-                    p_next[agent.player.ind()] *= prob;
-                    let util = recurse(infosets, next, p_chance, p_next);
-                    infosets[agent.infoset].utils[i] += mult * util;
-                    expected += prob * util;
-                }
-                expected
-            }
-        }
-    }
-
-    pub(super) fn solve(
-        start: &Vertex,
-        info: &[impl AgnosticInfoset],
-        max_iter: u64,
-        max_reg: f64,
-    ) -> Solution {
-        // FIXME make this range and panic on 0 max_steps and test panic
-        // TODO This allocates a bunch of memory independentally. We could do it in one allocation,
-        // but it makes this much more complicated, and it's not clear that the single allocation
-        // and locality is worth the complexity
-        let mut infosets: Vec<_> = info
-            .iter()
-            .map(|info| RegretInfoset::new(info.num_actions()))
-            .collect();
-        let mut reg = max_reg;
-        for it in 0..max_iter {
-            // go through self and update utilities and probability of reaching a node
-            recurse(&mut infosets, start, 1.0, [1.0; 2]);
-
-            // update infoset information for next iteration
-            let mut regs = [0.0; 2];
-            for (infoset, inf) in infosets.iter_mut().zip(info.iter()) {
-                regs[inf.player().ind()] += infoset.update(it + 1);
-            }
-            reg = 2.0 * f64::max(regs[0], regs[1]);
-            if reg < max_reg {
-                break;
-            }
-        }
-        let strat: Vec<_> = infosets.into_iter().map(|info| info.cum_probs).collect();
-        Solution {
-            regret: reg,
-            strategy: DenseStrategy(strat.into_boxed_slice()),
-        }
-    }
-}
-
-/// This is a module the implements the external sampled montecarlo counter-factual regret
-/// minimization algorithm FIXME
-mod external {
-    use super::{regret, AgnosticInfoset, DenseStrategy, Node, Player, Solution, Vertex};
-    use rand::random;
-
-    #[derive(Debug)]
-    struct RegretInfoset {
-        // TODO this could be updated to have one buffer of heap memory that we chunk since we know the
-        // chunks will have the same size.
-        cum_regret: Box<[f64]>,
-        probs: Box<[f64]>,
-        cum_probs: Box<[f64]>,
-        updates: u64,
-        cum_prob_reach: f64,
-        sampled_ind: usize,
-        last_sample: u64,
-    }
-
-    impl RegretInfoset {
-        fn new(num_actions: usize) -> RegretInfoset {
-            RegretInfoset {
-                cum_regret: vec![0.0; num_actions].into_boxed_slice(),
-                probs: vec![1.0 / num_actions as f64; num_actions].into_boxed_slice(),
-                cum_probs: vec![0.0; num_actions].into_boxed_slice(),
-                updates: 0,
-                cum_prob_reach: 0.0,
-                sampled_ind: 0,
-                last_sample: 0,
-            }
-        }
-
-        fn sample_ind(&mut self, seq: u64) -> usize {
-            if self.last_sample == seq {
-                self.sampled_ind
-            } else {
-                self.last_sample = seq;
-                self.sampled_ind = self.probs.len() - 1;
-                let mut sample: f64 = random();
-                for (ind, prob) in self.probs.iter().enumerate() {
-                    if sample < *prob {
-                        self.sampled_ind = ind;
-                        break;
-                    } else {
-                        sample -= prob;
-                    }
-                }
-                self.sampled_ind
-            }
-        }
-
-        fn update_probs(&mut self, prob_reach: f64) {
-            if prob_reach > 0.0 {
-                self.cum_prob_reach += prob_reach;
-                for (cum_prob, prob) in self.cum_probs.iter_mut().zip(self.probs.iter()) {
-                    *cum_prob += (*prob - *cum_prob) * prob_reach / self.cum_prob_reach;
-                }
-            }
-        }
-
-        fn update(&mut self, expected: f64, seq: u64) {
-            // update regret
-            let diff = (seq - self.updates) as f64;
-            self.updates = seq;
-            for (total_reg, util) in self.cum_regret.iter_mut().zip(self.probs.iter()) {
-                let reg = *util - expected;
-                *total_reg += (reg - *total_reg * diff) / self.updates as f64;
-            }
-            // update probability
-            let total: f64 = self.cum_regret.iter().map(|r| f64::max(0.0, *r)).sum();
-            if total == 0.0 {
-                // FIXME alternate ways to assign this
-                self.probs.fill(1.0 / self.probs.len() as f64);
-            } else {
-                for (total_reg, prob) in self.cum_regret.iter().zip(self.probs.iter_mut()) {
-                    *prob = f64::max(*total_reg, 0.0) / total;
-                }
-            }
-        }
-    }
-
-    fn recurse(
-        infosets: &mut [RegretInfoset],
-        node: &Vertex,
-        target: Player,
-        seq: u64,
-        p_reach: f64,
-    ) -> f64 {
-        match node {
-            Node::Terminal { player_one_payoff } => match target {
-                Player::One => *player_one_payoff,
-                Player::Two => -player_one_payoff,
-            },
-            Node::Chance(rand) => recurse(infosets, rand.sample_vertex(), target, seq, p_reach),
-            Node::Player(agent) if agent.player != target => {
-                let ind = infosets[agent.infoset].sample_ind(seq);
-                recurse(infosets, &agent.actions[ind], target, seq, p_reach)
-            }
-            Node::Player(agent) => {
-                infosets[agent.infoset].update_probs(p_reach);
-                let mut expected = 0.0;
-                for (i, next) in agent.actions.iter().enumerate() {
-                    let prob = infosets[agent.infoset].probs[i];
-                    let util = recurse(infosets, next, target, seq, p_reach * prob);
-                    infosets[agent.infoset].probs[i] = util;
-                    expected += util * prob;
-                }
-                infosets[agent.infoset].update(expected, seq);
-                expected
-            }
-        }
-    }
-
-    pub(super) fn solve(
-        start: &Vertex,
-        info: &[impl AgnosticInfoset],
-        max_steps: u64,
-        step_size: u64,
-        max_reg: f64,
-    ) -> Solution {
-        // FIXME test assertion
-        assert_ne!(step_size, 0, "can't set zero step_size");
-        assert_ne!(max_steps, 0, "can't set zero max_steps");
-        let mut infosets: Vec<_> = info
-            .iter()
-            .map(|info| RegretInfoset::new(info.num_actions()))
-            .collect();
-        let mut reg = f64::NAN;
-        for step in 0..max_steps {
-            let init = step * step_size + 1;
-            for it in init..(init + step_size) {
-                recurse(&mut infosets, start, Player::One, it, 1.0);
-                recurse(&mut infosets, start, Player::Two, it, 1.0);
-            }
-            // FIXME avoid copy with appropriate trait implementations
-            let strat: Vec<_> = infosets
-                .iter()
-                .map(|info| {
-                    if info.cum_prob_reach == 0.0 {
-                        vec![1.0 / info.cum_probs.len() as f64; info.cum_probs.len()]
-                            .into_boxed_slice()
-                    } else {
-                        info.cum_probs.clone()
-                    }
-                })
-                .collect();
-            let info = regret::regret(start, info, &strat).unwrap();
-            reg = info.regret();
-            if reg < max_reg {
-                break;
-            }
-        }
-        // FIXME if cumprobs is 0 / steps isn't updated than do uniform
-        let strat: Vec<_> = infosets
-            .into_iter()
-            .map(|info| {
-                if info.cum_prob_reach == 0.0 {
-                    vec![1.0 / info.cum_probs.len() as f64; info.cum_probs.len()].into_boxed_slice()
-                } else {
-                    info.cum_probs
-                }
-            })
-            .collect();
-        Solution {
-            regret: reg,
-            strategy: DenseStrategy(strat.into_boxed_slice()),
-        }
-    }
-}
-
-/// private module for computing regret
-mod regret {
-    use super::{
-        validate_strategy, Agent, AgnosticInfoset, CompactError, EquilibriumInfo, Node, Player,
-        Vertex,
-    };
-    use std::mem::take;
-
-    #[derive(Debug)]
-    struct RegretInfoset<'a, 'b> {
-        action_probs: &'a [f64],
-        util: f64,
-        prob_reach: f64,
-        states: Vec<(f64, &'b Agent)>,
-        num_fut_infosets: usize,
-    }
-
-    impl<'a, 'b> RegretInfoset<'a, 'b> {
-        fn new(action_probs: &'a [f64]) -> RegretInfoset<'a, 'b> {
-            RegretInfoset {
-                action_probs,
-                util: 0.0,
-                prob_reach: 0.0,
-                states: Vec::new(),
-                num_fut_infosets: 0,
-            }
-        }
-    }
-
-    /// walk through the tree and update the probability of reaching a player's node and infoset given
-    /// the actions of others
-    fn recurse_reach<'a, 'b>(
-        infosets: &mut [RegretInfoset<'a, 'b>],
-        node: &'b Vertex,
-        p_chance: f64,
-        p_player: [f64; 2],
-    ) {
-        match node {
-            Node::Terminal { .. } => {}
-            Node::Chance(rand) => {
-                for (prob, next) in rand.outcomes.iter() {
-                    recurse_reach(infosets, next, p_chance * prob, p_player);
-                }
-            }
-            Node::Player(agent) => {
-                let info = &mut infosets[agent.infoset];
-                let mut p_reach = p_chance;
-                for (i, prob) in p_player.iter().enumerate() {
-                    if i != agent.player.ind() {
-                        p_reach *= prob;
-                    }
-                }
-                info.prob_reach += p_reach;
-                info.states.push((p_reach, agent));
-                for (next, prob) in agent
-                    .actions
-                    .iter()
-                    .zip(infosets[agent.infoset].action_probs)
-                {
-                    let mut next_probs = p_player;
-                    next_probs[agent.player.ind()] *= prob;
-                    recurse_reach(infosets, next, p_chance, next_probs);
-                }
-            }
-        }
-    }
-
-    fn recurse_regret<'a, 'b>(
-        infosets: &[RegretInfoset<'a, 'b>],
-        node: &'b Vertex,
-        target: Player,
-    ) -> f64 {
-        match node {
-            Node::Terminal { player_one_payoff } => *player_one_payoff,
-            Node::Chance(rand) => {
-                let mut expected = 0.0;
-                for (prob, next) in rand.outcomes.iter() {
-                    expected += prob * recurse_regret(infosets, next, target);
-                }
-                expected
-            }
-            Node::Player(agent) if agent.player != target => {
-                let mut expected = 0.0;
-                let probs = &infosets[agent.infoset].action_probs;
-                for (prob, next) in probs.iter().zip(agent.actions.iter()) {
-                    expected += prob * recurse_regret(infosets, next, target);
-                }
-                expected
-            }
-            Node::Player(agent) => infosets[agent.infoset].util,
-        }
-    }
-
-    fn recurse_expected<'a, 'b>(infosets: &[RegretInfoset<'a, 'b>], node: &'b Vertex) -> f64 {
-        match node {
-            Node::Terminal { player_one_payoff } => *player_one_payoff,
-            Node::Chance(rand) => rand
-                .outcomes
-                .iter()
-                .map(|(prob, next)| prob * recurse_expected(infosets, next))
-                .sum(),
-            Node::Player(agent) => {
-                let probs = &infosets[agent.infoset].action_probs;
-                probs
-                    .iter()
-                    .zip(agent.actions.iter())
-                    .map(|(prob, next)| prob * recurse_expected(infosets, next))
-                    .sum()
-            }
-        }
-    }
-
-    pub(super) fn regret(
-        start: &Vertex,
-        info: &[impl AgnosticInfoset],
-        strategy: &[impl AsRef<[f64]>],
-    ) -> Result<EquilibriumInfo, CompactError> {
-        // NOTE in order to compute regret, we must compute regret for tail infosets before
-        // computing regret for earlier ones. We do this by creating metadata for each infoset that
-        // contains the states in it, and the number of future infosets. As we process infosets we
-        // decrement that number making sure we only process an infoset after computing the maximum
-        // utility for all future infosets.
-        validate_strategy(info, strategy)?;
-
-        let mut infosets = Vec::with_capacity(strategy.len());
-        for (probs_trait, inf) in strategy.iter().zip(info.iter()) {
-            let probs = probs_trait.as_ref();
-            infosets.push(RegretInfoset::new(probs));
-            // NOTE this works because previous infosets are guaranteed to have a lower index
-            // than future ones
-            if let Some(prev) = inf.prev_infoset() {
-                infosets[prev].num_fut_infosets += 1;
-            }
-        }
-
-        // add reach probability, and states to each infoset
-        recurse_reach(&mut infosets, start, 1.0, [1.0; 2]);
-
-        // iterate through in reverse breadth-first order by infoset for each player
-        let mut queue: Vec<_> = infosets
-            .iter()
-            .enumerate()
-            .filter(|(_, info)| info.num_fut_infosets == 0)
-            .map(|(ind, _)| ind)
-            .collect();
-        while let Some(ind) = queue.pop() {
-            let infoset_info = &info[ind];
-            let info = &mut infosets[ind];
-            let states = take(&mut info.states);
-            let prob_reach = info.prob_reach;
-
-            infosets[ind].util = if prob_reach == 0.0 {
-                // NOTE if prob_reach is 0 here it means that due to the other agent's play we can
-                // never reach this infoset.
-                0.0
-            } else {
-                let mut utils = vec![0.0; infoset_info.num_actions()];
-                for (prob, next) in states {
-                    assert_eq!(next.actions.len(), infoset_info.num_actions());
-                    for (i, exp) in next.actions.iter().enumerate() {
-                        utils[i] += prob * recurse_regret(&infosets, exp, infoset_info.player())
-                            / prob_reach;
-                    }
-                }
-                let reduce = match infoset_info.player() {
-                    Player::One => f64::max,
-                    Player::Two => f64::min,
-                };
-                utils.iter().copied().reduce(reduce).unwrap()
-            };
-
-            if let Some(prev_info) = infoset_info.prev_infoset() {
-                let prev = &mut infosets[prev_info];
-                prev.num_fut_infosets -= 1;
-                if prev.num_fut_infosets == 0 {
-                    queue.push(prev_info);
-                }
-            }
-        }
-
-        let util_one = recurse_regret(&infosets, start, Player::One);
-        let util_two = recurse_regret(&infosets, start, Player::Two);
-        let utility = recurse_expected(&infosets, start);
-
-        Ok(EquilibriumInfo {
-            utility,
-            player_one_regret: f64::max(0.0, util_one - utility),
-            player_two_regret: f64::max(0.0, utility - util_two),
+        strats: [impl IntoIterator<
+            Item = (
+                impl Borrow<I>,
+                impl IntoIterator<Item = (impl Borrow<A>, impl Borrow<f64>)>,
+            ),
+        >; 2],
+    ) -> Result<Strategies<I, A>, StratError> {
+        let [one_strat, two_strat] = strats;
+        let [one_info, two_info] = &self.player_infosets;
+        let [one_single, two_single] = &self.single_infosets;
+        Ok(Strategies {
+            game: self,
+            probs: [
+                Self::strat_into_box(one_strat, one_info, one_single)?,
+                Self::strat_into_box(two_strat, two_info, two_single)?,
+            ],
         })
     }
+
+    fn strat_into_box(
+        strat: impl IntoIterator<
+            Item = (
+                impl Borrow<I>,
+                impl IntoIterator<Item = (impl Borrow<A>, impl Borrow<f64>)>,
+            ),
+        >,
+        infos: &[PlayerInfosetData<I, A>],
+        raw_singles: &[(I, A)],
+    ) -> Result<Box<[f64]>, StratError> {
+        let mut num_inds = 0;
+        let mut inds: HashMap<I, HashMap<A, usize>> = HashMap::with_capacity(infos.len());
+        for info in infos {
+            let mut actions: HashMap<A, usize> = HashMap::with_capacity(info.num_actions());
+            for action in info.actions.iter() {
+                actions.insert(action.clone(), num_inds);
+                num_inds += 1;
+            }
+            inds.insert(info.infoset.clone(), actions);
+        }
+        let mut dense = vec![0.0; num_inds].into_boxed_slice();
+
+        let mut singles: HashMap<_, _> = raw_singles
+            .iter()
+            .map(|(info, act)| (info, (act, false)))
+            .collect();
+
+        for (binfoset, actions) in strat {
+            let infoset = binfoset.borrow();
+            if let Some(action_inds) = inds.get(infoset) {
+                for (baction, bprob) in actions {
+                    let action = baction.borrow();
+                    let prob = bprob.borrow();
+                    if prob >= &0.0 && prob.is_finite() {
+                        let ind = action_inds
+                            .get(action)
+                            .ok_or(StratError::InvalidInfosetAction)?;
+                        dense[*ind] = *prob;
+                    } else {
+                        return Err(StratError::InvalidProbability);
+                    }
+                }
+            } else if let Some((act, seen)) = singles.get_mut(infoset) {
+                for (baction, bprob) in actions {
+                    let action = baction.borrow();
+                    let prob = bprob.borrow();
+                    if &action != act {
+                        return Err(StratError::InvalidInfosetAction);
+                    } else if prob >= &0.0 && prob.is_finite() {
+                        *seen = true;
+                    } else {
+                        return Err(StratError::InvalidProbability);
+                    }
+                }
+            } else {
+                return Err(StratError::InvalidInfoset);
+            }
+        }
+
+        // check we wrote to all locations
+        for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
+            let total: f64 = vals.iter().sum();
+            if total == 0.0 {
+                return Err(StratError::InvalidInfosetProbability);
+            } else {
+                for val in vals.iter_mut() {
+                    *val /= total;
+                }
+            }
+        }
+        if !singles.into_values().all(|(_, seen)| seen) {
+            return Err(StratError::InvalidInfosetProbability);
+        }
+
+        Ok(dense)
+    }
 }
 
-fn validate_strategy(
-    info: &[impl AgnosticInfoset],
-    strategy: &[impl AsRef<[f64]>],
-) -> Result<(), CompactError> {
-    if strategy.len() != info.len() {
-        return Err(CompactError::InfosetNum {
-            game_num: info.len(),
-            strategy_num: strategy.len(),
-        });
+impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
+    /// Convert a named strategy into [Strategies]
+    ///
+    /// In case cloning is very expensive, this version doesn't require cloning, but otherwise
+    /// runs in time quadratic in the number of infosets and actions, which is almost certaintly
+    /// going to be worse than the cost of cloning.
+    ///
+    /// This is otherwise the same as [Game::from_named], so see that method for examples.
+    // NOTE this is very similar to from_named, but writing it generically with traits wasn't worth
+    // that overhead
+    pub fn from_named_slow(
+        &self,
+        strats: [impl IntoIterator<
+            Item = (
+                impl Borrow<I>,
+                impl IntoIterator<Item = (impl Borrow<A>, impl Borrow<f64>)>,
+            ),
+        >; 2],
+    ) -> Result<Strategies<I, A>, StratError> {
+        let [one_strat, two_strat] = strats;
+        let [one_info, two_info] = &self.player_infosets;
+        let [one_single, two_single] = &self.single_infosets;
+        Ok(Strategies {
+            game: self,
+            probs: [
+                Self::strat_into_box_slow(one_strat, one_info, one_single)?,
+                Self::strat_into_box_slow(two_strat, two_info, two_single)?,
+            ],
+        })
     }
-    for (ind, (probs_trait, inf)) in strategy.iter().zip(info.iter()).enumerate() {
-        let probs = probs_trait.as_ref();
-        if probs.len() != inf.num_actions() {
-            return Err(CompactError::ActionNum {
-                ind,
-                infoset_actions: inf.num_actions(),
-                strategy_actions: probs.len(),
-            });
-        } else if (1.0 - probs.iter().sum::<f64>()).abs() > 1e-6 {
-            return Err(CompactError::StratNotProbability {
-                ind,
-                total_prob: probs.iter().sum(),
-            });
+
+    fn strat_into_box_slow(
+        strat: impl IntoIterator<
+            Item = (
+                impl Borrow<I>,
+                impl IntoIterator<Item = (impl Borrow<A>, impl Borrow<f64>)>,
+            ),
+        >,
+        infos: &[PlayerInfosetData<I, A>],
+        singles: &[(I, A)],
+    ) -> Result<Box<[f64]>, StratError> {
+        let mut action_inds = Vec::with_capacity(infos.len());
+        let mut num_inds = 0;
+        for info in infos {
+            action_inds.push(num_inds);
+            num_inds += info.num_actions();
         }
+        let mut dense = vec![0.0; num_inds].into_boxed_slice();
+        let mut seen_singles: Box<[_]> = vec![false; singles.len()].into();
+
+        for (binfoset, actions) in strat {
+            let infoset = binfoset.borrow();
+            if let Some((ind, info)) = infos
+                .iter()
+                .enumerate()
+                .find(|(_, info)| &info.infoset == infoset)
+            {
+                let info_ind = action_inds[ind];
+                for (baction, bprob) in actions {
+                    let action = baction.borrow();
+                    let prob = bprob.borrow();
+                    if prob >= &0.0 && prob.is_finite() {
+                        let (act_ind, _) = info
+                            .actions
+                            .iter()
+                            .enumerate()
+                            .find(|(_, act)| act == &action)
+                            .ok_or(StratError::InvalidInfosetAction)?;
+                        dense[info_ind + act_ind] = *prob;
+                    } else {
+                        return Err(StratError::InvalidProbability);
+                    }
+                }
+            } else if let Some((ind, (_, act))) = singles
+                .iter()
+                .enumerate()
+                .find(|(_, (info, _))| info == infoset)
+            {
+                for (baction, bprob) in actions {
+                    let action = baction.borrow();
+                    let prob = bprob.borrow();
+                    if action != act {
+                        return Err(StratError::InvalidInfosetAction);
+                    } else if prob >= &0.0 && prob.is_finite() {
+                        seen_singles[ind] = true;
+                    } else {
+                        return Err(StratError::InvalidProbability);
+                    }
+                }
+            } else {
+                return Err(StratError::InvalidInfoset);
+            }
+        }
+
+        // check that we wrote to every location
+        for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
+            let total: f64 = vals.iter().sum();
+            if total == 0.0 {
+                return Err(StratError::InvalidInfosetProbability);
+            } else {
+                for val in vals.iter_mut() {
+                    *val /= total;
+                }
+            }
+        }
+        if !Vec::from(seen_singles).into_iter().all(|seen| seen) {
+            return Err(StratError::InvalidInfosetProbability);
+        }
+
+        Ok(dense)
     }
-    Ok(())
 }
 
 /// A compact strategy for both players
-///
-/// Returned from [Game::solve].
 #[derive(Debug, Clone)]
-pub struct DenseStrategy(Box<[Box<[f64]>]>);
+pub struct Strategies<'a, I, A> {
+    game: &'a Game<I, A>,
+    probs: [Box<[f64]>; 2],
+}
 
-impl DenseStrategy {
-    /// truncate a strategy where any probability below thresh is made zero
+impl<'a, I, A> PartialEq for Strategies<'a, I, A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.game == other.game && self.probs == other.probs
+    }
+}
+
+impl<'a, I, A> Eq for Strategies<'a, I, A> {}
+
+impl<'a, I, A> Strategies<'a, I, A> {
+    /// Attach player, infoset, and action information to a strategy
+    pub fn as_named<'b: 'a>(&'b self) -> [NamedStrategyIter<'a, I, A>; 2] {
+        let [info_one, info_two] = &self.game.player_infosets;
+        let [single_one, single_two] = &self.game.single_infosets;
+        let [probs_one, probs_two] = &self.probs;
+        [
+            NamedStrategyIter::new(info_one, probs_one, single_one),
+            NamedStrategyIter::new(info_two, probs_two, single_two),
+        ]
+    }
+
+    /// Truncate actions with small probability
     pub fn truncate(&mut self, thresh: f64) {
-        for strat in self.0.iter_mut() {
-            let mut total = 0.0;
-            for val in strat.iter_mut() {
-                if *val < thresh {
-                    *val = 0.0;
-                } else {
-                    total += *val;
+        for (infos, box_probs) in self.game.player_infosets.iter().zip(self.probs.iter_mut()) {
+            for strat in split_by_mut(
+                box_probs.as_mut(),
+                infos.iter().map(|info| info.num_actions()),
+            ) {
+                let total: f64 = strat.iter().filter(|p| p > &&thresh).sum();
+                for p in strat.iter_mut() {
+                    *p = if *p > thresh { *p / total } else { 0.0 }
                 }
-            }
-            for val in strat.iter_mut() {
-                *val /= total;
             }
         }
     }
-}
 
-// FIXME remove this?
-impl Deref for DenseStrategy {
-    type Target = [Box<[f64]>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// An approximate Nash equilibrium of a game
-#[derive(Debug)]
-pub struct Solution {
-    /// An upper bound on the regret of the returned strategy
-    pub regret: f64,
-    /// A compact representation of a set of player strategies
+    /// Get the distance between this strategy and another strategy
     ///
-    /// Use [Game::name_strategy] to convert it to a named version referencing information sets and
-    /// actions.
-    pub strategy: DenseStrategy,
-}
+    /// This computes the avg of the l1 earth movers distance between the strategies for each
+    /// player, thus the value is between 0 and 1 where 0 represents identical strategies, and 1
+    /// represents strategies that share no support.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `other` isn't from the same game.
+    pub fn distance(&self, other: &Self) -> [f64; 2] {
+        assert!(
+            self.game == other.game,
+            "can only compare strategies for the same game"
+        );
+        let dists: Vec<_> = self
+            .probs
+            .iter()
+            .zip(other.probs.iter())
+            .zip(self.game.player_infosets.iter())
+            .map(|((left, right), info)| {
+                let mut dist = 0.0;
+                for (left_val, right_val) in left.iter().zip(right.iter()) {
+                    dist += (left_val - right_val).abs();
+                }
+                dist / info.len() as f64
+            })
+            .collect();
+        dists.try_into().unwrap()
+    }
 
-/// Information about an approximate equilibrium
-#[derive(Debug, PartialEq)]
-pub struct EquilibriumInfo {
-    /// The expected utility of player one under the current strategies
-    pub utility: f64,
-    /// The regret of player one
-    pub player_one_regret: f64,
-    /// The regret of player two
-    pub player_two_regret: f64,
-}
-
-impl EquilibriumInfo {
-    /// The regret of this equilibrium independent of player
-    pub fn regret(&self) -> f64 {
-        f64::max(self.player_one_regret, self.player_two_regret)
+    /// Get regret and utility information for this strategy profile
+    pub fn get_info(&self) -> StrategiesInfo {
+        let [one_strat, two_strat] = &self.probs;
+        let [one_info, two_info] = &self.game.player_infosets;
+        let one_split: Box<[&[f64]]> =
+            split_by(one_strat, one_info.iter().map(|info| info.num_actions())).collect();
+        let two_split: Box<[&[f64]]> =
+            split_by(two_strat, two_info.iter().map(|info| info.num_actions())).collect();
+        let (util, regrets) = regret::regret(
+            &self.game.root,
+            &self.game.chance_infosets,
+            [one_info, two_info],
+            [&*one_split, &*two_split],
+        );
+        StrategiesInfo { util, regrets }
     }
 }
 
-/// FIXME
-type NamedStrategies<'a, I, A, R> = (
-    NamedStrategyIter<'a, I, A, R>,
-    NamedStrategyIter<'a, I, A, R>,
-);
+/// Information about the regret and utility of a specific strategy profile
+pub struct StrategiesInfo {
+    util: f64,
+    regrets: [f64; 2],
+}
+
+impl StrategiesInfo {
+    /// Get the regret of a specific player
+    pub fn player_regret(&self, player_num: PlayerNum) -> f64 {
+        *player_num.ind(&self.regrets)
+    }
+
+    /// Get the total regret
+    pub fn regret(&self) -> f64 {
+        let [one, two] = self.regrets;
+        f64::max(one, two)
+    }
+
+    /// Get the utility for a specific player
+    pub fn player_utility(&self, player_num: PlayerNum) -> f64 {
+        match player_num {
+            PlayerNum::One => self.util,
+            PlayerNum::Two => -self.util,
+        }
+    }
+}
 
 /// An iterator over named information sets of a strategy.
 ///
-/// This is returned when converting a [DenseStrategy] to a named strategy with
-/// [Game::name_strategy].
+/// This is returned when getting named [Strategies] using
+/// [Strategies::as_named].
 #[derive(Debug)]
-pub struct NamedStrategyIter<'a, I, A, R> {
-    player: Player,
-    info_strats: Zip<slice::Iter<'a, Infoset<I, A>>, slice::Iter<'a, R>>,
+pub struct NamedStrategyIter<'a, I, A> {
+    info: &'a [PlayerInfosetData<I, A>],
+    probs: &'a [f64],
+    singles: slice::Iter<'a, (I, A)>,
 }
 
-impl<'a, I, A, R> NamedStrategyIter<'a, I, A, R> {
-    fn new(
-        player: Player,
-        info: &'a [Infoset<I, A>],
-        strategy: &'a [R],
-    ) -> NamedStrategyIter<'a, I, A, R> {
+impl<'a, I, A> NamedStrategyIter<'a, I, A> {
+    fn new(info: &'a [PlayerInfosetData<I, A>], probs: &'a [f64], singles: &'a [(I, A)]) -> Self {
         NamedStrategyIter {
-            player,
-            info_strats: info.iter().zip(strategy.iter()),
+            info,
+            probs,
+            singles: singles.iter(),
         }
     }
 }
 
-impl<'a, I, A, R> Iterator for NamedStrategyIter<'a, I, A, R>
-where
-    R: AsRef<[f64]>,
-{
+impl<'a, I, A> Iterator for NamedStrategyIter<'a, I, A> {
     type Item = (&'a I, NamedStrategyActionIter<'a, A>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.info_strats
-            .find(|(info, _)| info.player == self.player)
-            .map(|(info, strat)| {
-                (
-                    &info.infoset,
-                    NamedStrategyActionIter::new(&info.actions, strat.as_ref()),
-                )
-            })
+        if let Some((info, rest_infos)) = self.info.split_first() {
+            let (probs, rest_probs) = self.probs.split_at(info.num_actions());
+            self.info = rest_infos;
+            self.probs = rest_probs;
+            Some((
+                &info.infoset,
+                NamedStrategyActionIter {
+                    iter: ActionType::Data(info.actions.iter().zip(probs.iter())),
+                },
+            ))
+        } else if let Some((info, act)) = self.singles.next() {
+            Some((
+                info,
+                NamedStrategyActionIter {
+                    iter: ActionType::Single(iter::once(act)),
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.probs.len() + self.singles.len();
+        (len, Some(len))
     }
 }
 
-/// An iterator over name actions assiciated probabilities
-///
-/// This is returned when converting a [DenseStrategy] to a named strategy with
-/// [Game::name_strategy].
-#[derive(Debug)]
-pub struct NamedStrategyActionIter<'a, A>(Zip<slice::Iter<'a, A>, slice::Iter<'a, f64>>);
+impl<'a, I, A> FusedIterator for NamedStrategyIter<'a, I, A> {}
 
-impl<'a, A> NamedStrategyActionIter<'a, A> {
-    fn new(actions: &'a [A], strategy: &'a [f64]) -> NamedStrategyActionIter<'a, A> {
-        NamedStrategyActionIter(actions.iter().zip(strategy.iter()))
-    }
+impl<'a, I, A> ExactSizeIterator for NamedStrategyIter<'a, I, A> {}
+
+/// An iterator over named actions and assiciated probabilities
+///
+/// This is returned when getting named [Strategies] using
+/// [Strategies::as_named].
+#[derive(Debug)]
+pub struct NamedStrategyActionIter<'a, A> {
+    iter: ActionType<'a, A>,
+}
+
+#[derive(Debug)]
+enum ActionType<'a, A> {
+    Data(Zip<slice::Iter<'a, A>, slice::Iter<'a, f64>>),
+    Single(Once<&'a A>),
 }
 
 impl<'a, A> Iterator for NamedStrategyActionIter<'a, A> {
-    type Item = (&'a A, &'a f64);
+    type Item = (&'a A, f64);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let NamedStrategyActionIter(iter) = self;
-        iter.next()
+        match &mut self.iter {
+            ActionType::Data(zip) => zip
+                .find(|(_, prob)| prob > &&0.0)
+                .map(|(act, &prob)| (act, prob)),
+            ActionType::Single(once) => once.next().map(|a| (a, 1.0)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = match &self.iter {
+            ActionType::Data(zip) => zip.len(),
+            ActionType::Single(once) => once.len(),
+        };
+        (len, Some(len))
     }
 }
 
+impl<'a, A> FusedIterator for NamedStrategyActionIter<'a, A> {}
+
+impl<'a, A> ExactSizeIterator for NamedStrategyActionIter<'a, A> {}
+
 #[cfg(test)]
-mod error_tests {
-    use super::*;
+mod tests {
+    use super::{Game, GameNode, IntoGameNode, PlayerNum};
 
-    struct Term;
+    struct Node(GameNode<Node>);
 
-    impl Term {
-        fn new_node() -> SimpNode {
-            SimpNode::Terminal {
-                player_one_payoff: 0.0,
-            }
-        }
-    }
+    impl IntoGameNode for Node {
+        type PlayerInfo = &'static str;
+        type Action = &'static str;
+        type ChanceInfo = &'static str;
+        type Outcomes = Vec<(f64, Node)>;
+        type Actions = Vec<(&'static str, Node)>;
 
-    struct Rand(Vec<(f64, SimpNode)>);
-
-    impl Rand {
-        fn new_node(iter: impl IntoIterator<Item = (f64, SimpNode)>) -> SimpNode {
-            SimpNode::Chance(Rand(iter.into_iter().collect()))
-        }
-    }
-
-    impl ChanceNode for Rand {
-        type PlayerNode = SimpPlayer;
-        type Outcomes = Vec<(f64, SimpNode)>;
-
-        fn into_outcomes(self) -> Self::Outcomes {
+        fn into_game_node(self) -> GameNode<Self> {
             self.0
         }
     }
 
-    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-    enum Info {
-        X,
-        Y,
-    }
-
-    #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
-    enum Action {
-        A,
-        B,
-        C,
-    }
-
-    struct SimpPlayer {
-        player: Player,
-        info: Info,
-        actions: Vec<(Action, SimpNode)>,
-    }
-
-    impl SimpPlayer {
-        fn new_node(
-            player: Player,
-            iter: impl IntoIterator<Item = (Action, SimpNode)>,
-        ) -> SimpNode {
-            SimpNode::Player(SimpPlayer {
-                player,
-                info: Info::X,
-                actions: iter.into_iter().collect(),
-            })
-        }
-
-        fn new_node_with_info(
-            player: Player,
-            info: Info,
-            iter: impl IntoIterator<Item = (Action, SimpNode)>,
-        ) -> SimpNode {
-            SimpNode::Player(SimpPlayer {
-                player,
-                info,
-                actions: iter.into_iter().collect(),
-            })
-        }
-    }
-
-    impl PlayerNode for SimpPlayer {
-        type Infoset = Info;
-        type Action = Action;
-        type ChanceNode = Rand;
-        type Actions = Vec<(Action, SimpNode)>;
-
-        fn get_player(&self) -> Player {
-            self.player
-        }
-
-        fn get_infoset(&self) -> Info {
-            self.info
-        }
-
-        fn into_actions(self) -> Self::Actions {
-            self.actions
-        }
-    }
-
-    type SimpNode = Node<Rand, SimpPlayer>;
-
-    #[test]
-    fn empty_chance() {
-        let err_game = Rand::new_node([]);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(err, GameError::EmptyChance);
-    }
-
-    #[test]
-    fn non_positive_chance() {
-        let err_game = Rand::new_node([(0.0, Term::new_node())]);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(err, GameError::NonPositiveChance { prob: 0.0 });
-    }
-
-    #[test]
-    fn degenerate_chance() {
-        let err_game = Rand::new_node([(1.0, Term::new_node())]);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(err, GameError::DegenerateChance);
-    }
-
-    #[test]
-    fn empty_player() {
-        let err_game = SimpPlayer::new_node(Player::One, []);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(err, GameError::EmptyPlayer);
-    }
-
-    #[test]
-    fn degenerate_player() {
-        let err_game = SimpPlayer::new_node(Player::One, [(Action::A, Term::new_node())]);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(err, GameError::DegeneratePlayer);
-    }
-
-    #[test]
-    fn imperfect_recall() {
-        let err_game = Rand::new_node([
-            (
-                0.5,
-                SimpPlayer::new_node_with_info(
-                    Player::One,
-                    Info::X,
-                    [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-                ),
-            ),
-            (
-                0.5,
-                SimpPlayer::new_node_with_info(
-                    Player::One,
-                    Info::Y,
-                    [
+    fn create_game() -> Game<&'static str, &'static str> {
+        let node = Node(GameNode::Player(
+            PlayerNum::One,
+            "x",
+            vec![(
+                "a",
+                Node(GameNode::Player(
+                    PlayerNum::Two,
+                    "z",
+                    vec![
                         (
-                            Action::A,
-                            SimpPlayer::new_node_with_info(
-                                Player::One,
-                                Info::X,
-                                [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-                            ),
+                            "b",
+                            Node(GameNode::Player(
+                                PlayerNum::One,
+                                "y",
+                                vec![
+                                    ("c", Node(GameNode::Terminal(0.0))),
+                                    ("d", Node(GameNode::Terminal(0.0))),
+                                ],
+                            )),
                         ),
-                        (Action::B, Term::new_node()),
+                        ("c", Node(GameNode::Terminal(0.0))),
                     ],
-                ),
-            ),
-        ]);
-        let err = Game::from_node(err_game).unwrap_err();
-        assert_eq!(
-            err,
-            GameError::ImperfectRecall {
-                player: Player::One,
-                infoset: Info::X,
-            }
-        );
+                )),
+            )],
+        ));
+        Game::from_root(node).unwrap()
     }
 
     #[test]
-    fn actions_not_equal() {
-        let ord_game = Rand::new_node([
-            (
-                0.5,
-                SimpPlayer::new_node(
-                    Player::One,
-                    [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-                ),
-            ),
-            (
-                0.5,
-                SimpPlayer::new_node(
-                    Player::One,
-                    [(Action::B, Term::new_node()), (Action::A, Term::new_node())],
-                ),
-            ),
-        ]);
-        let err = Game::from_node(ord_game).unwrap_err();
-        assert_eq!(
-            err,
-            GameError::ActionsNotEqual {
-                player: Player::One,
-                infoset: Info::X,
-                actions: vec![Action::B, Action::A]
-            }
-        );
-    }
+    fn strat_names() {
+        let game = create_game();
+        let fast = game
+            .from_named([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 2.0)])],
+                vec![("z", vec![("b", 2.0), ("c", 3.0)])],
+            ])
+            .unwrap();
+        let slow = game
+            .from_named_slow([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 2.0)])],
+                vec![("z", vec![("b", 2.0), ("c", 3.0)])],
+            ])
+            .unwrap();
+        assert_eq!(fast, slow);
+        assert_eq!(fast.distance(&slow), [0.0; 2]);
 
-    #[test]
-    fn actions_not_unique() {
-        let dup_game = SimpPlayer::new_node(
-            Player::One,
-            [(Action::A, Term::new_node()), (Action::A, Term::new_node())],
-        );
-        let err = Game::from_node(dup_game).unwrap_err();
-        assert_eq!(
-            err,
-            GameError::ActionsNotUnique {
-                player: Player::One,
-                infoset: Info::X,
-                actions: vec![Action::A, Action::A]
-            }
-        );
-    }
-
-    #[test]
-    fn incorrect_infosets() {
-        let base_game = SimpPlayer::new_node(
-            Player::One,
-            [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-        );
-        let game = Game::from_node(base_game).unwrap();
-
-        let info_err = game.regret(&[] as &[&[f64]]).unwrap_err();
-        assert_eq!(
-            info_err,
-            CompactError::InfosetNum {
-                game_num: 1,
-                strategy_num: 0
-            }
-        );
-
-        let action_err = game.regret(&[[1.0]]).unwrap_err();
-        assert_eq!(
-            action_err,
-            CompactError::ActionNum {
-                ind: 0,
-                infoset_actions: 2,
-                strategy_actions: 1
-            }
-        );
-
-        let strat_err = game.regret(&[[1.0, 1.0]]).unwrap_err();
-        assert_eq!(
-            strat_err,
-            CompactError::StratNotProbability {
-                ind: 0,
-                total_prob: 2.0
-            }
-        );
-
-        assert_eq!(
-            game.regret(&[[0.5, 0.5]]).unwrap(),
-            EquilibriumInfo {
-                utility: 0.0,
-                player_one_regret: 0.0,
-                player_two_regret: 0.0
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_info_action() {
-        let base_game = SimpPlayer::new_node(
-            Player::One,
-            [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-        );
-        let game = Game::from_node(base_game).unwrap();
-
-        let empty: [(Info, Action, f64); 0] = [];
-
-        let info_err = game
-            .compact_strategy([(Info::Y, Action::A, 0.5)], empty)
-            .unwrap_err();
-        assert_eq!(
-            info_err,
-            StratError::InvalidInfosetAction {
-                player: Player::One,
-                infoset: Info::Y,
-                action: Action::A,
-            }
-        );
-
-        let action_err = game
-            .compact_strategy([(Info::X, Action::C, 0.5)], empty)
-            .unwrap_err();
-        assert_eq!(
-            action_err,
-            StratError::InvalidInfosetAction {
-                player: Player::One,
-                infoset: Info::X,
-                action: Action::C,
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_prob() {
-        let base_game = SimpPlayer::new_node(
-            Player::One,
-            [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-        );
-        let game = Game::from_node(base_game).unwrap();
-
-        let empty: [(Info, Action, f64); 0] = [];
-
-        let prob_err = game
-            .compact_strategy([(Info::X, Action::A, 1.5)], empty)
-            .unwrap_err();
-        assert_eq!(
-            prob_err,
-            StratError::InvalidProbability {
-                player: Player::One,
-                infoset: Info::X,
-                action: Action::A,
-                prob: 1.5,
-            }
-        );
-    }
-
-    #[test]
-    fn incorrect_strategies() {
-        let base_game = SimpPlayer::new_node(
-            Player::One,
-            [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-        );
-        let game = Game::from_node(base_game).unwrap();
-
-        let empty: [(Info, Action, f64); 0] = [];
-
-        let total_err = game.compact_strategy(empty, empty).unwrap_err();
-        assert_eq!(
-            total_err,
-            StratError::InvalidInfosetProbability {
-                player: Player::One,
-                infoset: Info::X,
-                total_prob: 0.0
-            }
-        );
-    }
-
-    #[test]
-    fn zero_reach_regret() {
-        let base_game = SimpPlayer::new_node(
-            Player::One,
-            [
-                (
-                    Action::A,
-                    SimpPlayer::new_node_with_info(
-                        Player::Two,
-                        Info::X,
-                        [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-                    ),
-                ),
-                (
-                    Action::B,
-                    SimpPlayer::new_node_with_info(
-                        Player::Two,
-                        Info::Y,
-                        [(Action::A, Term::new_node()), (Action::B, Term::new_node())],
-                    ),
-                ),
-            ],
-        );
-        let game = Game::from_node(base_game).unwrap();
-        let one = [(Info::X, Action::A, 1.0)];
-        let two = [
-            (Info::X, Action::A, 0.5),
-            (Info::X, Action::B, 0.5),
-            (Info::Y, Action::A, 0.5),
-            (Info::Y, Action::B, 0.5),
-        ];
-        let strat = game.compact_strategy(one, two).unwrap();
-
-        assert_eq!(
-            game.regret(&strat).unwrap(),
-            EquilibriumInfo {
-                utility: 0.0,
-                player_one_regret: 0.0,
-                player_two_regret: 0.0
-            }
-        );
-    }
-}
-
-#[cfg(test)]
-mod akq_tests {
-    use super::*;
-
-    enum Pot {
-        WonAnte,
-        LostAnte,
-        WonRaise,
-        LostRaise,
-    }
-
-    impl Pot {
-        fn node(self: Pot) -> AkqNode {
-            AkqNode::Terminal {
-                player_one_payoff: match self {
-                    Pot::WonAnte => 1.0,
-                    Pot::LostAnte => -1.0,
-                    Pot::WonRaise => 2.0,
-                    Pot::LostRaise => -2.0,
-                },
-            }
-        }
-    }
-
-    struct Deal(Vec<AkqNode>);
-
-    impl Deal {
-        fn new_node(iter: impl IntoIterator<Item = AkqNode>) -> AkqNode {
-            AkqNode::Chance(Deal(iter.into_iter().collect()))
-        }
-    }
-
-    struct DealIter(f64, vec::IntoIter<AkqNode>);
-
-    impl Iterator for DealIter {
-        type Item = (f64, AkqNode);
-
-        fn next(&mut self) -> Option<Self::Item> {
-            let DealIter(frac, iter) = self;
-            iter.next().map(|node| (*frac, node))
-        }
-    }
-
-    impl ChanceNode for Deal {
-        type PlayerNode = AkqPlayer;
-        type Outcomes = DealIter;
-
-        fn into_outcomes(self) -> Self::Outcomes {
-            let Deal(vec) = self;
-            DealIter(1.0 / vec.len() as f64, vec.into_iter())
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-    enum Card {
-        A,
-        K,
-        Q,
-    }
-
-    #[derive(Debug, Hash, PartialEq, Eq)]
-    enum Action {
-        Fold,
-        Call,
-        Raise,
-    }
-
-    struct AkqPlayer {
-        player: Player,
-        infoset: Card,
-        actions: Vec<(Action, AkqNode)>,
-    }
-
-    impl AkqPlayer {
-        fn new_node(
-            player: Player,
-            infoset: Card,
-            iter: impl IntoIterator<Item = (Action, AkqNode)>,
-        ) -> AkqNode {
-            AkqNode::Player(AkqPlayer {
-                player,
-                infoset,
-                actions: iter.into_iter().collect(),
-            })
-        }
-    }
-
-    impl PlayerNode for AkqPlayer {
-        type Infoset = Card;
-        type Action = Action;
-        type ChanceNode = Deal;
-        type Actions = Vec<(Action, AkqNode)>;
-
-        fn get_player(&self) -> Player {
-            self.player
-        }
-
-        fn get_infoset(&self) -> Card {
-            self.infoset
-        }
-
-        fn into_actions(self) -> Self::Actions {
-            self.actions
-        }
-    }
-
-    type AkqNode = Node<Deal, AkqPlayer>;
-
-    fn create_akq() -> Game<Card, Action> {
-        // verify it runs
-        let aqk_poker = Deal::new_node([
-            AkqPlayer::new_node(
-                Player::One,
-                Card::Q,
-                [
-                    (Action::Call, Pot::LostAnte.node()),
-                    (
-                        Action::Raise,
-                        Deal::new_node([
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::K,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::LostRaise.node()),
-                                ],
-                            ),
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::A,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::LostRaise.node()),
-                                ],
-                            ),
-                        ]),
-                    ),
-                ],
-            ),
-            AkqPlayer::new_node(
-                Player::One,
-                Card::K,
-                [
-                    (
-                        Action::Call,
-                        Deal::new_node([Pot::WonAnte.node(), Pot::LostAnte.node()]),
-                    ),
-                    (
-                        Action::Raise,
-                        Deal::new_node([
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::Q,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::WonRaise.node()),
-                                ],
-                            ),
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::A,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::LostRaise.node()),
-                                ],
-                            ),
-                        ]),
-                    ),
-                ],
-            ),
-            AkqPlayer::new_node(
-                Player::One,
-                Card::A,
-                [
-                    (Action::Call, Pot::WonAnte.node()),
-                    (
-                        Action::Raise,
-                        Deal::new_node([
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::Q,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::WonRaise.node()),
-                                ],
-                            ),
-                            AkqPlayer::new_node(
-                                Player::Two,
-                                Card::K,
-                                [
-                                    (Action::Fold, Pot::WonAnte.node()),
-                                    (Action::Call, Pot::WonRaise.node()),
-                                ],
-                            ),
-                        ]),
-                    ),
-                ],
-            ),
-        ]);
-        Game::from_node(aqk_poker).unwrap()
-    }
-
-    #[test]
-    fn solve_full() {
-        let game = create_akq();
-        let Solution { regret, strategy } = game.solve_full(100000, 0.001);
-        assert!(regret < 0.001);
-
-        // measure regret manually
-        let reg = game.regret(&strategy).unwrap().regret();
-        assert!(reg <= regret);
-
-        // in this game, pruning should help, so we try pruning
-        let mut pruned_strat = strategy.clone();
-        pruned_strat.truncate(1e-3);
-        let pruned_reg = game.regret(&pruned_strat).unwrap().regret();
-        // NOTE given the strategies, there's no formal guarantee that pruning will reduce regret
-        // if it exploits the opponents non-pruned strategy more
-        assert!(pruned_reg <= regret * 2.0);
-
-        // verify we get the right named strategy
-        let (one, two) = game.name_strategy(&strategy).unwrap();
-
-        for (info, strat) in one {
-            match info {
-                Card::Q => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((2.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Raise => assert!((1.0 / 3.0 - prob).abs() < 0.01),
-                        }
-                    }
-                }
-                Card::K => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((1.0 - prob).abs() < 1e-3),
-                            Action::Raise => assert!((0.0 - prob).abs() < 1e-3),
-                        }
-                    }
-                }
-                Card::A => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((0.0 - prob).abs() < 1e-3),
-                            Action::Raise => assert!((1.0 - prob).abs() < 1e-3),
-                        }
-                    }
-                }
-            }
-        }
-
-        for (info, strat) in two {
-            match info {
-                Card::Q => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((1.0 - prob).abs() < 1e-3),
-                            Action::Call => assert!((0.0 - prob).abs() < 1e-3),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-                Card::K => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((2.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Call => assert!((1.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-                Card::A => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((0.0 - prob).abs() < 1e-3),
-                            Action::Call => assert!((1.0 - prob).abs() < 1e-3),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn solve_external() {
-        let game = create_akq();
-        let Solution { regret, strategy } = game.solve_external(u64::MAX, 1000, 0.001);
-        assert!(regret < 0.001);
-
-        // measure regret manually
-        let reg = game.regret(&strategy).unwrap().regret();
-        assert!(reg <= regret);
-
-        // in this game, pruning should help, so we try pruning
-        let mut pruned_strat = strategy.clone();
-        pruned_strat.truncate(1e-3);
-        let pruned_reg = game.regret(&pruned_strat).unwrap().regret();
-        // NOTE given the strategies, there's no formal guarantee that pruning will reduce regret
-        // if it exploits the opponents non-pruned strategy more
-        assert!(pruned_reg <= regret * 2.0);
-
-        // verify we get the right named strategy
-        let (one, two) = game.name_strategy(&strategy).unwrap();
-
-        for (info, strat) in one {
-            match info {
-                Card::Q => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((2.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Raise => assert!((1.0 / 3.0 - prob).abs() < 0.01),
-                        }
-                    }
-                }
-                Card::K => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((1.0 - prob).abs() < 0.01),
-                            Action::Raise => assert!((0.0 - prob).abs() < 0.01),
-                        }
-                    }
-                }
-                Card::A => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => panic!(),
-                            Action::Call => assert!((0.0 - prob).abs() < 0.01),
-                            Action::Raise => assert!((1.0 - prob).abs() < 0.01),
-                        }
-                    }
-                }
-            }
-        }
-
-        for (info, strat) in two {
-            match info {
-                Card::Q => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((1.0 - prob).abs() < 0.01),
-                            Action::Call => assert!((0.0 - prob).abs() < 0.01),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-                Card::K => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((2.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Call => assert!((1.0 / 3.0 - prob).abs() < 0.01),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-                Card::A => {
-                    for (act, prob) in strat {
-                        match act {
-                            Action::Fold => assert!((0.0 - prob).abs() < 0.01),
-                            Action::Call => assert!((1.0 - prob).abs() < 0.01),
-                            Action::Raise => panic!(),
-                        }
-                    }
-                }
-            }
-        }
+        let cloned = game.from_named(fast.as_named()).unwrap();
+        assert_eq!(fast, cloned);
     }
 }

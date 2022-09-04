@@ -5,8 +5,7 @@ Counterfactual Regret (CFR)
 [![build](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml/badge.svg)](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml)
 [![license](https://img.shields.io/github/license/erikbrinkman/cfr)](LICENSE)
 
-
-Counterfactual regret minimization of two-player zero-sum
+Counterfactual regret minimization solver for two-player zero-sum
 incomplete-information games in rust. This is a rust library and binary for
 computing approximate nash-equilibria of two-player zero-sum
 incomplete-information games.
@@ -22,34 +21,36 @@ To use the library part of this crate, add the following to your `Cargo.toml`.
 cfr = { version = "0.0.1", default-features = false }
 ```
 
-Then implement [`TerminalNode`](https://docs.rs/cfr/latest/cfr/trait.TerminalNode.html), [`ChanceNode`](https://docs.rs/cfr/latest/cfr/trait.ChanceNode.html), and [`PlayerNode`](https://docs.rs/cfr/latest/cfr/trait.PlayerNode.html) for your relevant
-objects in the game tree.
+Then implement [`IntoGameNode`](FIXME), for a type that represents a node in your game tree (or alternatively can generate new nodes).
 
 Finally execute:
 ```rust
-use cfr::{Game, Solution};
-let game = Game::from_node(...)?;
-let Solution {regret, strategy} = game.solve();
-let named = game.name_strategy(&strategy)?;
+use cfr::{Game, IntoGameNode};
+struct MyData { ... }
+impl IntoGameNode for MyData { ... }
+let game = Game::from_root(...)?;
+let strategies = game.solve_external();
+let info = strategies.get_info();
+let regret = info.regret();
+let [player_one, player_two] = strategies.as_named();
 ```
 
 ### Binary
 
-This package can also be used as a binary utilizing json format. To use first
+This package can also be used as a binary with a few different input formats.
 install it with
 
 ```bash
 $ cargo install cfr
 ```
 
-Game trees are defined using a JSON domain specific language that should be
-passed in via `stdin`. The resulting strategy for each player in addition to
-information about the strategy pair will be written to `stdout`.
+Solving a game will produce the expected utility to player one, as well as the
+regrets and the strategy found in json format.
 
 ```bash
-$ cfr < game.json
+$ cfr -i game_file
 {
-  "expected_utility": 0.05555555727916178,
+  "expected_one_utility": 0.05555555727916178,
   "player_one_regret": 1.186075528125663e-06,
   "player_two_regret": 8.061797025377127e-05,
   "regret": 8.061797025377127e-05,
@@ -58,38 +59,48 @@ $ cfr < game.json
 }
 ```
 
+The command line tool can interpret a custom [json dsl](#json-format), and
+[gambit `.efg`](#gambit-format) files.
+
+#### JSON Format
+
 The DSL is defined by:
 ```bison
-node      ::= terminal || chance || player
-terminal  ::= { "terminal": <number> }
-chance    ::= {
-                "chance": {
-                  "<named outcome>": { "prob": <number>, "state": node },
-                  ...
-                }
-              }
-player    ::= {
-                "player": {
-                  "player_one": <bool>,
-                  "infoset": <string>,
-                  "actions": { "<named action>": node, ... }
-                }
-              }
+node     ::= terminal || chance || player
+terminal ::= { "terminal": <number> }
+chance   ::= {
+               "chance": {
+                 "infoset"?: <string>,
+                 "outcomes": {
+                   "<named outcome>": { "prob": <number>, "state": node },
+                   ...
+                 }
+               }
+             }
+player   ::= {
+               "player": {
+                 "player_one": <bool>,
+                 "infoset": <string>,
+                 "actions": { "<named action>": node, ... }
+               }
+             }
 ```
 
 A minimal example highlighting all types of nodes, but of an uninteresting game is:
 ```json
 {
   "chance": {
-    "single": {
-      "prob": 1.0,
-      "state": {
-        "player": {
-          "player_one": true,
-          "infoset": "none",
-          "actions": {
-            "only": {
-              "terminal": 0.0
+    "outcomes: {
+      "single": {
+        "prob": 1.0,
+        "state": {
+          "player": {
+            "player_one": true,
+            "infoset": "none",
+            "actions": {
+              "only": {
+                "terminal": 0.0
+              }
             }
           }
         }
@@ -102,32 +113,81 @@ In this game there's a 100% chance of the `"single"` outcome, followed by a
 move by player one where they have information `"none"` and only have one
 action: `"only"`. After selecting that action, they get payoff 0.
 
+#### Gambit Format
+
+The gambit format follows the standard [gambit extensive form game
+format](https://gambitproject.readthedocs.io/en/v16.0.2/formats.html), with
+some mild restrictions.
+
+- Gambit specifies that actions are optional, but this requires every player and chance node specifies thier actions.
+- Actions must be unique, and there are some very mild restrictions on
+  non-conflicting information set names (See [duplicate infosets](#duplicate-infosets)).
+- The gambit format allows for arbitrary player, non-constant-sum extensive
+  form games, but this only allows two-player constant-sum perfect recall
+  games.
+- For efficiency this uses double precision floats, because equilibria are
+  approximate, thus in extreme circumstances payoffs might not be
+  representable.
+
 Errors
 ------
+
+This section has more details on errors the command line might return.
 
 ### Json Error
 
 This error occurs when the json doesn't match the expected format for reading.
-See [binary](#binary) for details on the specification, and make sure that the
-json you're providing matches that specification.
+See [JSON Format](#json-format) for details on the specification, and make sure
+that the json you're providing matches that specification.
+
+### Gambit Error
+
+This error occurs when the gambit file can't be parsed. There should be more
+info about exactly where the error occured. See [gambit format](#gambit-format)
+for more details on the format.
+
+### Duplicate Infosets
+
+Gambit `.efg` files don't require naming infosets, but `cfr` requires string
+names for every infoset. It will default to useing the string version of the
+infoset number, but this will fail if that infoset name is already taken. For
+example:
+
+```
+...
+p 1 1 "2" { ... } 0
+p 1 2 { ... } 0
+...
+```
+
+will throw this error as long as a name for infoset 2 isn't defined elsewhere.
+
+### Constant Sum
+
+Counterfactual regret minimization only works on constant sum games. Since
+gambit files define payoffs independently, this verifies that the range of the
+sum of every profile is less than 0.1% of the range of the of the payoffs for a
+single player. If you encounter this error, `cfr` will not for this game. 
 
 ### Game Error
 
 This error occurs if there were problems with the game specification that made
-creating a compact game impossible. There are two different ways this could
-fail, and all will come with extra information:
+creating a compact game impossible. See the documentation of
+[`GameError`](https://docs.rs/cfr/latest/cfr/enum.GameError.html) for more
+details.
 
-- `ChanceNotProbability` : This gets thrown if there's a chance node who's
-  total probability between all outcomes isn't one.
-- `ActionsNotEqual` : This gets thrown if two different states with the same
-  information sets had different actions available to them. It will report what
-  information set, player, and actions caused the error.
+### Auto Error
+
+The game file couldn't be parsed by any known game format. In order to get more
+detailed errors regarding the parsing failure, try rerunning again with
+`--input-format <format>` to get more precise errors
 
 To Do
 -----
 
-- [ ] Efficiently allocating the memory in a way that is compact, requires few 
-      allocations, and uses only safe code in rust was note easy to figure out,
-      so the current implementation does a lot of small heap allocations to
-      initialize the data structures. This could be improved in the future, but
-      doing so isn't obvious.
+- [ ] Implement multi threaded variants.
+- [ ] A lot of guarantees around memory safety are guaranteed by the nature of
+  the tree objects we traverse, but rust can't verify these memory guarantees.
+  We currently use standard rust runtime checks like `RefCell` and `Mutex`, but
+  we shouldn't need these in all circumstances, and we will be more perofrmant
+  by switching to more unsafe rust.

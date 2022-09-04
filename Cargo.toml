@@ -1,8 +1,8 @@
 [package]
 name = "cfr"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
-description = "Counterfactual regret minimization of two-player zero-sum incomplete-information games"
+description = "Counterfactual regret minimization solver for two-player zero-sum incomplete-information games"
 readme = "README.md"
 repository = "https://github.com/erikbrinkman/cfr"
 license = "MIT"
@@ -11,13 +11,16 @@ keywords = ["counterfactual", "regret", "incomplete", "information", "game"]
 [dependencies]
 serde_json = { version = "1.0", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-clap = { version = "3.2.8", features = ["derive"], optional = true }
-rand = "0.8.5"
-rand_distr = "0.4.3"
+clap = { version = "3.2", features = ["derive"], optional = true }
+rand = "0.8"
+rand_distr = "0.4"
+indexmap = "1.9"
+gambit-parser = { version = "0.1", optional = true }
+num = { version = "0.4", optional = true }
 
 [features]
 default = [ "binary" ]
-binary = ["serde", "serde_json", "clap"]
+binary = ["serde", "serde_json", "clap", "gambit-parser", "num"]
 
 [lib]
 name = "cfr"
