@@ -18,7 +18,7 @@ Usage
 To use the library part of this crate, add the following to your `Cargo.toml`.
 ```toml
 [dependencies]
-cfr = { version = "0.0.1", default-features = false }
+cfr = { version = "0.1.0", default-features = false }
 ```
 
 Then implement [`IntoGameNode`](FIXME), for a type that represents a node in your game tree (or alternatively can generate new nodes).
@@ -90,7 +90,7 @@ A minimal example highlighting all types of nodes, but of an uninteresting game 
 ```json
 {
   "chance": {
-    "outcomes: {
+    "outcomes": {
       "single": {
         "prob": 1.0,
         "state": {
