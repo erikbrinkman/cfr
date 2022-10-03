@@ -21,7 +21,10 @@ To use the library part of this crate, add the following to your `Cargo.toml`.
 cfr = { version = "0.1.0", default-features = false }
 ```
 
-Then implement [`IntoGameNode`](FIXME), for a type that represents a node in your game tree (or alternatively can generate new nodes).
+Then implement
+[`IntoGameNode`]((https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html), for
+a type that represents a node in your game tree (or alternatively can generate
+new nodes).
 
 Finally execute:
 ```rust
@@ -146,6 +149,12 @@ This error occurs when the gambit file can't be parsed. There should be more
 info about exactly where the error occured. See [gambit format](#gambit-format)
 for more details on the format.
 
+### Auto Error
+
+The game file couldn't be parsed by any known game format. In order to get more
+detailed errors regarding the parsing failure, try rerunning again with
+`--input-format <format>` to get more precise errors
+
 ### Duplicate Infosets
 
 Gambit `.efg` files don't require naming infosets, but `cfr` requires string
@@ -176,18 +185,19 @@ creating a compact game impossible. See the documentation of
 [`GameError`](https://docs.rs/cfr/latest/cfr/enum.GameError.html) for more
 details.
 
-### Auto Error
+### Solve Error
 
-The game file couldn't be parsed by any known game format. In order to get more
-detailed errors regarding the parsing failure, try rerunning again with
-`--input-format <format>` to get more precise errors
+The error occured if there were problems solving it. This should only happen if
+you requested too many threads, or the threads couldn't be spawned. See the
+documentation of
+[`SolveError`]((https://docs.rs/cfr/latest/cfr/enum.SolveError.html) for more
+details.
 
 To Do
 -----
 
-- [ ] Implement multi threaded variants.
-- [ ] A lot of guarantees around memory safety are guaranteed by the nature of
-  the tree objects we traverse, but rust can't verify these memory guarantees.
-  We currently use standard rust runtime checks like `RefCell` and `Mutex`, but
-  we shouldn't need these in all circumstances, and we will be more perofrmant
-  by switching to more unsafe rust.
+- [ ] This currently requires that infosets and actions be hashable and,
+  depending on the usecase, cloneable. Most of the functions could be rewritten
+  to take combinations of `Hash`, `Ord`, or `Clone` and use the most performant
+  option given the trait bounds. This doesn't seem particularly useful and
+  would be a lot of work, so it's omitted for now.

@@ -1,4 +1,5 @@
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum, Strategies};
+//! Tests based a kuhn poker
+use cfr::{Game, GameNode, IntoGameNode, PlayerNum, RegretBound, SolveMethod, Strategies};
 use rand::{thread_rng, Rng};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -156,10 +157,11 @@ fn create_equilibrium(
     alpha: f64,
 ) -> Strategies<(usize, bool), Action> {
     assert!(
-        (0.0..=1.0).contains(&alpha),
+        (-1e-2..=1.01).contains(&alpha),
         "alpha not in proper range: {}",
         alpha
     );
+    let alpha = f64::min(f64::max(0.0, alpha), 1.0);
     let one = vec![
         (
             (0, false),
@@ -220,23 +222,23 @@ fn equilibrium_test() {
     assert!(eqm_reg < 0.01, "equilibrium regret too large: {}", eqm_reg);
 }
 
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_full_three() {
-    let game = create_kuhn(3);
-    let (mut strategies, [one_bound, two_bound]) = game.solve_full(10000, 0.005);
+fn assert_three(
+    game: &Game<(usize, bool), Action>,
+    mut strategies: Strategies<(usize, bool), Action>,
+    bounds: RegretBound,
+) {
     strategies.truncate(1e-3);
 
     let alpha = infer_alpha(&strategies);
     let eqm = create_equilibrium(&game, alpha);
-    let [dist_one, dist_two] = strategies.distance(&eqm);
+    let [dist_one, dist_two] = strategies.distance(&eqm, 1.0);
     assert!(
-        dist_one < 0.01,
+        dist_one < 0.05,
         "first player strategy not close enough to alpha equilibrium: {}",
         dist_one
     );
     assert!(
-        dist_two < 0.01,
+        dist_two < 0.05,
         "second player strategy not close enough to alpha equilibrium: {}",
         dist_two
     );
@@ -249,93 +251,74 @@ fn solve_full_three() {
         util
     );
 
-    let bound = f64::max(one_bound, two_bound);
-    assert!(bound < 0.005, "regret bound not small enough: {}", bound);
-
-    let regret = info.regret();
-    assert!(regret <= bound, "regret not less than bound: {}", regret);
-}
-
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_sampled_three() {
-    thread_rng().fill(&mut [0; 8]);
-    let game = create_kuhn(3);
-    let (mut strategies, [one_bound, two_bound]) = game.solve_sampled(100000, 0.005);
-    strategies.truncate(1e-3);
-
-    let alpha = infer_alpha(&strategies);
-    let eqm = create_equilibrium(&game, alpha);
-    let [dist_one, dist_two] = strategies.distance(&eqm);
-    assert!(
-        dist_one < 0.02,
-        "first player strategy not close enough to alpha equilibrium: {}",
-        dist_one
-    );
-    assert!(
-        dist_two < 0.02,
-        "second player strategy not close enough to alpha equilibrium: {}",
-        dist_two
-    );
-
-    let info = strategies.get_info();
-    let util = info.player_utility(PlayerNum::One);
-    assert!(
-        (util + 1.0 / 18.0).abs() < 1e-3,
-        "utility not close to -1/18: {}",
-        util
-    );
-
-    let bound = f64::max(one_bound, two_bound);
+    let bound = bounds.regret_bound();
     assert!(bound < 0.005, "regret bound not small enough: {}", bound);
 
     let regret = info.regret();
     assert!(
-        regret <= bound * 2.0,
+        regret <= bound,
         "regret not less than bound: {} > {}",
         regret,
-        bound * 2.0
+        bound
     );
 }
 
 #[test]
 #[cfg(not(tarpaulin))]
-fn solve_external_three() {
+fn solve_full_three_single() {
+    let game = create_kuhn(3);
+    let (strategies, bound) = game.solve(SolveMethod::Full, 10000, 0.005, 0.0, 1).unwrap();
+    assert_three(&game, strategies, bound);
+}
+
+#[test]
+#[cfg(not(tarpaulin))]
+fn solve_full_three_multi() {
+    let game = create_kuhn(3);
+    let (strategies, bound) = game
+        .solve(SolveMethod::Full, 100000, 0.005, 0.0, 2)
+        .unwrap();
+    assert_three(&game, strategies, bound);
+}
+
+#[test]
+#[cfg(not(tarpaulin))]
+fn solve_sampled_three_single() {
     thread_rng().fill(&mut [0; 8]);
     let game = create_kuhn(3);
-    let (mut strategies, [one_bound, two_bound]) = game.solve_external(100000, 0.005);
-    strategies.truncate(1e-3);
+    let (strategies, bound) = game
+        .solve(SolveMethod::Sampled, 10_000_000, 0.004, 0.0, 1)
+        .unwrap();
+    assert_three(&game, strategies, bound);
+}
 
-    let alpha = infer_alpha(&strategies);
-    let eqm = create_equilibrium(&game, alpha);
-    let [dist_one, dist_two] = strategies.distance(&eqm);
-    assert!(
-        dist_one < 0.02,
-        "first player strategy not close enough to alpha equilibrium: {}",
-        dist_one
-    );
-    assert!(
-        dist_two < 0.02,
-        "second player strategy not close enough to alpha equilibrium: {}",
-        dist_two
-    );
+#[test]
+#[cfg(not(tarpaulin))]
+fn solve_sampled_three_multi() {
+    let game = create_kuhn(3);
+    let (strategies, bound) = game
+        .solve(SolveMethod::Sampled, 10_000_000, 0.004, 0.0, 2)
+        .unwrap();
+    assert_three(&game, strategies, bound);
+}
 
-    let info = strategies.get_info();
-    let util = info.player_utility(PlayerNum::One);
-    assert!(
-        (util + 1.0 / 18.0).abs() < 1e-3,
-        "utility not close to -1/18: {}",
-        util
-    );
+#[test]
+#[cfg(not(tarpaulin))]
+fn solve_external_three_single() {
+    let game = create_kuhn(3);
+    let (strategies, bound) = game
+        .solve(SolveMethod::External, 1000000, 0.004, 0.0, 1)
+        .unwrap();
+    assert_three(&game, strategies, bound);
+}
 
-    let bound = f64::max(one_bound, two_bound);
-    assert!(bound < 0.005, "regret bound not small enough: {}", bound);
-
-    let regret = info.regret();
-    assert!(
-        regret <= bound * 2.0,
-        "regret not less than bound: {} > {}",
-        regret,
-        bound * 2.0
-    );
+#[test]
+#[cfg(not(tarpaulin))]
+fn solve_external_three_multi() {
+    thread_rng().fill(&mut [0; 8]);
+    let game = create_kuhn(3);
+    let (strategies, bound) = game
+        .solve(SolveMethod::External, 1000000, 0.004, 0.0, 2)
+        .unwrap();
+    assert_three(&game, strategies, bound);
 }

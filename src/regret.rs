@@ -2,6 +2,9 @@
 use super::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use std::mem;
 
+// NOTE Some of these methods could be written to use thread pools, but it's not clear that this is
+// a large bottleneck so it's not worth the complexity
+
 pub(super) fn expected(
     node: &Node,
     chance_info: &[impl ChanceInfoset],

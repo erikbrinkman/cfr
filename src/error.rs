@@ -1,26 +1,28 @@
 #[cfg(doc)]
 use crate::Game;
+use rayon::ThreadPoolBuildError;
 
 /// Errors that result from game definition errors
 ///
 /// If the object passed into [Game::from_root] doesn't conform to necessary
 /// invariants, one of these will be returned.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[non_exhaustive]
 pub enum GameError {
-    /// Returned when a chance node has no outcomes.
+    /// Returned when a chance node has no outcomes
     EmptyChance,
-    /// Returned when a chance node has a non-positive probability of happening
+    /// Returned when a chance node has an outcome with a non-positive probability of happening
     NonPositiveChance,
     /// Returned when a chance node has different probabilities than another node in its infoset
     ProbabilitiesNotEqual,
-    /// Returned when a games infosets don't exhibit perfect recall
+    /// Returned when a game's infosets don't exhibit perfect recall
     ///
     /// If a game does have perfect recall, then a player's infosets must form a tree, that is for
-    /// all game nodes with a given infoset the players previous action node must also share the
-    /// same infoset. We ignore this criterion for single action infosets since they don't actually
+    /// all game nodes with a given infoset, the infoset of the player's previous action must be
+    /// identical. We ignore this criterion for single action infosets since they don't actually
     /// reflect a decision.
     ImperfectRecall,
-    /// Returned when a player node has no actions.
+    /// Returned when a player node has no actions
     EmptyPlayer,
     /// Returned when the actions of a player node didn't match the order and values of an earlier
     /// information set.
@@ -126,7 +128,7 @@ mod game_errors {
                                 "a",
                                 Node(GameNode::Player(
                                     PlayerNum::One,
-                                    // NOTE forgot "y"
+                                    // forgot that we played "y"
                                     "x",
                                     vec![
                                         ("a", Node(GameNode::Terminal(0.0))),
@@ -203,16 +205,17 @@ mod game_errors {
 ///
 /// If a strategy object passed to [Game::from_named] doesn't match the games information and
 /// action structure, one of these errors will be returned.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[non_exhaustive]
 pub enum StratError {
     /// Returned when the game doesn't have a specific infoset
     InvalidInfoset,
     /// Returned when the game doesn't have an action for an infoset
-    InvalidInfosetAction,
+    InvalidAction,
     /// Returned when a probability for an action is negative, nan, or infinite
     InvalidProbability,
-    /// Returned when every action in an infoset has zero probability
-    InvalidInfosetProbability,
+    /// Returned when no action in an infoset was assigned positive probability
+    UninitializedInfoset,
 }
 
 #[cfg(test)]
@@ -271,7 +274,7 @@ mod strat_errors {
         assert_eq!(err, StratError::InvalidInfoset);
 
         let err = game
-            .from_named_slow([vec![("a", vec![("b", 1.0)])], vec![]])
+            .from_named_eq([vec![("a", vec![("b", 1.0)])], vec![]])
             .unwrap_err();
         assert_eq!(err, StratError::InvalidInfoset);
     }
@@ -282,12 +285,12 @@ mod strat_errors {
         let err = game
             .from_named([vec![("x", vec![("b", 1.0)])], vec![]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetAction);
+        assert_eq!(err, StratError::InvalidAction);
 
         let err = game
-            .from_named_slow([vec![("x", vec![("b", 1.0)])], vec![]])
+            .from_named_eq([vec![("x", vec![("b", 1.0)])], vec![]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetAction);
+        assert_eq!(err, StratError::InvalidAction);
     }
 
     #[test]
@@ -299,7 +302,7 @@ mod strat_errors {
         assert_eq!(err, StratError::InvalidProbability);
 
         let err = game
-            .from_named_slow([vec![("x", vec![("a", -1.0)])], vec![]])
+            .from_named_eq([vec![("x", vec![("a", -1.0)])], vec![]])
             .unwrap_err();
         assert_eq!(err, StratError::InvalidProbability);
     }
@@ -310,12 +313,12 @@ mod strat_errors {
         let err = game
             .from_named([vec![("x", vec![("a", 1.0)])], vec![("z", vec![("c", 1.0)])]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetProbability);
+        assert_eq!(err, StratError::UninitializedInfoset);
 
         let err = game
-            .from_named_slow([vec![("x", vec![("a", 1.0)])], vec![("z", vec![("c", 1.0)])]])
+            .from_named_eq([vec![("x", vec![("a", 1.0)])], vec![("z", vec![("c", 1.0)])]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetProbability);
+        assert_eq!(err, StratError::UninitializedInfoset);
     }
 
     #[test]
@@ -324,11 +327,59 @@ mod strat_errors {
         let err = game
             .from_named([vec![("y", vec![("d", 1.0)])], vec![("z", vec![("c", 1.0)])]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetProbability);
+        assert_eq!(err, StratError::UninitializedInfoset);
 
         let err = game
-            .from_named_slow([vec![("y", vec![("d", 1.0)])], vec![("z", vec![("c", 1.0)])]])
+            .from_named_eq([vec![("y", vec![("d", 1.0)])], vec![("z", vec![("c", 1.0)])]])
             .unwrap_err();
-        assert_eq!(err, StratError::InvalidInfosetProbability);
+        assert_eq!(err, StratError::UninitializedInfoset);
+    }
+}
+
+/// Errors that result from problems solving
+///
+/// Most of of these are either caused by invalid arguments or problems creating threads when using
+/// multi-threaded solving. If explicitely using single threaded, or the input parameters are
+/// validated in advance, these can be safely unwrapped.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[non_exhaustive]
+pub enum SolveError {
+    /// Returned when the requested number of threads was too large
+    ThreadOverflow,
+    /// Returned when a multi-threaded solver couldn't create a thread pool
+    ThreadSpawnError,
+}
+
+impl From<ThreadPoolBuildError> for SolveError {
+    fn from(_: ThreadPoolBuildError) -> Self {
+        SolveError::ThreadSpawnError
+    }
+}
+
+#[cfg(test)]
+mod solve_errors {
+    use crate::{Game, GameNode, IntoGameNode, SolveError, SolveMethod};
+
+    struct Node(GameNode<Node>);
+
+    impl IntoGameNode for Node {
+        type PlayerInfo = &'static str;
+        type Action = &'static str;
+        type ChanceInfo = &'static str;
+        type Outcomes = Vec<(f64, Node)>;
+        type Actions = Vec<(&'static str, Node)>;
+
+        fn into_game_node(self) -> GameNode<Self> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn test_thread_overflow() {
+        let game = Game::from_root(Node(GameNode::Terminal(0.0))).unwrap();
+        let err = game
+            .solve(SolveMethod::Full, 0, 0.0, 0.0, usize::MAX)
+            .unwrap_err();
+        assert_eq!(err, SolveError::ThreadOverflow);
     }
 }

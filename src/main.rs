@@ -2,7 +2,7 @@ mod auto;
 mod gambit;
 mod json;
 
-use cfr::PlayerNum;
+use cfr::{PlayerNum, SolveMethod};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::borrow::Borrow;
@@ -46,8 +46,8 @@ struct Args {
     /// After finding a solution subject to max-regret and max-iters criteria, this will try
     /// pruning any strategy played less than this fraction of the time. If pruning all strategies
     /// below this threshold produces less regret then the pruned strategy is output.
-    #[clap(short = 'p', long, value_parser, default_value_t = 0.0)]
-    prune_threshold: f64,
+    #[clap(short, long, value_parser, default_value_t = 0.0)]
+    clip_threshold: f64,
 
     /// Terminate solving early if regret is below `max_regret`
     #[clap(short = 'r', long, value_parser, default_value_t = 0.0)]
@@ -57,13 +57,24 @@ struct Args {
     #[clap(short = 't', long, value_parser, default_value_t = 1000)]
     max_iters: u64,
 
+    /// Amount of parallelism to use for solving
+    ///
+    /// If set to zero (default), this will use rusts `std::thread::available_parallelism` falling
+    /// back to single threaded if this can't determine an amount.
+    #[clap(short, long, value_parser, default_value_t = 0)]
+    parallel: usize,
+
     /// Method to use for game solving
+    ///
+    /// External : alternates between players, doing regret updates for one while sampling the
+    /// other. This samples poor performing branches of the game tree less often, resulting in
+    /// faster convergence overall.
     ///
     /// Sampled : only chance nodes are sampled.
     ///
     /// Full : does no sampling, this tends to be very slow on complex games, but produces fully
     /// acurate regret estimates.
-    #[clap(short, long, value_enum, default_value_t = Method::Sampled)]
+    #[clap(short, long, value_enum, default_value_t = Method::External)]
     method: Method,
 
     /// Format of the input game file
@@ -164,14 +175,17 @@ fn main() {
     } else {
         args.max_iters
     };
-    let (mut strategies, _) = match args.method {
-        Method::Full => game.solve_full(max_iters, args.max_regret),
-        Method::Sampled => game.solve_sampled(max_iters, args.max_regret),
-        Method::External => game.solve_external(max_iters, args.max_regret),
+    let method = match args.method {
+        Method::Full => SolveMethod::Full,
+        Method::Sampled => SolveMethod::Sampled,
+        Method::External => SolveMethod::External,
     };
+    let (mut strategies, _) = game
+        .solve(method, max_iters, args.max_regret, 0.0, args.parallel)
+        .unwrap();
     let mut info = strategies.get_info();
     let mut pruned_strats = strategies.clone();
-    pruned_strats.truncate(args.prune_threshold);
+    pruned_strats.truncate(args.clip_threshold);
     let pruned_info = pruned_strats.get_info();
     if pruned_info.regret() < info.regret() {
         strategies = pruned_strats;
@@ -191,4 +205,15 @@ fn main() {
     } else {
         serde_json::to_writer(File::create(args.output).unwrap(), &out).unwrap();
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_cli() {
+        Args::command().debug_assert()
+    }
 }

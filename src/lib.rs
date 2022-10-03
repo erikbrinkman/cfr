@@ -1,25 +1,28 @@
 //! Counterfactual Regret (CFR) is a library for finding an approximate nash equilibrium in
-//! two-player zero-sum games of incomplete information, such as poker etc., using counterfactual
-//! regret minimization[^cfr] and variants[^mccfr].
+//! two-player zero-sum games of incomplete information with perfect recall, such as poker etc.,
+//! using counterfactual regret minimization[^cfr] and variants[^mccfr].
 //!
 //! # Usage
 //!
-//! To use this library, define the [IntoGameNode] trait for the representation of your [extensive
-//! form game](https://en.wikipedia.org/wiki/Extensive-form_game). See the trait for details on how
-//! to implement this. The use of [IntoIterator] allows this conversion to be zero-copy for
-//! expensive types. Once this trait is defined, a [Game] can be created with [Game::from_root].
-//! Compute an approximate equilibrium with `solve_*` methods likes [Game::solve_full]. You can
-//! then get information like utilities and regret from [Strategies::get_info].
+//! To use the command line tool, see [documentation on
+//! github](https://github.com/erikbrinkman/cfr#binary), or use `cfr --help`.
+//!
+//! To use this as a rust library, define the [IntoGameNode] trait for the representation of your
+//! [extensive form game](https://en.wikipedia.org/wiki/Extensive-form_game). See the trait for
+//! details and contracts of implementation. The use of [IntoIterator] allows this conversion to be
+//! zero-copy for expensive types, e.g. long history information sets. Once this trait is defined,
+//! create an efficient representation of the [Game] with [from_root][Game::from_root]. Compute an
+//! approximate equilibrium with [Game::solve]. You can then get equilibrium utilities and regret
+//! from [Strategies::get_info].
 //!
 //! # Examples
 //!
-//! To compute a nash equilibrium, simply define a game by implementing the relevant traits on your
-//! input data, then execute the following functions:
+//! Once the conversion trait, [IntoGameNode], is defined for your game, you solve for equilibria
+//! like:
 //!
 //! ```
-//! use cfr::{GameNode, Game, IntoGameNode};
-//! struct ExData {
-//! }
+//! # use cfr::{GameNode, Game, IntoGameNode, SolveMethod};
+//! # struct ExData {}
 //! impl IntoGameNode for ExData {
 //! # type PlayerInfo = ();
 //! # type ChanceInfo = ();
@@ -27,11 +30,21 @@
 //! # type Actions = Vec<((), ExData)>;
 //! # type Outcomes = Vec<(f64, ExData)>;
 //! # fn into_game_node(self) -> GameNode<Self> { GameNode::Terminal(0.0) }
+//!     // ...
 //! }
-//! let game = Game::from_root(ExData {
-//! }).unwrap();
-//! let (strats, reg_bounds) = game.solve_full(100, 0.0);
+//! let data: ExData = // ...
+//! # ExData {};
+//! let game = Game::from_root(data).unwrap();
+//! let (strats, reg_bounds) = game.solve(
+//!     SolveMethod::External,
+//!     100, // number of iterations
+//!     0.0, // early termination regret
+//!     0.0, // temperature - advanced option
+//!     1,   // number of threads
+//! ).unwrap();
+//! // get named versions, i.e. exportable version
 //! let named = strats.as_named();
+//! // compute regret and other values
 //! let strat_info = strats.get_info();
 //! let regret = strat_info.regret();
 //! ```
@@ -52,7 +65,7 @@ mod solve;
 mod split;
 
 use compact::{Builder, OptBuilder};
-pub use error::{GameError, StratError};
+pub use error::{GameError, SolveError, StratError};
 use solve::{external, vanilla};
 use split::{split_by, split_by_mut};
 use std::borrow::Borrow;
@@ -60,10 +73,17 @@ use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::iter::{self, FusedIterator, Once, Zip};
+use std::num::NonZeroUsize;
 use std::ptr;
 use std::slice;
+use std::thread;
 
-/// An enum indicating which player a state in the tree belongs to
+/// An enum indicating a player
+///
+/// This is used to indicate which player is acting at a given player node, as well as get regret
+/// or utilities tied to a specific player. Sometimes information for both players is returned as a
+/// two element array. In these cases, [One][PlayerNum::One] corresponds to index 0, and one
+/// [Two][PlayerNum::Two] corresponds to index 1.
 #[derive(Debug, Copy, Eq, Clone, PartialEq, Hash)]
 pub enum PlayerNum {
     /// The first player
@@ -92,39 +112,46 @@ impl PlayerNum {
 ///
 /// This enum represents a conversion type from custom data to a game node that can be turned
 /// into a full game representation. By implementing [IntoGameNode] on a custom tree-like object,
-/// you can specify a lazy allocation into the internal representation of a game, and then perform
+/// you can specify a lazy conversion into the internal representation of a game, and then perform
 /// the conversion with [Game::from_root].
 #[derive(Debug)]
 pub enum GameNode<T: IntoGameNode + ?Sized> {
-    /// A terminal node represents the end of a game, and should return the payoff to player one
+    /// A terminal node represents the end of a game
+    ///
+    /// This should contain the payoff to player one. Since games are always zero-sum, the payoff
+    /// to player two is the negative.
     Terminal(f64),
     /// A chance node selects randomly between several outcomes
     ///
-    /// The first element of the chance node is an optional infoset, if omitted its assumed this
-    /// chance node has a unique infoset. Chance nodes with the same infoset must have the same
-    /// outcome probabilities in the same order. When random sampling, chance nodes with the same
-    /// infoset will be sampled the same way.
+    /// # Fields
     ///
-    /// The second element should implement [IntoIterator] with an `Item` that's a tuple of outcome
-    /// probabilities, and a type that can be converted into a [GameNode].
+    /// - The first element of the chance node is an optional infoset, if omitted its assumed this
+    ///   chance node has a unique infoset. Chance nodes with the same infoset must have the same
+    ///   outcome probabilities in the same order. When random sampling, chance nodes with the same
+    ///   infoset will be sampled the same way.
+    /// - The second element should implement [IntoIterator] with an `Item` that's a tuple of
+    ///   outcome probabilities, and a type that can be converted into a [GameNode]. See
+    ///   [IntoGameNode::Outcomes] for more details.
     Chance(Option<T::ChanceInfo>, T::Outcomes),
     /// A player node indicate a place where agents make a strategic decision
     ///
-    /// The first element is which player number this node corresponds to.
+    /// # Fields
     ///
-    /// The second element is the infoset of this node. Nodes with the same infoset must specify
-    /// the same actions in the same order.
-    ///
-    /// The final element should implement [IntoIterator] with an `Item` that's a tuple of an
-    /// action and a type that can be converted into a [GameNode].
+    /// - The first element is which player number this node corresponds to.
+    /// - The second element is the infoset of this node. Nodes with the same infoset must specify
+    ///   the same actions in the same order.
+    /// - The final element should implement [IntoIterator] with an `Item` that's a tuple of an
+    ///   action and a type that can be converted into a [GameNode]. See [IntoGameNode::Actions]
+    ///   for more details.
     Player(PlayerNum, T::PlayerInfo, T::Actions),
 }
 
 /// A trait that defines how to convert game-tree-like data into a [Game]
 ///
 /// Define this trait on your custom data type to allow zero-copy conversion into the internal game
-/// tree representation to enable game solving. There are a lot of associated types that define how
-/// your game is represented.
+/// tree representation to enable game solving. There are five associated types that define how
+/// your game is represented. Here zero-copy means none of the types need to implement [Copy] or
+/// [Clone], but the conversion will still allocate memory for the different branches.
 ///
 /// The trait ultimately resolves to converting each of your tree nodes into a coresponding
 /// [GameNode] that contains all the information necessary for the internal game structure.
@@ -132,9 +159,9 @@ pub enum GameNode<T: IntoGameNode + ?Sized> {
 /// # Examples
 ///
 /// If you're constructing your data from scratch and don't have a custom representation then the
-/// easiest way to structure your data is with a custom singleton wrapper. Any data types that fix
-/// the required contracts should work in this scenario, but note that information sets are defined
-/// by the order of actions, so using a structure without consistent iteration order could cause
+/// easiest way to structure your data is with a custom singleton wrapper. Any data types that fit
+/// the required bounds should work in this scenario, but note that information sets are defined by
+/// the order of actions, so using a structure without consistent iteration order could cause
 /// exceptions when trying to create a full game.
 ///
 /// ```
@@ -167,8 +194,8 @@ pub enum GameNode<T: IntoGameNode + ?Sized> {
 /// );
 /// ```
 ///
-/// However, this can also be used to create more advanced games in a lazy manner. This example is
-/// only to illustrate how you would do that.
+/// However, this can also be used to create more advanced games in a lazy manner. This example
+/// illustrates a lazily created game, but note that the game itself is not interesting.
 ///
 /// ```
 /// # use cfr::{GameNode, IntoGameNode, Game, PlayerNum};
@@ -218,18 +245,19 @@ pub enum GameNode<T: IntoGameNode + ?Sized> {
 pub trait IntoGameNode {
     /// The type for player information sets
     ///
-    /// All nodes that have the same player information set are indistinguishable from each other.
-    /// That means that they must have the same actions available in the same order. In addition,
-    /// this library only works for games with perfect recall, which means that a player can't
-    /// forget their own actions. Another way to states this is that all nodes with the same
-    /// infoset must all have follow the same infoset for that player.
+    /// All nodes that have the same player information set are indistinguishable from the
+    /// perspective of the acting player.  That means that they must have the same actions
+    /// available in the same order. In addition, this library only works for games with perfect
+    /// recall, which means that a player can't forget their own actions. Another way to state this
+    /// is that all nodes with the same infoset must all have followed the same previous infoset
+    /// for that player.
     type PlayerInfo: Eq;
     /// The type of the player action
     ///
     /// Player nodes have an iterator of actions attached to future states. The actual action
-    /// representation isn't that important, but infosets must have the same actions in the same
-    /// order. When converting a set of strategies back into their named representations, these
-    /// will be used to represent them.
+    /// representation isn't important, but infosets must have the same actions in the same order.
+    /// When converting a set of strategies back into their named representations, these will be
+    /// used to represent them.
     type Action: Eq;
     /// The information set type for chance nodes
     ///
@@ -243,8 +271,16 @@ pub trait IntoGameNode {
     /// this should be set to the `!` type, or any empty type.
     type ChanceInfo: Eq;
     /// The type for iterating over the actions in a chance node
+    ///
+    /// For chance nodes in the same information set, these should iterate over outcomes in the
+    /// same order. The associated float for each outcome is a positive weight associated with that
+    /// outcome. Outcome occur proportional to their weight. In other words, the weights must all
+    /// be positive, but they don't have to sum to one.
     type Outcomes: IntoIterator<Item = (f64, Self)>;
     /// The type for iterating over the actions in a player nodes
+    ///
+    /// Actions must occur in the same order for the same information sets, so using
+    /// representations like a [std::collections::HashMap] is discouraged.
     type Actions: IntoIterator<Item = (Self::Action, Self)>;
 
     /// Convert this type into a `GameNode`
@@ -335,6 +371,7 @@ impl<I, A> PlayerInfosetData<I, A> {
     }
 }
 
+/// A generic player infoset without specific game type information
 trait PlayerInfoset {
     fn num_actions(&self) -> usize;
 
@@ -351,6 +388,7 @@ impl<I, A> PlayerInfoset for PlayerInfosetData<I, A> {
     }
 }
 
+/// A generic chance infoset without specific game type information
 trait ChanceInfoset {
     fn probs(&self) -> &[f64];
 }
@@ -361,16 +399,19 @@ impl ChanceInfoset for ChanceInfosetData {
     }
 }
 
-/// A compact game representation that includes strategies for finding approximate nash equilibria
-/// and computing regret of strategies.
+/// A compact game representation
+///
+/// This structure allows computing approximate equilibria, and evaluating the regret and utility
+/// of strategy profiles.
 #[derive(Debug)]
-pub struct Game<I, A> {
+pub struct Game<Infoset, Action> {
     chance_infosets: Box<[ChanceInfosetData]>,
-    player_infosets: [Box<[PlayerInfosetData<I, A>]>; 2],
-    single_infosets: [Box<[(I, A)]>; 2],
+    player_infosets: [Box<[PlayerInfosetData<Infoset, Action>]>; 2],
+    single_infosets: [Box<[(Infoset, Action)]>; 2],
     root: Node,
 }
 
+/// Two games are equal if and only if they are the same game
 impl<I, A> PartialEq for Game<I, A> {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(self, other)
@@ -382,7 +423,8 @@ impl<I, A> Eq for Game<I, A> {}
 impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
     /// Create a game from the root node of an arbitrary game tree
     ///
-    /// To create a game from data, the data must implement [Into<GameNode<...>>].
+    /// For more information on how to create a game, see the necessary trait [IntoGameNode] for
+    /// details on how to structure the input data.
     pub fn from_root<T>(root: T) -> Result<Self, GameError>
     where
         T: IntoGameNode<PlayerInfo = I, Action = A>,
@@ -549,73 +591,179 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
     }
 }
 
+/// The method to use for finding approximate equilibria
+///
+/// When in doubt, you'll probably want to default to [External][SolveMethod::External][^mccfr] as it
+/// generally converges faster than [Full][SolveMethod::Full][^cfr] or
+/// [Sampled][SolveMethod::Sampled][^mccfr], which are mostly provided for completeness.
+///
+/// [^cfr]: [Zinkevich, Martin, et al. "Regret minimization in games with incomplete
+/// information." Advances in neural information processing systems 20
+/// (2007)](https://proceedings.neurips.cc/paper/2007/file/08d98638c6fcd194a4b1e6992063e944-Paper.pdf).
+///
+/// [^mccfr]: [Lanctot, Marc, et al. "Monte Carlo sampling for regret minimization in extensive
+/// games." Advances in neural information processing systems 22
+/// (2009)](https://proceedings.neurips.cc/paper/2009/file/00411460f7c92d2124a67ea0f4cb5f85-Paper.pdf).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SolveMethod {
+    /// This method indicates vanilla counterfactual regret minimization, which does no random
+    /// sampling. This can be good for small games, espcially ones with very unlikely chance
+    /// outcomes, but otherwise spends a lot of computation exploring unimportant areas of the game
+    /// tree.
+    Full,
+    /// This method indicates chance sampled counterfactual regret minimization, which samples
+    /// outcomes at chance nodes, but fully explores player actions. This often performs better
+    /// than full exploration, but may produce worse results if there are infrequent but very
+    /// relevant chance outcomes.
+    ///
+    /// Since this is sampled, there's a chance that it terminates early with a small regret bound
+    /// that's slighly incorrect because it didn't sample enough chance outcomes.
+    Sampled,
+    /// This method indicates external sampled counterfactual regret minimization, which alternates
+    /// between players, and only fully explores the actions of one player, while sampling the
+    /// actions of the other according to their current strategy. This often converges faster than
+    /// the other methods because it doesn't explore sections of the game tree with low value.
+    ///
+    /// Since this is sampled, there's a chance that it terminates early with a small regret bound
+    /// that's slighly incorrect because it didn't sample enough chance outcomes.
+    External,
+}
+
 impl<I, A> Game<I, A> {
     /// Find an approximate Nash equilibrium of the current game
     ///
-    /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
-    /// that it's found a solution with regret smaller than `max_reg`.
+    /// Often you'll either want to run with `max_iter` as [usize::MAX] and `max_reg` as a meaningful
+    /// regret, or `max_iter` as a number set based off of the time you have and `max_reg` set to
+    /// 0.0, although setting both as a tradeoff also reasonable.
     ///
-    /// This uses the full vanilla CFR algorithm which is deterministc, but tends to have worse
-    /// convergence than [Game::solve_sampled] or [Game::solve_external].
-    pub fn solve_full(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
-        let [first_player, second_player] = &self.player_infosets;
-        let (regrets, probs) = vanilla::solve_full(
-            &self.root,
-            &self.chance_infosets,
-            [first_player, second_player],
-            max_iter,
-            max_reg,
+    /// # Arguments
+    ///
+    /// - `method` - The method of solving to use. When in doubt prefer
+    ///   [External][SolveMethod::External].  See [SolveMethod] for details on the distinctions.
+    /// - `max_iter` - The maximum number of iterations to run, more iterations means lower regret
+    ///   of the found strategy.
+    /// - `max_reg` - Terminate early if the regret of the returned strategy is going to be less
+    ///   than this value.
+    /// - `temp` - Set to zero unless you know what you're doing. This is an advanced parameter
+    ///   that determines what strategy to pick when all actions have non-positive regret. Positive
+    ///   infinity indicates that the uniform strategy should be played, this is consistent with
+    ///   the original description of CFR. Zero indicates that the action with the largest regret
+    ///   should be played all the time, this often converges more quickly. Other positive values
+    ///   interpolate between those two settings. Negative values panic.
+    /// - `num_threads` - The number of threads to use for solving. Zero selects based off of
+    ///   [thread::available_parallelism]. One uses a single threaded variant that's more efficient
+    ///   when not in a threaded environment.
+    ///
+    /// # Panics
+    ///
+    /// If `temp` is negative or [nan][f64::NAN], or if `max_reg` is negative or [nan][f64::NAN].
+    ///
+    /// # Errors
+    ///
+    /// If num_threads is too large, and this tries to spawn too many threads, or if there are
+    /// problems spawning threads. This will not error when `num_threads` is 1.
+    pub fn solve(
+        &self,
+        method: SolveMethod,
+        max_iter: u64,
+        max_reg: f64,
+        temp: f64,
+        num_threads: usize,
+    ) -> Result<(Strategies<I, A>, RegretBound), SolveError> {
+        assert!(
+            max_reg >= 0.0,
+            "invalid `max_reg` to solve, must be non-negative but got {}",
+            max_reg
         );
-        (Strategies { game: self, probs }, regrets)
-    }
-
-    /// Find an approximate Nash equilibrium of the current game
-    ///
-    /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
-    /// that it's found a solution with regret smaller than `max_reg`.
-    ///
-    /// This uses the sampled CFR algorithm, where chance nodes are sampled, but both player nodes
-    /// are expanded each iteration.
-    pub fn solve_sampled(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
-        let [first_player, second_player] = &self.player_infosets;
-        let (regrets, probs) = vanilla::solve_sampled(
-            &self.root,
-            &self.chance_infosets,
-            [first_player, second_player],
-            max_iter,
-            max_reg,
+        assert!(
+            temp >= 0.0,
+            "invalid `temp` to solve, must be non-negative but got {}",
+            temp
         );
-        (Strategies { game: self, probs }, regrets)
-    }
-
-    /// Find an approximate Nash equilibrium of the current game
-    ///
-    /// This will run no more than `max_iter` iterations, and terminate early if it can guarantee
-    /// that it's found a solution with regret smaller than `max_reg`.
-    ///
-    /// This uses the external CFR algorithm, where chance nodes and the oposing player's
-    /// strategies are sampled at each iteraton.
-    pub fn solve_external(&self, max_iter: u64, max_reg: f64) -> (Strategies<I, A>, [f64; 2]) {
         let [first_player, second_player] = &self.player_infosets;
-        let (regrets, probs) = external::solve_external(
-            &self.root,
-            &self.chance_infosets,
-            [first_player, second_player],
-            max_iter,
-            max_reg,
-        );
-        (Strategies { game: self, probs }, regrets)
+        let threads = NonZeroUsize::new(num_threads)
+            .or_else(|| thread::available_parallelism().ok())
+            .unwrap_or(NonZeroUsize::new(1).unwrap());
+        let (regrets, probs) = if threads == NonZeroUsize::new(1).unwrap() {
+            match method {
+                SolveMethod::Full => vanilla::solve_full_single(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                ),
+                SolveMethod::Sampled => vanilla::solve_sampled_single(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                ),
+                SolveMethod::External => external::solve_external_single(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                ),
+            }
+        } else {
+            // number of tasks to send to num_threads
+            let target = threads
+                .checked_mul(NonZeroUsize::new(3).unwrap())
+                .ok_or(SolveError::ThreadOverflow)?;
+            match method {
+                SolveMethod::Full => vanilla::solve_full_multi(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                    (threads, target),
+                ),
+                SolveMethod::Sampled => vanilla::solve_sampled_multi(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                    (threads, target),
+                ),
+                SolveMethod::External => external::solve_external_multi(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    temp,
+                    (threads, target),
+                ),
+            }?
+        };
+        Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
     }
 }
 
 impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     /// Convert a named strategy into [Strategies]
     ///
+    /// The input can be any set of types that vaguelly iterates over pairs of information sets and
+    /// then actions paired to weights. Weights can be any non-negative f64, which will be
+    /// normalized in the final strategy. There are no restrictions on iteration order.
+    ///
     /// # Example
     ///
     /// ```
     /// use std::collections::HashMap;
     /// # use cfr::{GameNode, Game, IntoGameNode, PlayerNum};
+    ///
     /// # struct Node(GameNode<Node>);
     /// # impl IntoGameNode for Node {
     /// # type PlayerInfo = &'static str;
@@ -625,18 +773,19 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     /// # type Actions = Vec<(&'static str, Node)>;
     /// # fn into_game_node(self) -> GameNode<Self> { self.0 }
     /// # }
-    /// let game = Game::from_root(
-    /// # Node(GameNode::Chance(None, vec![
-    /// #     (0.5, Node(GameNode::Player(PlayerNum::One, "info", vec![
-    /// #         ("A", Node(GameNode::Terminal(0.0))),
-    /// #         ("B", Node(GameNode::Terminal(0.0))),
-    /// #     ]))),
-    /// #     (0.5, Node(GameNode::Player(PlayerNum::Two, "info", vec![
-    /// #         ("1", Node(GameNode::Terminal(0.0))),
-    /// #         ("2", Node(GameNode::Terminal(0.0))),
-    /// #     ]))),
-    /// # ]))
-    /// ).unwrap();
+    /// let game = // ...
+    /// # Game::from_root(
+    /// #     Node(GameNode::Chance(None, vec![
+    /// #         (0.5, Node(GameNode::Player(PlayerNum::One, "info", vec![
+    /// #             ("A", Node(GameNode::Terminal(0.0))),
+    /// #             ("B", Node(GameNode::Terminal(0.0))),
+    /// #         ]))),
+    /// #         (0.5, Node(GameNode::Player(PlayerNum::Two, "info", vec![
+    /// #             ("1", Node(GameNode::Terminal(0.0))),
+    /// #             ("2", Node(GameNode::Terminal(0.0))),
+    /// #         ]))),
+    /// #     ]))
+    /// # ).unwrap();
     /// let one: HashMap<&'static str, HashMap<&'static str, f64>> = [
     ///     ("info", [("A", 0.2), ("B", 0.8)].into())
     /// ].into();
@@ -647,6 +796,11 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     /// let info = strat.get_info();
     /// info.regret();
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// This will error if a valid strategy wasn't specified for every infoset, or it received
+    /// invalid infosets or actions for the current [Game].
     pub fn from_named(
         &self,
         strats: [impl IntoIterator<
@@ -702,9 +856,7 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
                     let action = baction.borrow();
                     let prob = bprob.borrow();
                     if prob >= &0.0 && prob.is_finite() {
-                        let ind = action_inds
-                            .get(action)
-                            .ok_or(StratError::InvalidInfosetAction)?;
+                        let ind = action_inds.get(action).ok_or(StratError::InvalidAction)?;
                         dense[*ind] = *prob;
                     } else {
                         return Err(StratError::InvalidProbability);
@@ -715,7 +867,7 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
                     let action = baction.borrow();
                     let prob = bprob.borrow();
                     if &action != act {
-                        return Err(StratError::InvalidInfosetAction);
+                        return Err(StratError::InvalidAction);
                     } else if prob >= &0.0 && prob.is_finite() {
                         *seen = true;
                     } else {
@@ -731,7 +883,7 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
         for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
             let total: f64 = vals.iter().sum();
             if total == 0.0 {
-                return Err(StratError::InvalidInfosetProbability);
+                return Err(StratError::UninitializedInfoset);
             } else {
                 for val in vals.iter_mut() {
                     *val /= total;
@@ -739,24 +891,27 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
             }
         }
         if !singles.into_values().all(|(_, seen)| seen) {
-            return Err(StratError::InvalidInfosetProbability);
+            return Err(StratError::UninitializedInfoset);
         }
 
         Ok(dense)
     }
 }
 
-impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
+impl<I: Eq, A: Eq> Game<I, A> {
     /// Convert a named strategy into [Strategies]
     ///
-    /// In case cloning is very expensive, this version doesn't require cloning, but otherwise
-    /// runs in time quadratic in the number of infosets and actions, which is almost certaintly
-    /// going to be worse than the cost of cloning.
+    /// In case cloning is very expensive, this version doesn't require cloning or hashing, but
+    /// otherwise runs in time quadratic in the number of infosets and actions, which is almost
+    /// certaintly going to be worse than the cost of cloning.
+    ///
+    /// Also note that currently constructing the [Game] requires hashing so that relaxation is
+    /// meaningless.
     ///
     /// This is otherwise the same as [Game::from_named], so see that method for examples.
     // NOTE this is very similar to from_named, but writing it generically with traits wasn't worth
     // that overhead
-    pub fn from_named_slow(
+    pub fn from_named_eq(
         &self,
         strats: [impl IntoIterator<
             Item = (
@@ -813,7 +968,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                             .iter()
                             .enumerate()
                             .find(|(_, act)| act == &action)
-                            .ok_or(StratError::InvalidInfosetAction)?;
+                            .ok_or(StratError::InvalidAction)?;
                         dense[info_ind + act_ind] = *prob;
                     } else {
                         return Err(StratError::InvalidProbability);
@@ -828,7 +983,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                     let action = baction.borrow();
                     let prob = bprob.borrow();
                     if action != act {
-                        return Err(StratError::InvalidInfosetAction);
+                        return Err(StratError::InvalidAction);
                     } else if prob >= &0.0 && prob.is_finite() {
                         seen_singles[ind] = true;
                     } else {
@@ -844,7 +999,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
         for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
             let total: f64 = vals.iter().sum();
             if total == 0.0 {
-                return Err(StratError::InvalidInfosetProbability);
+                return Err(StratError::UninitializedInfoset);
             } else {
                 for val in vals.iter_mut() {
                     *val /= total;
@@ -852,7 +1007,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
             }
         }
         if !Vec::from(seen_singles).into_iter().all(|seen| seen) {
-            return Err(StratError::InvalidInfosetProbability);
+            return Err(StratError::UninitializedInfoset);
         }
 
         Ok(dense)
@@ -860,12 +1015,18 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
 }
 
 /// A compact strategy for both players
+///
+/// Strategies are tied to a specific game and maintain a reference back to them. Create these from
+/// original data using [Game::from_named].
 #[derive(Debug, Clone)]
-pub struct Strategies<'a, I, A> {
-    game: &'a Game<I, A>,
+pub struct Strategies<'a, Infoset, Action> {
+    game: &'a Game<Infoset, Action>,
     probs: [Box<[f64]>; 2],
 }
 
+/// Strategies are equal if they contain identical values and are from the same game
+///
+/// Equality is strict since action probabilities can't be [nan][f64::NAN].
 impl<'a, I, A> PartialEq for Strategies<'a, I, A> {
     fn eq(&self, other: &Self) -> bool {
         self.game == other.game && self.probs == other.probs
@@ -876,6 +1037,36 @@ impl<'a, I, A> Eq for Strategies<'a, I, A> {}
 
 impl<'a, I, A> Strategies<'a, I, A> {
     /// Attach player, infoset, and action information to a strategy
+    ///
+    /// Use this to convert a strategy profile into an exportable format.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, PlayerNum};
+    /// # struct ExData {}
+    /// # impl IntoGameNode for ExData {
+    /// # type PlayerInfo = ();
+    /// # type ChanceInfo = ();
+    /// # type Action = ();
+    /// # type Actions = Vec<((), ExData)>;
+    /// # type Outcomes = Vec<(f64, ExData)>;
+    /// # fn into_game_node(self) -> GameNode<Self> { GameNode::Terminal(0.0) }
+    /// # }
+    /// # let data: ExData = ExData {};
+    /// let game = // ...
+    /// # Game::from_root(data).unwrap();
+    /// let (strats, _) = game.solve(
+    ///     // ...
+    /// # SolveMethod::External, 1, 0.0, 0.0, 1
+    /// ).unwrap();
+    /// let [player_one_strat, player_two_strat] = strats.as_named();
+    /// for (infoset, actions) in player_one_strat {
+    ///     for (action, prob) in actions {
+    ///         // ...
+    ///     }
+    /// }
+    /// ```
     pub fn as_named<'b: 'a>(&'b self) -> [NamedStrategyIter<'a, I, A>; 2] {
         let [info_one, info_two] = &self.game.player_infosets;
         let [single_one, single_two] = &self.game.single_infosets;
@@ -887,6 +1078,10 @@ impl<'a, I, A> Strategies<'a, I, A> {
     }
 
     /// Truncate actions with small probability
+    ///
+    /// Since CFR produces approximate equilibria, often it will return a strategy with very low
+    /// probability of playing an action that should never actually be played. Use this to truncate
+    /// the probability of small actions when they're played less than `thresh` of the time.
     pub fn truncate(&mut self, thresh: f64) {
         for (infos, box_probs) in self.game.player_infosets.iter().zip(self.probs.iter_mut()) {
             for strat in split_by_mut(
@@ -903,18 +1098,22 @@ impl<'a, I, A> Strategies<'a, I, A> {
 
     /// Get the distance between this strategy and another strategy
     ///
-    /// This computes the avg of the l1 earth movers distance between the strategies for each
+    /// This computes the avg of the l-`p` earth movers distance between the strategies for each
     /// player, thus the value is between 0 and 1 where 0 represents identical strategies, and 1
     /// represents strategies that share no support.
     ///
+    /// This is only a valid distance if `p` is at least 1, which should also be the default
+    /// setting.
+    ///
     /// # Panics
     ///
-    /// Panics if `other` isn't from the same game.
-    pub fn distance(&self, other: &Self) -> [f64; 2] {
+    /// Panics if `other` isn't from the same game, or if `p` isn't positive
+    pub fn distance(&self, other: &Self, p: f64) -> [f64; 2] {
         assert!(
             self.game == other.game,
             "can only compare strategies for the same game"
         );
+        assert!(p > 0.0, "`p` must be positive but got: {}", p);
         let dists: Vec<_> = self
             .probs
             .iter()
@@ -923,7 +1122,7 @@ impl<'a, I, A> Strategies<'a, I, A> {
             .map(|((left, right), info)| {
                 let mut dist = 0.0;
                 for (left_val, right_val) in left.iter().zip(right.iter()) {
-                    dist += (left_val - right_val).abs();
+                    dist += (left_val - right_val).abs().powf(p);
                 }
                 dist / info.len() as f64
             })
@@ -946,6 +1145,31 @@ impl<'a, I, A> Strategies<'a, I, A> {
             [&*one_split, &*two_split],
         );
         StrategiesInfo { util, regrets }
+    }
+}
+
+/// Regret bound produced by solving a game
+///
+/// This represents an upperbound on the regrets of the returned strategy
+#[derive(Debug, Clone)]
+pub struct RegretBound {
+    regrets: [f64; 2],
+}
+
+impl RegretBound {
+    fn new(regrets: [f64; 2]) -> Self {
+        RegretBound { regrets }
+    }
+
+    /// Get the regret bound of a specific player
+    pub fn player_regret_bound(&self, player_num: PlayerNum) -> f64 {
+        *player_num.ind(&self.regrets)
+    }
+
+    /// Get the total regret bound
+    pub fn regret_bound(&self) -> f64 {
+        let [one, two] = self.regrets;
+        f64::max(one, two)
     }
 }
 
@@ -978,13 +1202,13 @@ impl StrategiesInfo {
 
 /// An iterator over named information sets of a strategy.
 ///
-/// This is returned when getting named [Strategies] using
-/// [Strategies::as_named].
+/// This is returned when getting the names attached to [Strategies] using
+/// [as_named][Strategies::as_named].
 #[derive(Debug)]
-pub struct NamedStrategyIter<'a, I, A> {
-    info: &'a [PlayerInfosetData<I, A>],
+pub struct NamedStrategyIter<'a, Infoset, Action> {
+    info: &'a [PlayerInfosetData<Infoset, Action>],
     probs: &'a [f64],
-    singles: slice::Iter<'a, (I, A)>,
+    singles: slice::Iter<'a, (Infoset, Action)>,
 }
 
 impl<'a, I, A> NamedStrategyIter<'a, I, A> {
@@ -1035,11 +1259,11 @@ impl<'a, I, A> ExactSizeIterator for NamedStrategyIter<'a, I, A> {}
 
 /// An iterator over named actions and assiciated probabilities
 ///
-/// This is returned when getting named [Strategies] using
-/// [Strategies::as_named].
+/// This is returned when getting the names attached to [Strategies] using
+/// [as_named][Strategies::as_named].
 #[derive(Debug)]
-pub struct NamedStrategyActionIter<'a, A> {
-    iter: ActionType<'a, A>,
+pub struct NamedStrategyActionIter<'a, Action> {
+    iter: ActionType<'a, Action>,
 }
 
 #[derive(Debug)]
@@ -1075,7 +1299,7 @@ impl<'a, A> ExactSizeIterator for NamedStrategyActionIter<'a, A> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Game, GameNode, IntoGameNode, PlayerNum};
+    use super::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod};
 
     struct Node(GameNode<Node>);
 
@@ -1130,15 +1354,50 @@ mod tests {
             ])
             .unwrap();
         let slow = game
-            .from_named_slow([
+            .from_named_eq([
                 vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 2.0)])],
                 vec![("z", vec![("b", 2.0), ("c", 3.0)])],
             ])
             .unwrap();
         assert_eq!(fast, slow);
-        assert_eq!(fast.distance(&slow), [0.0; 2]);
+        assert_eq!(fast.distance(&slow, 1.0), [0.0; 2]);
 
         let cloned = game.from_named(fast.as_named()).unwrap();
         assert_eq!(fast, cloned);
+    }
+
+    #[test]
+    #[should_panic(expected = "`max_reg`")]
+    fn test_solve_max_reg_panic() {
+        let game = create_game();
+        game.solve(SolveMethod::Full, 0, f64::NAN, 0.0, 1).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "`temp`")]
+    fn test_solve_temp_panic() {
+        let game = create_game();
+        game.solve(SolveMethod::Full, 0, 0.0, f64::NAN, 1).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "same game")]
+    fn test_distance_game_panic() {
+        let game_one = create_game();
+        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+
+        let game_two = create_game();
+        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+
+        strat_one.distance(&strat_two, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "`p` must be positive")]
+    fn test_distance_p_panic() {
+        let game = create_game();
+        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+        strat_one.distance(&strat_two, 0.0);
     }
 }
