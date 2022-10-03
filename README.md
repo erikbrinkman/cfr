@@ -1,9 +1,9 @@
 Counterfactual Regret (CFR)
 ===========================
 [![crates.io](https://img.shields.io/crates/v/cfr)](https://crates.io/crates/cfr)
-[![docs](https://img.shields.io/badge/docs-docs.rs-blue)](https://docs.rs/cfr/latest/cfr/)
-[![build](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml/badge.svg)](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml)
+[![docs](https://docs.rs/cfr/badge.svg)](https://docs.rs/cfr)
 [![license](https://img.shields.io/github/license/erikbrinkman/cfr)](LICENSE)
+[![build](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml/badge.svg)](https://github.com/erikbrinkman/cfr/actions/workflows/rust.yml)
 
 Counterfactual regret minimization solver for two-player zero-sum
 incomplete-information games in rust. This is a rust library and binary for
