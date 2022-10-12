@@ -190,7 +190,7 @@ details.
 The error occured if there were problems solving it. This should only happen if
 you requested too many threads, or the threads couldn't be spawned. See the
 documentation of
-[`SolveError`]((https://docs.rs/cfr/latest/cfr/enum.SolveError.html) for more
+[`SolveError`](https://docs.rs/cfr/latest/cfr/enum.SolveError.html) for more
 details.
 
 To Do
