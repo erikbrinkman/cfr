@@ -196,6 +196,10 @@ details.
 To Do
 -----
 
+- [ ] With the implementation of discounted CFR, the incremental regret updates
+  hold even less frequrntly. We should instead check the true regret after a
+  certain number of iterations. This takes some restructuing, as well as some
+  benchmarking to make sure that time isn't wasted on regret calculation.
 - [ ] This currently requires that infosets and actions be hashable and,
   depending on the usecase, cloneable. Most of the functions could be rewritten
   to take combinations of `Hash`, `Ord`, or `Clone` and use the most performant

@@ -186,5 +186,8 @@ pub(super) fn regret(
     let expected = expected(start, chance_info, strat_info);
     let one = optimal_deviations::<true>(start, chance_info, player_info[0], strat_info[1]);
     let two = optimal_deviations::<false>(start, chance_info, player_info[1], strat_info[0]);
-    (expected, [one - expected, two + expected])
+    (
+        expected,
+        [f64::max(one - expected, 0.0), f64::max(two + expected, 0.0)],
+    )
 }

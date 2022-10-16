@@ -1,6 +1,6 @@
 use cfr::{Game, GameNode, IntoGameNode, PlayerNum};
 use gambit_parser::{Error, ExtensiveFormGame, Node};
-use num::cast::ToPrimitive;
+use num_traits::cast::ToPrimitive;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 

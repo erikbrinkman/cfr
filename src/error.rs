@@ -378,7 +378,7 @@ mod solve_errors {
     fn test_thread_overflow() {
         let game = Game::from_root(Node(GameNode::Terminal(0.0))).unwrap();
         let err = game
-            .solve(SolveMethod::Full, 0, 0.0, 0.0, usize::MAX)
+            .solve(SolveMethod::Full, 0, 0.0, usize::MAX, None)
             .unwrap_err();
         assert_eq!(err, SolveError::ThreadOverflow);
     }

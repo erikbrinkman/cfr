@@ -1,5 +1,5 @@
 //! External regret solving
-use super::data::{CachedPayoff, RegretInfoset, SampledChance, SolveInfo};
+use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use super::multinomial::Multinomial;
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use by_address::ByAddress;
@@ -82,7 +82,7 @@ impl<T: ChanceInfo> ChanceRecurse for Mutex<T> {
 trait ActiveInfo {
     fn recurse(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64;
 
-    fn advance(&mut self, temp: f64) -> f64;
+    fn advance<const FIRST: bool>(&mut self, it: u64, params: &RegretParams) -> f64;
 }
 
 trait ActiveRecurse {
@@ -154,10 +154,15 @@ impl ActiveInfo for CachedInfoset {
         expected
     }
 
-    fn advance(&mut self, temp: f64) -> f64 {
+    fn advance<const FIRST: bool>(&mut self, it: u64, params: &RegretParams) -> f64 {
         self.cached = 0;
-        self.reg.regret_match(temp);
-        self.reg.cum_regret()
+        params.regret_match(&mut *self.reg.cum_regret, &mut self.reg.strat);
+        params.discount_cum_regret(it, &mut *self.reg.cum_regret);
+        // NOTE since we alternate updates, when do the first discounting of player one's average
+        // strat, they'll actually have nothing acumulated, so we actualy want to update on the
+        // second round
+        params.discount_average_strat(if FIRST { it - 1 } else { it }, &mut self.reg.cum_strat);
+        params.cum_regret(it, &mut *self.reg.cum_regret)
     }
 }
 
@@ -298,12 +303,13 @@ impl<'a> Workspace<'a> {
 fn single_player_iter<'a, const FIRST: bool>(
     root: &'a Node,
     chance_infosets: &mut [Mutex<SampledChance>],
-    active_player_infosets: &mut [Mutex<CachedInfoset>],
-    external_player_infosets: &mut [Mutex<CachedInfoset>],
+    player_infosets: [&mut [Mutex<CachedInfoset>]; 2],
     target: NonZeroUsize,
-    temp: f64,
     work: &mut Workspace<'a>,
+    it: u64,
+    params: &RegretParams,
 ) -> f64 {
+    let [active_player_infosets, external_player_infosets] = player_infosets;
     // compute threashold of `target` nodes for efficient multi threading
     thread_threshold::<FIRST>(
         root,
@@ -341,7 +347,7 @@ fn single_player_iter<'a, const FIRST: bool>(
         .for_each(|info| info.get_mut().unwrap().advance());
     active_player_infosets
         .par_iter_mut()
-        .map(|info| info.get_mut().unwrap().advance(temp))
+        .map(|info| info.get_mut().unwrap().advance::<FIRST>(it, params))
         .sum()
 }
 
@@ -351,8 +357,8 @@ pub(crate) fn solve_external_multi(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
     thread_info: (NonZeroUsize, NonZeroUsize),
+    params: &RegretParams,
 ) -> Result<SolveInfo, ThreadPoolBuildError> {
     let (num_threads, target) = thread_info;
     // NOTE these are Box's not Arcs so that at the end of the threaded computation we can move
@@ -382,23 +388,21 @@ pub(crate) fn solve_external_multi(
             reg_one = single_player_iter::<true>(
                 root,
                 &mut chance_infosets,
-                &mut player_one,
-                &mut player_two,
+                [&mut player_one, &mut player_two],
                 target,
-                temp,
                 &mut work,
+                it,
+                params,
             );
-            reg_one *= 2.0 / it as f64;
             reg_two = single_player_iter::<false>(
                 root,
                 &mut chance_infosets,
-                &mut player_two,
-                &mut player_one,
+                [&mut player_two, &mut player_one],
                 target,
-                temp,
                 &mut work,
+                it,
+                params,
             );
-            reg_two *= 2.0 / it as f64;
             // check to terminate
             if f64::max(reg_one, reg_two) < max_reg {
                 break;
@@ -421,7 +425,7 @@ pub(crate) fn solve_external_single(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
+    params: &RegretParams,
 ) -> SolveInfo {
     let mut chance_infosets: Box<[_]> = chance_info
         .iter()
@@ -442,9 +446,8 @@ pub(crate) fn solve_external_single(
             .for_each(|info| info.get_mut().advance());
         reg_one = player_one
             .iter_mut()
-            .map(|info| info.get_mut().advance(temp))
+            .map(|info| info.get_mut().advance::<true>(it, params))
             .sum();
-        reg_one *= 2.0 / it as f64;
         // player two
         recurse_regret::<false>(start, &chance_infosets, &player_two, &player_one, &());
         chance_infosets
@@ -452,9 +455,8 @@ pub(crate) fn solve_external_single(
             .for_each(|info| info.get_mut().advance());
         reg_two = player_two
             .iter_mut()
-            .map(|info| info.get_mut().advance(temp))
+            .map(|info| info.get_mut().advance::<false>(it, params))
             .sum();
-        reg_two *= 2.0 / it as f64;
         // check to terminate
         if f64::max(reg_one, reg_two) < max_reg {
             break;
@@ -471,7 +473,7 @@ pub(crate) fn solve_external_single(
 
 #[cfg(test)]
 mod tests {
-    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
+    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams};
     use std::num::NonZeroUsize;
 
     #[derive(Debug, Clone)]
@@ -543,8 +545,8 @@ mod tests {
             [&pone, &ptwo],
             1000,
             0.0,
-            0.0,
             (NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap()),
+            &RegretParams::vanilla(),
         )
         .unwrap();
         assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);
@@ -598,8 +600,14 @@ mod tests {
     #[test]
     fn test_external_simple() {
         let (root, chance, [one, two]) = simple_game();
-        let ([reg_one, reg_two], [strat_one, strat_two]) =
-            super::solve_external_single(&root, &*chance, [&*one, &*two], 1000, 0.0, 0.0);
+        let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_external_single(
+            &root,
+            &*chance,
+            [&*one, &*two],
+            1000,
+            0.0,
+            &RegretParams::vanilla(),
+        );
         assert!(strat_one[1] < 0.05);
         assert!(strat_two[0] < 0.05);
         assert!(reg_one < 0.05);
@@ -609,10 +617,16 @@ mod tests {
     #[test]
     fn test_external_even_or_odd() {
         let (root, chance, [one, two]) = even_or_odd();
-        let ([reg_one, reg_two], [strat_one, strat_two]) =
-            super::solve_external_single(&root, &*chance, [&*one, &*two], 10000, 0.05, 0.0);
-        assert!((strat_one[1] - 0.5).abs() < 0.05);
-        assert!((strat_two[0] - 0.5).abs() < 0.05);
+        let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_external_single(
+            &root,
+            &*chance,
+            [&*one, &*two],
+            10_000,
+            0.005,
+            &RegretParams::vanilla(),
+        );
+        assert!((strat_one[1] - 0.5).abs() < 0.05, "{:?}", strat_one);
+        assert!((strat_two[0] - 0.5).abs() < 0.05, "{:?}", strat_two);
         assert!(reg_one < 0.05);
         assert!(reg_two < 0.05);
     }

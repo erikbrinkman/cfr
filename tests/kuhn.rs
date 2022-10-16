@@ -1,6 +1,7 @@
-//! Tests based a kuhn poker
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum, RegretBound, SolveMethod, Strategies};
+//! Tests based on kuhn poker
+use cfr::{Game, GameNode, IntoGameNode, PlayerNum, RegretParams, SolveMethod, Strategies};
 use rand::{thread_rng, Rng};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Impossible {}
@@ -152,10 +153,7 @@ fn infer_alpha(strat: &Strategies<(usize, bool), Action>) -> f64 {
     alpha
 }
 
-fn create_equilibrium(
-    game: &Game<(usize, bool), Action>,
-    alpha: f64,
-) -> Strategies<(usize, bool), Action> {
+fn create_equilibrium(alpha: f64) -> [Vec<((usize, bool), Vec<(Action, f64)>)>; 2] {
     assert!(
         (-1e-2..=1.01).contains(&alpha),
         "alpha not in proper range: {}",
@@ -187,15 +185,15 @@ fn create_equilibrium(
         ((1, true), vec![(Action::Call, 1.0), (Action::Fold, 2.0)]),
         ((2, true), vec![(Action::Call, 1.0)]),
     ];
-    game.from_named([one, two]).unwrap()
+    [one, two]
 }
 
 #[test]
 #[cfg(not(tarpaulin))]
-fn equilibrium_test() {
+fn test_equilibrium() {
     let game = create_kuhn(3);
 
-    let eqm = create_equilibrium(&game, 0.5);
+    let eqm = game.from_named(create_equilibrium(0.5)).unwrap();
     let info = eqm.get_info();
 
     let util = info.player_utility(PlayerNum::One);
@@ -208,7 +206,7 @@ fn equilibrium_test() {
     let eqm_reg = info.regret();
     assert!(eqm_reg < 0.01, "equilibrium regret too large: {}", eqm_reg);
 
-    let eqm = create_equilibrium(&game, 1.0);
+    let eqm = game.from_named(create_equilibrium(1.0)).unwrap();
     let info = eqm.get_info();
 
     let util = info.player_utility(PlayerNum::One);
@@ -222,106 +220,131 @@ fn equilibrium_test() {
     assert!(eqm_reg < 0.01, "equilibrium regret too large: {}", eqm_reg);
 }
 
-fn assert_three(
-    game: &Game<(usize, bool), Action>,
-    mut strategies: Strategies<(usize, bool), Action>,
-    bounds: RegretBound,
-) {
-    strategies.truncate(1e-3);
+#[test]
+#[cfg(not(tarpaulin))]
+fn test_regret() {
+    let game = create_kuhn(3);
 
-    let alpha = infer_alpha(&strategies);
-    let eqm = create_equilibrium(&game, alpha);
-    let [dist_one, dist_two] = strategies.distance(&eqm, 1.0);
-    assert!(
-        dist_one < 0.05,
-        "first player strategy not close enough to alpha equilibrium: {}",
-        dist_one
-    );
-    assert!(
-        dist_two < 0.05,
-        "second player strategy not close enough to alpha equilibrium: {}",
-        dist_two
-    );
+    let [one, _] = create_equilibrium(0.5);
+    let bad = vec![
+        ((0, false), vec![(Action::Raise, 1.0)]),
+        ((1, false), vec![(Action::Raise, 1.0)]),
+        ((2, false), vec![(Action::Call, 1.0)]),
+        ((0, true), vec![(Action::Call, 1.0)]),
+        ((1, true), vec![(Action::Call, 1.0)]),
+        ((2, true), vec![(Action::Fold, 1.0)]),
+    ];
+    let eqm = game.from_named([one, bad]).unwrap();
+    let info = eqm.get_info();
 
-    let info = strategies.get_info();
     let util = info.player_utility(PlayerNum::One);
-    assert!(
-        (util + 1.0 / 18.0).abs() < 1e-3,
-        "utility not close to -1/18: {}",
-        util
-    );
-
-    let bound = bounds.regret_bound();
-    assert!(bound < 0.005, "regret bound not small enough: {}", bound);
-
-    let regret = info.regret();
-
-    // NOTE with the sampled versions, the bound can be a bit higher
-    let eff_bound = bound * 1.5;
-    assert!(
-        regret <= eff_bound,
-        "regret not less than effective bound: {} > {}",
-        regret,
-        eff_bound
-    );
+    assert!(util > 0.0, "utility not positive: {}", util);
 }
 
 #[test]
 #[cfg(not(tarpaulin))]
-fn solve_full_three_single() {
-    let game = create_kuhn(3);
-    let (strategies, bound) = game.solve(SolveMethod::Full, 10000, 0.005, 0.0, 1).unwrap();
-    assert_three(&game, strategies, bound);
+fn test_solve_three() {
+    let owned_game = create_kuhn(3);
+    let game = &owned_game;
+    // test all methods with multi threading
+    [
+        SolveMethod::Full,
+        SolveMethod::Sampled,
+        SolveMethod::External,
+    ]
+    .into_par_iter()
+    .flat_map(|method| [1, 2].into_par_iter().map(move |threads| (method, threads)))
+    .for_each(|(method, threads)| {
+        thread_rng().fill(&mut [0; 8]);
+        let (mut strategies, bounds) = game
+            .solve(
+                method,
+                10_000_000,
+                0.005,
+                threads,
+                Some(RegretParams::vanilla()),
+            )
+            .unwrap();
+        strategies.truncate(1e-3);
+
+        let alpha = infer_alpha(&strategies);
+        let eqm = game.from_named(create_equilibrium(alpha)).unwrap();
+        let [dist_one, dist_two] = strategies.distance(&eqm, 1.0);
+        assert!(
+            dist_one < 0.05,
+            "first player strategy not close enough to alpha equilibrium: {} [{:?} {}]",
+            dist_one,
+            method,
+            threads
+        );
+        assert!(
+            dist_two < 0.05,
+            "second player strategy not close enough to alpha equilibrium: {} [{:?} {}]",
+            dist_two,
+            method,
+            threads
+        );
+
+        let info = strategies.get_info();
+        let util = info.player_utility(PlayerNum::One);
+        assert!(
+            (util + 1.0 / 18.0).abs() < 1e-3,
+            "utility not close to -1/18: {} [{:?} {}]",
+            util,
+            method,
+            threads
+        );
+
+        let bound = bounds.regret_bound();
+        assert!(
+            bound < 0.005,
+            "regret bound not small enough: {} [{:?} {}]",
+            bound,
+            method,
+            threads
+        );
+
+        let regret = info.regret();
+
+        // NOTE with the sampled versions, the bound can be a bit higher
+        let eff_bound = bound * 2.0;
+        assert!(
+            regret <= eff_bound,
+            "regret not less than effective bound: {} > {} [{:?} {}]",
+            regret,
+            eff_bound,
+            method,
+            threads,
+        );
+    });
 }
 
+// NOTE discounts don't have accurate regret thresholds
 #[test]
 #[cfg(not(tarpaulin))]
-fn solve_full_three_multi() {
-    let game = create_kuhn(3);
-    let (strategies, bound) = game
-        .solve(SolveMethod::Full, 100000, 0.005, 0.0, 2)
-        .unwrap();
-    assert_three(&game, strategies, bound);
-}
-
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_sampled_three_single() {
-    thread_rng().fill(&mut [0; 8]);
-    let game = create_kuhn(3);
-    let (strategies, bound) = game
-        .solve(SolveMethod::Sampled, 10_000_000, 0.005, 0.0, 1)
-        .unwrap();
-    assert_three(&game, strategies, bound);
-}
-
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_sampled_three_multi() {
-    let game = create_kuhn(3);
-    let (strategies, bound) = game
-        .solve(SolveMethod::Sampled, 10_000_000, 0.005, 0.0, 2)
-        .unwrap();
-    assert_three(&game, strategies, bound);
-}
-
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_external_three_single() {
-    let game = create_kuhn(3);
-    let (strategies, bound) = game
-        .solve(SolveMethod::External, 1000000, 0.005, 0.0, 1)
-        .unwrap();
-    assert_three(&game, strategies, bound);
-}
-
-#[test]
-#[cfg(not(tarpaulin))]
-fn solve_external_three_multi() {
-    thread_rng().fill(&mut [0; 8]);
-    let game = create_kuhn(3);
-    let (strategies, bound) = game
-        .solve(SolveMethod::External, 1000000, 0.005, 0.0, 2)
-        .unwrap();
-    assert_three(&game, strategies, bound);
+fn test_solve_three_discounts() {
+    let owned_game = create_kuhn(3);
+    let game = &owned_game;
+    [
+        ("vanilla", RegretParams::vanilla()),
+        ("lcfr", RegretParams::lcfr()),
+        ("cfr+", RegretParams::cfr_plus()),
+        ("dcfr", RegretParams::dcfr()),
+    ]
+    .into_par_iter()
+    .for_each(|(name, params)| {
+        thread_rng().fill(&mut [0; 8]);
+        let (mut strategies, _) = game
+            .solve(SolveMethod::Full, 10_000, 0.0, 1, Some(params))
+            .unwrap();
+        strategies.truncate(1e-3);
+        let info = strategies.get_info();
+        let util = info.player_utility(PlayerNum::One);
+        assert!(
+            (util + 1.0 / 18.0).abs() < 1e-3,
+            "utility not close to -1/18: {} [{}]",
+            util,
+            name
+        );
+    });
 }

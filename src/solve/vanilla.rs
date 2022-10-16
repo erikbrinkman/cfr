@@ -1,6 +1,6 @@
 //! Vanilla and sampled cfr implementations
 use super::data;
-use super::data::{CachedPayoff, RegretInfoset, SampledChance, SolveInfo};
+use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use by_address::ByAddress;
 use portable_atomic::AtomicF64;
@@ -62,7 +62,7 @@ impl ChanceRecurse for Mutex<SampledChance> {
 trait PlayerRecurse {
     fn update_cum_strat(&mut self, prob: f64);
 
-    fn advance(&mut self, temp: f64) -> f64;
+    fn advance(&mut self, it: u64, params: &RegretParams) -> f64;
 }
 
 impl PlayerRecurse for RegretInfoset {
@@ -72,9 +72,11 @@ impl PlayerRecurse for RegretInfoset {
         }
     }
 
-    fn advance(&mut self, temp: f64) -> f64 {
-        self.regret_match(temp);
-        self.cum_regret()
+    fn advance(&mut self, it: u64, params: &RegretParams) -> f64 {
+        params.regret_match(&mut *self.cum_regret, &mut self.strat);
+        params.discount_cum_regret(it, &mut *self.cum_regret);
+        params.discount_average_strat(it, &mut self.cum_strat);
+        params.cum_regret(it, &mut *self.cum_regret)
     }
 }
 
@@ -97,27 +99,6 @@ impl MutexRegretInfoset {
         }
     }
 
-    fn regret_match(&mut self, temp: f64) {
-        data::regret_match(
-            self.cum_regret
-                .iter()
-                .map(|atomic| atomic.load(Ordering::Relaxed)),
-            temp,
-            &mut self.strat,
-        )
-    }
-
-    fn cum_regret(&self) -> f64 {
-        f64::max(
-            self.cum_regret
-                .iter()
-                .map(|atomic| atomic.load(Ordering::Relaxed))
-                .reduce(f64::max)
-                .unwrap_or(0.0),
-            0.0,
-        )
-    }
-
     fn into_avg_strat(self) -> Box<[f64]> {
         let mut cum_strat = self.cum_strat.into_inner().unwrap();
         data::avg_strat(&mut cum_strat);
@@ -128,7 +109,7 @@ impl MutexRegretInfoset {
 trait MutexPlayerRecurse {
     fn update_cum_strat(&self, prob: f64);
 
-    fn advance(&mut self, temp: f64) -> f64;
+    fn advance(&mut self, it: u64, params: &RegretParams) -> f64;
 }
 
 impl MutexPlayerRecurse for MutexRegretInfoset {
@@ -142,9 +123,11 @@ impl MutexPlayerRecurse for MutexRegretInfoset {
         }
     }
 
-    fn advance(&mut self, temp: f64) -> f64 {
-        self.regret_match(temp);
-        self.cum_regret()
+    fn advance(&mut self, it: u64, params: &RegretParams) -> f64 {
+        params.regret_match(&mut *self.cum_regret, &mut self.strat);
+        params.discount_cum_regret(it, &mut *self.cum_regret);
+        params.discount_average_strat(it, self.cum_strat.get_mut().unwrap());
+        params.cum_regret(it, &mut *self.cum_regret)
     }
 }
 
@@ -215,6 +198,12 @@ impl<'a> Add for &'a mut f64 {
     }
 }
 
+// NOTE making this generic is very difficult because when we're passing in f64s, they're mutable
+// and we need them to be mutable. However, when we're passing in AtomicF64s, they're not mutable.
+// Generalizing over that mutability difference, while valid in the context of what we're doing
+// isn't supported by rust. If we wanted to make this really generic, we could use unsafe rust to
+// convery immutable floats into mutable ones since we trust ourselves, but it doesn't feel like
+// that unsafety really helps clean this up that much.
 fn recurse_player(
     player: &Player,
     p_chance: f64,
@@ -307,7 +296,7 @@ fn solve_generic_single(
     mut player_infosets: [Box<[RefCell<RegretInfoset>]>; 2],
     iter: u64,
     max_reg: f64,
-    temp: f64,
+    params: &RegretParams,
 ) -> SolveInfo {
     let mut regs = [f64::INFINITY; 2];
     for it in 1..=iter {
@@ -321,11 +310,10 @@ fn solve_generic_single(
         );
         chance_infosets.iter_mut().for_each(ChanceRecurse::advance);
         for (reg, infos) in regs.iter_mut().zip(player_infosets.iter_mut()) {
-            let total: f64 = infos
+            *reg = infos
                 .iter_mut()
-                .map(|info| info.get_mut().advance(temp))
+                .map(|info| info.get_mut().advance(it, params))
                 .sum();
-            *reg = 2.0 * total / it as f64;
         }
         let [reg_one, reg_two] = regs;
         if f64::max(reg_one, reg_two) < max_reg {
@@ -362,7 +350,6 @@ fn thread_threshold<'a>(
                 );
             }
             Some((Node::Player(player), p_chance, p_player)) => {
-                // NOTE get_mut is much faster than locking, so when possible we prefer it
                 let probs = &player.num.ind_mut(&mut player_infosets)[player.infoset].strat;
                 for (prob, next) in probs.iter().zip(player.actions.iter()) {
                     let mut next_probs = p_player;
@@ -383,8 +370,8 @@ fn solve_generic_multi(
     mut player_infosets: [Box<[MutexRegretInfoset]>; 2],
     iter: u64,
     max_reg: f64,
-    temp: f64,
     thread_info: (NonZeroUsize, NonZeroUsize),
+    params: &RegretParams,
 ) -> Result<SolveInfo, ThreadPoolBuildError> {
     let mut regs = [f64::INFINITY; 2];
     let (num_threads, target) = thread_info;
@@ -430,8 +417,7 @@ fn solve_generic_multi(
             );
             chance_infosets.iter_mut().for_each(ChanceRecurse::advance);
             for (reg, infos) in regs.iter_mut().zip(player_infosets.iter_mut()) {
-                let total: f64 = infos.iter_mut().map(|info| info.advance(temp)).sum();
-                *reg = 2.0 * total / it as f64;
+                *reg = infos.iter_mut().map(|info| info.advance(it, params)).sum();
             }
             let [reg_one, reg_two] = regs;
             if f64::max(reg_one, reg_two) < max_reg {
@@ -454,7 +440,7 @@ pub(crate) fn solve_full_single(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
+    params: &RegretParams,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -472,7 +458,7 @@ pub(crate) fn solve_full_single(
         player_infosets,
         max_iter,
         max_reg,
-        temp,
+        params,
     )
 }
 
@@ -482,8 +468,8 @@ pub(crate) fn solve_full_multi(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
     thread_info: (NonZeroUsize, NonZeroUsize),
+    params: &RegretParams,
 ) -> Result<SolveInfo, ThreadPoolBuildError> {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -501,8 +487,8 @@ pub(crate) fn solve_full_multi(
         player_infosets,
         max_iter,
         max_reg,
-        temp,
         thread_info,
+        params,
     )
 }
 
@@ -512,7 +498,7 @@ pub(crate) fn solve_sampled_single(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
+    params: &RegretParams,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -530,7 +516,7 @@ pub(crate) fn solve_sampled_single(
         player_infosets,
         max_iter,
         max_reg,
-        temp,
+        params,
     )
 }
 
@@ -540,8 +526,8 @@ pub(crate) fn solve_sampled_multi(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    temp: f64,
     thread_info: (NonZeroUsize, NonZeroUsize),
+    params: &RegretParams,
 ) -> Result<SolveInfo, ThreadPoolBuildError> {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -559,14 +545,14 @@ pub(crate) fn solve_sampled_multi(
         player_infosets,
         max_iter,
         max_reg,
-        temp,
         thread_info,
+        params,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
+    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams};
     use std::num::NonZeroUsize;
 
     #[derive(Clone, Debug)]
@@ -616,8 +602,14 @@ mod tests {
     #[test]
     fn test_full_single() {
         let (root, chance, [one, two]) = new_game();
-        let ([reg_one, reg_two], [strat_one, strat_two]) =
-            super::solve_full_single(&root, &*chance, [&*one, &*two], 100, 0.0, 0.0);
+        let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_full_single(
+            &root,
+            &*chance,
+            [&*one, &*two],
+            100,
+            0.0,
+            &RegretParams::vanilla(),
+        );
         assert_eq!(*strat_one, [0.995, 0.005]);
         assert_eq!(*strat_two, [0.005, 0.995]);
         assert!(reg_one < 0.05);
@@ -627,8 +619,14 @@ mod tests {
     #[test]
     fn test_sampled_single() {
         let (root, chance, [one, two]) = new_game();
-        let ([reg_one, reg_two], [strat_one, strat_two]) =
-            super::solve_sampled_single(&root, &*chance, [&*one, &*two], 100, 0.0, 0.0);
+        let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_sampled_single(
+            &root,
+            &*chance,
+            [&*one, &*two],
+            100,
+            0.0,
+            &RegretParams::vanilla(),
+        );
         assert!(strat_one[1] < 0.05);
         assert!(strat_two[0] < 0.05);
         assert!(reg_one < 0.05);
@@ -682,8 +680,8 @@ mod tests {
             [&*one, &*two],
             10000,
             0.0,
-            0.0,
             (NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap()),
+            &RegretParams::vanilla(),
         )
         .unwrap();
         assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);
@@ -698,8 +696,8 @@ mod tests {
             [&*one, &*two],
             10000,
             0.0,
-            0.0,
             (NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap()),
+            &RegretParams::vanilla(),
         )
         .unwrap();
         assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);

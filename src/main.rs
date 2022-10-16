@@ -2,7 +2,7 @@ mod auto;
 mod gambit;
 mod json;
 
-use cfr::{PlayerNum, SolveMethod};
+use cfr::{PlayerNum, RegretParams, SolveMethod};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::borrow::Borrow;
@@ -12,16 +12,48 @@ use std::io;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Method {
+    /// No sampling
     Full,
+    /// Sample chance nodes
     Sampled,
+    /// Sample chance and the other player
     External,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum InputFormat {
+    /// Auto-detect format from file extension and contents
     Auto,
+    /// Gambit style `.efg` format
     Gambit,
+    /// Json game dsl: https://github.com/erikbrinkman/cfr#json-format
     Json,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Discount {
+    /// No discounting
+    Vanilla,
+    /// Linear discounting of regret and strategies
+    Lcfr,
+    /// Forget negative regrets and quadratic strategy discounting (CFR+)
+    CfrPlus,
+    /// Rough average of LCFR and CFR+
+    Dcfr,
+    /// DCFR modified to prune poor actions
+    DcfrPrune,
+}
+
+impl Discount {
+    fn into_params(self) -> RegretParams {
+        match self {
+            Discount::Vanilla => RegretParams::vanilla(),
+            Discount::Lcfr => RegretParams::lcfr(),
+            Discount::CfrPlus => RegretParams::cfr_plus(),
+            Discount::Dcfr => RegretParams::dcfr(),
+            Discount::DcfrPrune => RegretParams::dcfr_prune(),
+        }
+    }
 }
 
 /// Counterfactual regret minimization solver for two-player zero-sum incomplete-information games
@@ -65,39 +97,16 @@ struct Args {
     parallel: usize,
 
     /// Method to use for game solving
-    ///
-    /// External : alternates between players, doing regret updates for one while sampling the
-    /// other. This samples poor performing branches of the game tree less often, resulting in
-    /// faster convergence overall.
-    ///
-    /// Sampled : only chance nodes are sampled.
-    ///
-    /// Full : does no sampling, this tends to be very slow on complex games, but produces fully
-    /// acurate regret estimates.
     #[clap(short, long, value_enum, default_value_t = Method::External)]
     method: Method,
 
     /// Format of the input game file
-    ///
-    /// Auto : If `input` was specified and the filename ends with ".json" or ".efg" use that
-    /// parser. Otherwise attempt all parsers. If all of these fail, no diagnostic information will
-    /// be given, instead retry with the desired parser.
-    ///
-    /// Gambit : parses Gambit style `.efg` files. Because this uses string representations of
-    /// information sets, if an information set doesn't have a name it's name will become its
-    /// number in string format. If this conflicts with a given infoset name, the parsing will fail
-    /// even though the file is valid. This also only works for constant sum games, so if the game
-    /// is not constant sum, this will also error. Finally, gambit uses rational payoffs, but this
-    /// only computes approximate equilibria and so only uses floating point numbers.
-    ///
-    /// Json : uses a custom json extensive form game format. The game tree is specified as a tree
-    /// of json objects. Terminal nodes have the structure `{ terminal: <number> }`. Chance nodes
-    /// have the structure `{ chance: { infoset?: <string>, outcomes: { [<string>]: { prob:
-    /// <number>, state: <node> } } } }`. Chance probabilities will be renormalized, so they don't
-    /// need to explicitely sum to one. Player nodes have the structure `{ player: { player_one:
-    /// <bool>, infoset: <string>, actions: { [<string>]: <node> } } }`.
     #[clap(long, value_enum, default_value_t = InputFormat::Auto)]
     input_format: InputFormat,
+
+    /// Discounted CFR parameters
+    #[clap(short, long, value_enum, default_value_t = Discount::Dcfr)]
+    discount: Discount,
 
     /// Read game from a file instead of from stdin
     #[clap(short, long, value_parser, default_value = "-")]
@@ -141,10 +150,11 @@ where
 
 #[derive(Serialize)]
 struct Output {
-    expected_one_utility: f64,
+    regret: f64,
+    player_one_utility: f64,
+    player_two_utility: f64,
     player_one_regret: f64,
     player_two_regret: f64,
-    regret: f64,
     player_one_strategy: Strategy,
     player_two_strategy: Strategy,
 }
@@ -181,7 +191,13 @@ fn main() {
         Method::External => SolveMethod::External,
     };
     let (mut strategies, _) = game
-        .solve(method, max_iters, args.max_regret, 0.0, args.parallel)
+        .solve(
+            method,
+            max_iters,
+            args.max_regret,
+            args.parallel,
+            Some(args.discount.into_params()),
+        )
         .unwrap();
     let mut info = strategies.get_info();
     let mut pruned_strats = strategies.clone();
@@ -193,10 +209,11 @@ fn main() {
     }
     let [one, two] = strategies.as_named();
     let out = Output {
-        expected_one_utility: info.player_utility(PlayerNum::One) + sum,
+        regret: info.regret(),
+        player_one_utility: info.player_utility(PlayerNum::One) + sum,
+        player_two_utility: info.player_utility(PlayerNum::Two) - sum,
         player_one_regret: info.player_regret(PlayerNum::One),
         player_two_regret: info.player_regret(PlayerNum::Two),
-        regret: info.regret(),
         player_one_strategy: one.into(),
         player_two_strategy: two.into(),
     };

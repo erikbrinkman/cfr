@@ -1,6 +1,6 @@
 //! Counterfactual Regret (CFR) is a library for finding an approximate nash equilibrium in
 //! two-player zero-sum games of incomplete information with perfect recall, such as poker etc.,
-//! using counterfactual regret minimization[^cfr] and variants[^mccfr].
+//! using discounted[^dcfr] monte carlo[^mccfr] counterfactual regret minimization[^cfr].
 //!
 //! # Usage
 //!
@@ -37,10 +37,10 @@
 //! let game = Game::from_root(data).unwrap();
 //! let (strats, reg_bounds) = game.solve(
 //!     SolveMethod::External,
-//!     100, // number of iterations
-//!     0.0, // early termination regret
-//!     0.0, // temperature - advanced option
-//!     1,   // number of threads
+//!     100,  // number of iterations
+//!     0.0,  // early termination regret
+//!     1,    // number of threads
+//!     None, // advanced options
 //! ).unwrap();
 //! // get named versions, i.e. exportable version
 //! let named = strats.as_named();
@@ -56,6 +56,10 @@
 //! [^mccfr]: [Lanctot, Marc, et al. "Monte Carlo sampling for regret minimization in extensive
 //!   games." Advances in neural information processing systems 22
 //!   (2009)](https://proceedings.neurips.cc/paper/2009/file/00411460f7c92d2124a67ea0f4cb5f85-Paper.pdf).
+//!
+//! [^dcfr]: [Brown, Noam, and Tuomas Sandholm. "Solving imperfect-information games via discounted
+//!   regret minimization." Proceedings of the AAAI Conference on Artificial Intelligence. Vol. 33.
+//!   No. 01. (2019)](https://ojs.aaai.org/index.php/AAAI/article/view/4007/3885)
 #![warn(missing_docs)]
 
 mod compact;
@@ -66,6 +70,7 @@ mod split;
 
 use compact::{Builder, OptBuilder};
 pub use error::{GameError, SolveError, StratError};
+pub use solve::RegretParams;
 use solve::{external, vanilla};
 use split::{split_by, split_by_mut};
 use std::borrow::Borrow;
@@ -641,23 +646,18 @@ impl<I, A> Game<I, A> {
     ///
     /// - `method` - The method of solving to use. When in doubt prefer
     ///   [External][SolveMethod::External].  See [SolveMethod] for details on the distinctions.
-    /// - `max_iter` - The maximum number of iterations to run, more iterations means lower regret
-    ///   of the found strategy.
+    /// - `max_iter` - The maximum number of iterations to run. The maximum regret of the found
+    ///   strategy is bounded by the square-root of the number of iterations.
     /// - `max_reg` - Terminate early if the regret of the returned strategy is going to be less
-    ///   than this value.
-    /// - `temp` - Set to zero unless you know what you're doing. This is an advanced parameter
-    ///   that determines what strategy to pick when all actions have non-positive regret. Positive
-    ///   infinity indicates that the uniform strategy should be played, this is consistent with
-    ///   the original description of CFR. Zero indicates that the action with the largest regret
-    ///   should be played all the time, this often converges more quickly. Other positive values
-    ///   interpolate between those two settings. Negative values panic.
+    ///   than this value. With this current implementation this is only valid when the method is
+    ///   [Full][SolveMethod::Full] and the params are [vanilla][RegretParams::vanilla]. If using
+    ///   other parameters, this should be set lower than the desired regret.
     /// - `num_threads` - The number of threads to use for solving. Zero selects based off of
     ///   [thread::available_parallelism]. One uses a single threaded variant that's more efficient
     ///   when not in a threaded environment.
-    ///
-    /// # Panics
-    ///
-    /// If `temp` is negative or [nan][f64::NAN], or if `max_reg` is negative or [nan][f64::NAN].
+    /// - `param` - Advanced parameters that govern the behavior of the regret and strategy
+    ///   updates. See [RegretParams] for more details, or set to [None] to use the
+    ///   [default][RegretParams::default].
     ///
     /// # Errors
     ///
@@ -668,23 +668,14 @@ impl<I, A> Game<I, A> {
         method: SolveMethod,
         max_iter: u64,
         max_reg: f64,
-        temp: f64,
         num_threads: usize,
+        params: Option<RegretParams>,
     ) -> Result<(Strategies<I, A>, RegretBound), SolveError> {
-        assert!(
-            max_reg >= 0.0,
-            "invalid `max_reg` to solve, must be non-negative but got {}",
-            max_reg
-        );
-        assert!(
-            temp >= 0.0,
-            "invalid `temp` to solve, must be non-negative but got {}",
-            temp
-        );
         let [first_player, second_player] = &self.player_infosets;
         let threads = NonZeroUsize::new(num_threads)
             .or_else(|| thread::available_parallelism().ok())
             .unwrap_or(NonZeroUsize::new(1).unwrap());
+        let params = params.unwrap_or_default();
         let (regrets, probs) = if threads == NonZeroUsize::new(1).unwrap() {
             match method {
                 SolveMethod::Full => vanilla::solve_full_single(
@@ -693,7 +684,7 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
+                    &params,
                 ),
                 SolveMethod::Sampled => vanilla::solve_sampled_single(
                     &self.root,
@@ -701,7 +692,7 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
+                    &params,
                 ),
                 SolveMethod::External => external::solve_external_single(
                     &self.root,
@@ -709,7 +700,7 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
+                    &params,
                 ),
             }
         } else {
@@ -724,8 +715,8 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
                     (threads, target),
+                    &params,
                 ),
                 SolveMethod::Sampled => vanilla::solve_sampled_multi(
                     &self.root,
@@ -733,8 +724,8 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
                     (threads, target),
+                    &params,
                 ),
                 SolveMethod::External => external::solve_external_multi(
                     &self.root,
@@ -742,8 +733,8 @@ impl<I, A> Game<I, A> {
                     [first_player, second_player],
                     max_iter,
                     max_reg,
-                    temp,
                     (threads, target),
+                    &params,
                 ),
             }?
         };
@@ -1058,7 +1049,7 @@ impl<'a, I, A> Strategies<'a, I, A> {
     /// # Game::from_root(data).unwrap();
     /// let (strats, _) = game.solve(
     ///     // ...
-    /// # SolveMethod::External, 1, 0.0, 0.0, 1
+    /// # SolveMethod::External, 1, 0.0, 1, None
     /// ).unwrap();
     /// let [player_one_strat, player_two_strat] = strats.as_named();
     /// for (infoset, actions) in player_one_strat {
@@ -1367,27 +1358,13 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "`max_reg`")]
-    fn test_solve_max_reg_panic() {
-        let game = create_game();
-        game.solve(SolveMethod::Full, 0, f64::NAN, 0.0, 1).unwrap();
-    }
-
-    #[test]
-    #[should_panic(expected = "`temp`")]
-    fn test_solve_temp_panic() {
-        let game = create_game();
-        game.solve(SolveMethod::Full, 0, 0.0, f64::NAN, 1).unwrap();
-    }
-
-    #[test]
     #[should_panic(expected = "same game")]
     fn test_distance_game_panic() {
         let game_one = create_game();
-        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
 
         let game_two = create_game();
-        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
 
         strat_one.distance(&strat_two, 1.0);
     }
@@ -1396,8 +1373,8 @@ mod tests {
     #[should_panic(expected = "`p` must be positive")]
     fn test_distance_p_panic() {
         let game = create_game();
-        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
-        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 0.0, 1).unwrap();
+        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
+        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
         strat_one.distance(&strat_two, 0.0);
     }
 }
