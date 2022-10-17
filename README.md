@@ -200,6 +200,10 @@ To Do
   hold even less frequrntly. We should instead check the true regret after a
   certain number of iterations. This takes some restructuing, as well as some
   benchmarking to make sure that time isn't wasted on regret calculation.
+- [ ] We currently set the number of threads arbitrarily high, but we have the
+  full game tree before we decide how many threads to spawn, so we could be
+  smarter about both setting a maximum, and setting the load factor based on
+  the tree size.
 - [ ] This currently requires that infosets and actions be hashable and,
   depending on the usecase, cloneable. Most of the functions could be rewritten
   to take combinations of `Hash`, `Ord`, or `Clone` and use the most performant
