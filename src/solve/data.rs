@@ -1,7 +1,7 @@
 //! Common data structures for solving games
 use crate::Node;
 use by_address::ByAddress;
-use num_traits::FloatConst;
+use logaddexp::LogAddExp;
 use portable_atomic::AtomicF64;
 use rand::thread_rng;
 use rand_distr::{Distribution, WeightedAliasIndex};
@@ -366,7 +366,7 @@ impl RegretParams {
             1.0
         } else {
             let numer = discount * (it as f64).ln();
-            let denom = logaddexp(numer, 0.0);
+            let denom = numer.ln_add_exp(0.0);
             (numer - denom).exp()
         }
     }
@@ -410,34 +410,9 @@ impl Default for RegretParams {
 /// None of the values can be [nan][f64::NAN], so equality is well behaved
 impl Eq for RegretParams {}
 
-/// Compute (x.exp() + y.exp()).log() more efficiently
-///
-/// NOTE ideally we should upstream this to num.
-fn logaddexp(x: f64, y: f64) -> f64 {
-    if x == y {
-        x + f64::LN_2()
-    } else {
-        let diff = x - y;
-        if diff.is_nan() {
-            f64::NAN
-        } else if diff > 0.0 {
-            x + (-diff).exp().ln_1p()
-        } else {
-            y + diff.exp().ln_1p()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::RegretParams;
-
-    #[test]
-    fn logaddexp() {
-        assert!((super::logaddexp(0.0, 0.0) - 2.0_f64.ln()) < 1e-6);
-        assert!((super::logaddexp(1.0, 0.0) - (1.0 + 1.0_f64.exp()).ln()) < 1e-6);
-        assert!((super::logaddexp(0.0, 1.0) - (1.0 + 1.0_f64.exp()).ln()) < 1e-6);
-    }
 
     #[test]
     fn avg_strat() {

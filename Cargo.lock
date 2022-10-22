@@ -51,6 +51,7 @@ dependencies = [
  "clap",
  "gambit-parser",
  "indexmap",
+ "logaddexp",
  "num-traits",
  "portable-atomic",
  "rand",
@@ -249,6 +250,15 @@ name = "linux-raw-sys"
 version = "0.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4d2456c373231a208ad294c33dc5bff30051eafd954cd4caae83a712b12854d"
+
+[[package]]
+name = "logaddexp"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25958fead7442dae498f9d2d54223b763cf219523dc1490e154b9e645dbfe24d"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "memchr"
