@@ -871,7 +871,7 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
         }
 
         // check we wrote to all locations
-        for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
+        for vals in split_by_mut(&mut dense, infos.iter().map(|info| info.num_actions())) {
             let total: f64 = vals.iter().sum();
             if total == 0.0 {
                 return Err(StratError::UninitializedInfoset);
@@ -987,7 +987,7 @@ impl<I: Eq, A: Eq> Game<I, A> {
         }
 
         // check that we wrote to every location
-        for vals in split_by_mut(&mut *dense, infos.iter().map(|info| info.num_actions())) {
+        for vals in split_by_mut(&mut dense, infos.iter().map(|info| info.num_actions())) {
             let total: f64 = vals.iter().sum();
             if total == 0.0 {
                 return Err(StratError::UninitializedInfoset);

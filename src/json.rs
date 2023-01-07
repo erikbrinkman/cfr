@@ -89,7 +89,7 @@ pub fn from_str(raw: &str) -> Result<(Game<String, String>, f64), Error> {
     Ok(from_state(definition))
 }
 
-pub fn from_reader(reader: impl Read) -> (Game<String, String>, f64) {
+pub fn from_reader(reader: &mut impl Read) -> (Game<String, String>, f64) {
     let definition = serde_json::from_reader(reader).expect(
         "couldn't parse json game definition : https://github.com/erikbrinkman/cfr#json-error",
     );
@@ -104,14 +104,14 @@ fn from_state(definition: State) -> (Game<String, String>, f64) {
 mod tests {
     #[test]
     fn test_success() {
-        super::from_reader(r#"{ "terminal": 0.0 }"#.as_bytes());
+        super::from_reader(&mut r#"{ "terminal": 0.0 }"#.as_bytes());
     }
 
     #[test]
     #[should_panic(expected = "couldn't parse json game definition")]
     fn test_json_error() {
         super::from_reader(
-            r#"{ "chance": { "outcomes": { "a": { "terminal": 0.0 } } } }"#.as_bytes(),
+            &mut r#"{ "chance": { "outcomes": { "a": { "terminal": 0.0 } } } }"#.as_bytes(),
         );
     }
 
@@ -121,7 +121,7 @@ mod tests {
     )]
     fn test_game_error() {
         super::from_reader(
-            r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#.as_bytes(),
+            &mut r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#.as_bytes(),
         );
     }
 }

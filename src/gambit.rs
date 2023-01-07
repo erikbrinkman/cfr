@@ -251,7 +251,7 @@ pub fn from_str(raw: &str) -> Result<(Game<String, String>, f64), Error<'_>> {
     Ok((game, info.sum))
 }
 
-pub fn from_reader(mut reader: impl Read) -> (Game<String, String>, f64) {
+pub fn from_reader(reader: &mut impl Read) -> (Game<String, String>, f64) {
     let mut buff = String::new();
     reader.read_to_string(&mut buff).unwrap();
     from_str(&buff).expect(
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "couldn't parse gambit game definition")]
     fn test_parse() {
-        super::from_reader("EFG 2 F".as_bytes());
+        super::from_reader(&mut "EFG 2 F".as_bytes());
     }
 
     #[test]

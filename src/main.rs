@@ -9,6 +9,7 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
+use std::io::BufReader;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Method {
@@ -162,22 +163,20 @@ struct Output {
 fn main() {
     let args = Args::parse();
     let (game, sum) = if args.input == "-" {
+        let mut inp = io::stdin().lock();
         match args.input_format {
-            InputFormat::Json => json::from_reader(io::stdin()),
-            InputFormat::Gambit => gambit::from_reader(io::stdin()),
-            InputFormat::Auto => auto::from_reader(io::stdin()),
+            InputFormat::Json => json::from_reader(&mut inp),
+            InputFormat::Gambit => gambit::from_reader(&mut inp),
+            InputFormat::Auto => auto::from_reader(&mut inp),
         }
     } else {
+        let mut inp = BufReader::new(File::open(&args.input).unwrap());
         match args.input_format {
-            InputFormat::Json => json::from_reader(File::open(args.input).unwrap()),
-            InputFormat::Auto if args.input.ends_with(".json") => {
-                json::from_reader(File::open(args.input).unwrap())
-            }
-            InputFormat::Gambit => gambit::from_reader(File::open(args.input).unwrap()),
-            InputFormat::Auto if args.input.ends_with(".efg") => {
-                gambit::from_reader(File::open(args.input).unwrap())
-            }
-            InputFormat::Auto => auto::from_reader(File::open(args.input).unwrap()),
+            InputFormat::Json => json::from_reader(&mut inp),
+            InputFormat::Auto if args.input.ends_with(".json") => json::from_reader(&mut inp),
+            InputFormat::Gambit => gambit::from_reader(&mut inp),
+            InputFormat::Auto if args.input.ends_with(".efg") => gambit::from_reader(&mut inp),
+            InputFormat::Auto => auto::from_reader(&mut inp),
         }
     };
     let max_iters = if args.max_iters == 0 {

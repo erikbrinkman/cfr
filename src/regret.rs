@@ -113,7 +113,7 @@ fn optimal_deviations<const PLAYER_ONE: bool>(
                 *res += next_infoset_search::<PLAYER_ONE>(
                     next,
                     &mut search_queue,
-                    &*infosets,
+                    &infosets,
                     chance_info,
                     strat_info,
                 ) * prob;
@@ -123,13 +123,7 @@ fn optimal_deviations<const PLAYER_ONE: bool>(
         // set the max utility of playing to reach an infoset
         infosets[info].max_utility = payoffs.into_iter().reduce(f64::max).unwrap() / total_reach;
     }
-    next_infoset_search::<PLAYER_ONE>(
-        start,
-        &mut search_queue,
-        &*infosets,
-        chance_info,
-        strat_info,
-    )
+    next_infoset_search::<PLAYER_ONE>(start, &mut search_queue, &infosets, chance_info, strat_info)
 }
 
 fn next_infoset_search<'a, const PLAYER_ONE: bool>(

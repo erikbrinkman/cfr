@@ -244,48 +244,52 @@ fn recurse_multi(
     p_player: [f64; 2],
     cached: &impl CachedPayoff,
 ) -> f64 {
-    match node {
-        Node::Terminal(payoff) => *payoff,
-        Node::Chance(chance) => {
-            let mut expected = 0.0;
-            for (prob, next) in chance_infosets[chance.infoset].next_nodes(chance) {
-                let payoff = recurse_multi(
-                    next,
-                    chance_infosets,
-                    player_infosets,
-                    p_chance * prob,
-                    p_player,
-                    cached,
-                );
-                expected += prob * payoff;
-            }
-            expected
-        }
-        Node::Player(player) => {
-            // get infoset
-            let info = &player.num.ind(&player_infosets)[player.infoset];
-            info.update_cum_strat(*player.num.ind(&p_player));
-            let (res, sub) = recurse_player(
-                player,
-                p_chance,
-                p_player,
-                &info.strat,
-                &*info.cum_regret,
-                |next, p_next| {
-                    recurse_multi(
+    if let Some(pay) = cached.get_payoff(node) {
+        pay
+    } else {
+        match node {
+            Node::Terminal(payoff) => *payoff,
+            Node::Chance(chance) => {
+                let mut expected = 0.0;
+                for (prob, next) in chance_infosets[chance.infoset].next_nodes(chance) {
+                    let payoff = recurse_multi(
                         next,
                         chance_infosets,
                         player_infosets,
-                        p_chance,
-                        p_next,
+                        p_chance * prob,
+                        p_player,
                         cached,
-                    )
-                },
-            );
-            for val in info.cum_regret.iter() {
-                val.fetch_sub(sub, Ordering::Relaxed);
+                    );
+                    expected += prob * payoff;
+                }
+                expected
             }
-            res
+            Node::Player(player) => {
+                // get infoset
+                let info = &player.num.ind(&player_infosets)[player.infoset];
+                info.update_cum_strat(*player.num.ind(&p_player));
+                let (res, sub) = recurse_player(
+                    player,
+                    p_chance,
+                    p_player,
+                    &info.strat,
+                    &*info.cum_regret,
+                    |next, p_next| {
+                        recurse_multi(
+                            next,
+                            chance_infosets,
+                            player_infosets,
+                            p_chance,
+                            p_next,
+                            cached,
+                        )
+                    },
+                );
+                for val in info.cum_regret.iter() {
+                    val.fetch_sub(sub, Ordering::Relaxed);
+                }
+                res
+            }
         }
     }
 }
