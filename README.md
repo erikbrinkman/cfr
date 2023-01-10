@@ -22,7 +22,7 @@ cfr = { version = "0.1.0", default-features = false }
 ```
 
 Then implement
-[`IntoGameNode`]((https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html), for
+[`IntoGameNode`](https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html), for
 a type that represents a node in your game tree (or alternatively can generate
 new nodes).
 
