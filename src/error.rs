@@ -1,6 +1,8 @@
 #[cfg(doc)]
 use crate::Game;
 use rayon::ThreadPoolBuildError;
+use std::error::Error;
+use std::fmt::{Display, Error as FmtError, Formatter};
 
 /// Errors that result from game definition errors
 ///
@@ -35,6 +37,14 @@ pub enum GameError {
     /// Make sure that all actions of a player node are unique.
     ActionsNotUnique,
 }
+
+impl Display for GameError {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
+        write!(fmt, "{:?}", self)
+    }
+}
+
+impl Error for GameError {}
 
 #[cfg(test)]
 mod game_errors {
@@ -218,6 +228,14 @@ pub enum StratError {
     UninitializedInfoset,
 }
 
+impl Display for StratError {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
+        write!(fmt, "{:?}", self)
+    }
+}
+
+impl Error for StratError {}
+
 #[cfg(test)]
 mod strat_errors {
     use crate::{Game, GameNode, IntoGameNode, PlayerNum, StratError};
@@ -349,6 +367,13 @@ pub enum SolveError {
     /// Returned when a multi-threaded solver couldn't create a thread pool
     ThreadSpawnError,
 }
+impl Display for SolveError {
+    fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
+        write!(fmt, "{:?}", self)
+    }
+}
+
+impl Error for SolveError {}
 
 impl From<ThreadPoolBuildError> for SolveError {
     fn from(_: ThreadPoolBuildError) -> Self {
