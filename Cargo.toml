@@ -10,7 +10,7 @@ keywords = ["counterfactual", "regret", "incomplete", "information", "game"]
 [dependencies]
 by_address = "1.0"
 clap = { version = "4.0", features = ["derive", "wrap_help"], optional = true }
-gambit-parser = { version = "0.1", optional = true }
+gambit-parser = { version = "0.2", optional = true }
 indexmap = "1.9"
 portable-atomic = { version = "0.3", features = ["float"] }
 rand = "0.8"

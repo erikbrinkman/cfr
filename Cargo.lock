@@ -171,9 +171,9 @@ dependencies = [
 
 [[package]]
 name = "gambit-parser"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03b4d107409a708617572b348dd9beb2614542ab9ef66f0dff65d0a1b83d42c9"
+checksum = "3a658f848d52e2f8d650a383bafe4e180a3fe2603afa51769b8a9b8987354a60"
 dependencies = [
  "nom",
  "num",
