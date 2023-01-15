@@ -740,6 +740,12 @@ impl<I, A> Game<I, A> {
         };
         Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
     }
+
+    /// The total number of information sets for each player
+    pub fn num_infosets(&self) -> usize {
+        let [one, two] = &self.player_infosets;
+        one.len() + two.len()
+    }
 }
 
 impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
