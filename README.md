@@ -132,6 +132,19 @@ some mild restrictions.
   approximate, thus in extreme circumstances payoffs might not be
   representable.
 
+Examples
+--------
+
+If implementing
+[IntoGameNode](https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html) is
+confusing for your game, here are more complicated examples of games that don't
+quite fit in the documentation:
+
+- [Kuhn Poker](https://github.com/erikbrinkman/cfr/blob/main/examples/kuhn_poker.rs) - this
+  can also be run using `cargo run --example kuhn_poker --`.
+- [Liar's Dice](https://github.com/erikbrinkman/cfr/blob/main/benches/liars_dice.rs) - this
+  is implemented as a benchmark to allow using nightly apis.
+
 Errors
 ------
 
