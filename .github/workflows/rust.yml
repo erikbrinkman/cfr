@@ -27,4 +27,4 @@ jobs:
     - name: Run lints
       run: cargo clippy --verbose -- -D warnings
     - name: Run examples lints
-      run: cargo clippy --verbose --exampels -- -D warnings
+      run: cargo clippy --verbose --examples -- -D warnings
