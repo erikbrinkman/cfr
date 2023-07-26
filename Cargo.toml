@@ -1,6 +1,6 @@
 [package]
 name = "cfr"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Counterfactual regret minimization solver for two-player zero-sum incomplete-information games"
 repository = "https://github.com/erikbrinkman/cfr"
