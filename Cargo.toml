@@ -11,8 +11,8 @@ keywords = ["counterfactual", "regret", "incomplete", "information", "game"]
 by_address = "1.0"
 clap = { version = "4.0", features = ["derive", "wrap_help"], optional = true }
 gambit-parser = { version = "0.2", optional = true }
-indexmap = "1.9"
-portable-atomic = { version = "0.3", features = ["float"] }
+indexmap = "2.0"
+portable-atomic = { version = "1.4", features = ["float"] }
 rand = "0.8"
 rand_distr = "0.4"
 num-traits = "0.2"
