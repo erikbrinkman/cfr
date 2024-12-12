@@ -29,7 +29,7 @@ trait ChanceRecurse: Send {
 #[derive(Debug)]
 struct FullChance<'a>(&'a [f64]);
 
-impl<'a> ChanceRecurse for FullChance<'a> {
+impl ChanceRecurse for FullChance<'_> {
     fn next_nodes<'b>(&self, chance: &'b Chance) -> ChanceIter<'_, 'b> {
         self.0.iter().zip(chance.outcomes.iter())
     }
@@ -186,13 +186,13 @@ trait Add {
     fn add(self, other: f64);
 }
 
-impl<'a> Add for &'a AtomicF64 {
+impl Add for &AtomicF64 {
     fn add(self, other: f64) {
         self.fetch_add(other, Ordering::Relaxed);
     }
 }
 
-impl<'a> Add for &'a mut f64 {
+impl Add for &mut f64 {
     fn add(self, other: f64) {
         *self += other;
     }
@@ -577,7 +577,7 @@ mod tests {
 
     impl ChanceInfoset for Cinfo {
         fn probs(&self) -> &[f64] {
-            &*self.0
+            &self.0
         }
     }
 
@@ -608,7 +608,7 @@ mod tests {
         let (root, chance, [one, two]) = new_game();
         let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_full_single(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             100,
             0.0,
@@ -625,7 +625,7 @@ mod tests {
         let (root, chance, [one, two]) = new_game();
         let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_sampled_single(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             100,
             0.0,
@@ -680,7 +680,7 @@ mod tests {
         let (root, chance, [one, two]) = large_game(10);
         let ([reg_one, reg_two], _) = super::solve_full_multi(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             10000,
             0.0,
@@ -696,7 +696,7 @@ mod tests {
         let (root, chance, [one, two]) = large_game(10);
         let ([reg_one, reg_two], _) = super::solve_sampled_multi(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             10000,
             0.0,

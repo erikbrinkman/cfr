@@ -101,7 +101,7 @@ impl<const D: usize> PlayState<D> {
         // bids with any card but higher num
         let higher_num_bids = cards
             .into_iter()
-            .flat_map(move |card| higher_nums.clone().into_iter().map(move |num| (card, num)));
+            .flat_map(move |card| higher_nums.clone().map(move |num| (card, num)));
         // actual action objects
         let bid_iter = higher_card_bids
             .chain(higher_num_bids)

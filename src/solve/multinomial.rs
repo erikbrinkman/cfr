@@ -14,7 +14,7 @@ impl<'a> Multinomial<'a> {
     }
 }
 
-impl<'a> Distribution<usize> for Multinomial<'a> {
+impl Distribution<usize> for Multinomial<'_> {
     fn sample<R>(&self, rnd: &mut R) -> usize
     where
         R: Rng + ?Sized,

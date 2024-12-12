@@ -1024,13 +1024,13 @@ pub struct Strategies<'a, Infoset, Action> {
 /// Strategies are equal if they contain identical values and are from the same game
 ///
 /// Equality is strict since action probabilities can't be [nan][f64::NAN].
-impl<'a, I, A> PartialEq for Strategies<'a, I, A> {
+impl<I, A> PartialEq for Strategies<'_, I, A> {
     fn eq(&self, other: &Self) -> bool {
         self.game == other.game && self.probs == other.probs
     }
 }
 
-impl<'a, I, A> Eq for Strategies<'a, I, A> {}
+impl<I, A> Eq for Strategies<'_, I, A> {}
 
 impl<'a, I, A> Strategies<'a, I, A> {
     /// Attach player, infoset, and action information to a strategy
@@ -1250,9 +1250,9 @@ impl<'a, I, A> Iterator for NamedStrategyIter<'a, I, A> {
     }
 }
 
-impl<'a, I, A> FusedIterator for NamedStrategyIter<'a, I, A> {}
+impl<I, A> FusedIterator for NamedStrategyIter<'_, I, A> {}
 
-impl<'a, I, A> ExactSizeIterator for NamedStrategyIter<'a, I, A> {}
+impl<I, A> ExactSizeIterator for NamedStrategyIter<'_, I, A> {}
 
 /// An iterator over named actions and assiciated probabilities
 ///
@@ -1290,9 +1290,9 @@ impl<'a, A> Iterator for NamedStrategyActionIter<'a, A> {
     }
 }
 
-impl<'a, A> FusedIterator for NamedStrategyActionIter<'a, A> {}
+impl<A> FusedIterator for NamedStrategyActionIter<'_, A> {}
 
-impl<'a, A> ExactSizeIterator for NamedStrategyActionIter<'a, A> {}
+impl<A> ExactSizeIterator for NamedStrategyActionIter<'_, A> {}
 
 #[cfg(test)]
 mod tests {

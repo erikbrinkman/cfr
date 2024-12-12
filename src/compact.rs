@@ -133,7 +133,7 @@ pub struct VacantEntry<'a, K, V> {
     ent: map::VacantEntry<'a, K, (usize, V)>,
 }
 
-impl<'a, K: Hash + Eq, V> VacantEntry<'a, K, V> {
+impl<K: Hash + Eq, V> VacantEntry<'_, K, V> {
     pub fn insert(self, val: V) -> usize {
         self.ent.insert((self.ind, val));
         self.ind

@@ -16,7 +16,7 @@ struct GlobalInfo {
     sum: f64,
 }
 
-impl<'a> IntoGameNode for JoinedNode<'a> {
+impl IntoGameNode for JoinedNode<'_> {
     type PlayerInfo = String;
     type Action = String;
     type ChanceInfo = u64;

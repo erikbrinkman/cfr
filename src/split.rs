@@ -22,7 +22,7 @@ impl<'a, T, I: Iterator<Item = usize>> Iterator for SplitsBy<'a, T, I> {
     }
 }
 
-impl<'a, T, I: FusedIterator<Item = usize>> FusedIterator for SplitsBy<'a, T, I> {}
+impl<T, I: FusedIterator<Item = usize>> FusedIterator for SplitsBy<'_, T, I> {}
 
 pub fn split_by<T, I: Iterator<Item = usize>, N: IntoIterator<IntoIter = I>>(
     slice: &[T],
@@ -55,7 +55,7 @@ impl<'a, T, I: Iterator<Item = usize>> Iterator for SplitsByMut<'a, T, I> {
     }
 }
 
-impl<'a, T, I: FusedIterator<Item = usize>> FusedIterator for SplitsByMut<'a, T, I> {}
+impl<T, I: FusedIterator<Item = usize>> FusedIterator for SplitsByMut<'_, T, I> {}
 
 pub fn split_by_mut<T, I: Iterator<Item = usize>, N: IntoIterator<IntoIter = I>>(
     slice: &mut [T],

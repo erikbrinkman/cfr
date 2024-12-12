@@ -286,7 +286,7 @@ struct Workspace<'a> {
     payoffs: HashMap<ByAddress<&'a Node>, f64>,
 }
 
-impl<'a> Workspace<'a> {
+impl Workspace<'_> {
     fn with_capacity(capacity: usize) -> Self {
         Workspace {
             queue: Vec::with_capacity(capacity),
@@ -494,7 +494,7 @@ mod tests {
 
     impl ChanceInfoset for Cinfo {
         fn probs(&self) -> &[f64] {
-            &*self.0
+            &self.0
         }
     }
 
@@ -602,7 +602,7 @@ mod tests {
         let (root, chance, [one, two]) = simple_game();
         let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_external_single(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             1000,
             0.0,
@@ -619,7 +619,7 @@ mod tests {
         let (root, chance, [one, two]) = even_or_odd();
         let ([reg_one, reg_two], [strat_one, strat_two]) = super::solve_external_single(
             &root,
-            &*chance,
+            &chance,
             [&*one, &*two],
             10_000,
             0.005,

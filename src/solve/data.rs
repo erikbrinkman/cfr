@@ -192,9 +192,9 @@ impl<'a> Iterator for AtomicIter<'a> {
     }
 }
 
-impl<'a> FusedIterator for AtomicIter<'a> {}
+impl FusedIterator for AtomicIter<'_> {}
 
-impl<'a> ExactSizeIterator for AtomicIter<'a> {}
+impl ExactSizeIterator for AtomicIter<'_> {}
 
 impl RegretParams {
     /// Create a new arbitrary set of regret parameters
