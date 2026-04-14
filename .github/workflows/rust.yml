@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,6 +17,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - name: Install nightly toolchain
+      run: rustup toolchain install nightly --component clippy
     - name: Build lib
       run: cargo build --verbose --no-default-features
     - name: Build bin
@@ -28,3 +31,5 @@ jobs:
       run: cargo clippy --verbose -- -D warnings
     - name: Run examples lints
       run: cargo clippy --verbose --examples -- -D warnings
+    - name: Run bench lints
+      run: cargo +nightly clippy --verbose --benches -- -D warnings

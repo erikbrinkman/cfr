@@ -69,7 +69,7 @@ fn optimal_deviations<const PLAYER_ONE: bool>(
                     if let Some(prev) = player_info[player.infoset].prev_infoset() {
                         infosets[prev].future_nodes += 1;
                     }
-                    for next in player.actions.iter() {
+                    for next in &player.actions {
                         search_queue.push((next, reach));
                     }
                 }

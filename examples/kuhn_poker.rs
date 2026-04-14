@@ -215,7 +215,7 @@ fn main() {
 mod tests {
     use super::Action;
     use cfr::{PlayerNum, RegretParams, SolveMethod, Strategies};
-    use rand::{thread_rng, Rng};
+    use rand::{rng, RngExt};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     fn infer_alpha(strat: &Strategies<(usize, bool), Action>) -> f64 {
@@ -349,7 +349,7 @@ mod tests {
         .into_par_iter()
         .flat_map(|method| [1, 2].into_par_iter().map(move |threads| (method, threads)))
         .for_each(|(method, threads)| {
-            thread_rng().fill(&mut [0; 8]);
+            rng().fill(&mut [0; 8]);
             let (mut strategies, bounds) = game
                 .solve(
                     method,
@@ -426,7 +426,7 @@ mod tests {
         ]
         .into_par_iter()
         .for_each(|(name, params)| {
-            thread_rng().fill(&mut [0; 8]);
+            rng().fill(&mut [0; 8]);
             let (mut strategies, _) = game
                 .solve(SolveMethod::Full, 10_000, 0.0, 1, Some(params))
                 .unwrap();

@@ -1,5 +1,5 @@
-use rand::Rng;
-use rand_distr::Distribution;
+use rand::distr::Distribution;
+use rand::{Rng, RngExt};
 
 pub struct Multinomial<'a> {
     // We store all be the last, since that should sum to one
@@ -19,7 +19,7 @@ impl Distribution<usize> for Multinomial<'_> {
     where
         R: Rng + ?Sized,
     {
-        let mut remaining: f64 = rnd.gen();
+        let mut remaining: f64 = rnd.random();
         let mut res = 0;
         for val in self.init_probs {
             if val < &remaining {
@@ -36,14 +36,14 @@ impl Distribution<usize> for Multinomial<'_> {
 #[cfg(test)]
 mod tests {
     use super::Multinomial;
-    use rand::thread_rng;
-    use rand_distr::Distribution;
+    use rand::distr::Distribution;
+    use rand::rng;
 
     #[test]
     fn test_invalid_small() {
         let dist = Multinomial::new(&[0.2, 0.3, 0.4]);
         for _ in 0..1000 {
-            assert!((0..3).contains(&dist.sample(&mut thread_rng())));
+            assert!((0..3).contains(&dist.sample(&mut rng())));
         }
     }
 
@@ -51,7 +51,7 @@ mod tests {
     fn test_invalid_large() {
         let dist = Multinomial::new(&[0.2, 0.7, 0.4]);
         for _ in 0..1000 {
-            assert!((0..3).contains(&dist.sample(&mut thread_rng())));
+            assert!((0..3).contains(&dist.sample(&mut rng())));
         }
     }
 }

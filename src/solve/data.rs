@@ -1,10 +1,11 @@
 //! Common data structures for solving games
+#![allow(clippy::cast_precision_loss)]
 use crate::Node;
 use by_address::ByAddress;
 use logaddexp::LogAddExp;
 use portable_atomic::AtomicF64;
-use rand::thread_rng;
-use rand_distr::{Distribution, WeightedAliasIndex};
+use rand::rng;
+use rand_distr::{weighted::WeightedAliasIndex, Distribution};
 use std::collections::HashMap;
 use std::iter::FusedIterator;
 use std::slice;
@@ -30,7 +31,7 @@ impl SampledChance {
     /// This will return the same value on successive calls until reset is called
     pub fn sample(&mut self) -> usize {
         if self.cached == 0 {
-            let res = self.index.sample(&mut thread_rng());
+            let res = self.index.sample(&mut rng());
             self.cached = res + 1;
             res
         } else {
@@ -143,9 +144,9 @@ pub struct RegretParams {
     pub no_positive: f64,
 }
 
-/// Trait for &mut [f64] or &mut [AtomicF64]
+/// Trait for &mut [f64] or &mut [`AtomicF64`]
 ///
-/// This is mut because we have mut in all instances, and AtomicF64 can be more efficient because
+/// This is mut because we have mut in all instances, and `AtomicF64` can be more efficient because
 /// we don't need to synchronize.
 pub(super) trait IntoFloatsMut<'a> {
     type Floats: Iterator<Item = &'a mut f64>;
@@ -202,6 +203,7 @@ impl RegretParams {
     /// # Panics
     ///
     /// If any values are nan, or `strat` is negative.
+    #[must_use]
     pub fn new(pos_regret: f64, neg_regret: f64, strat: f64, no_positive: f64) -> Self {
         assert!(
             !pos_regret.is_nan(),
@@ -213,8 +215,7 @@ impl RegretParams {
         );
         assert!(
             strat >= 0.0,
-            "strategy discounting must be non-negative: {}",
-            strat
+            "strategy discounting must be non-negative: {strat}"
         );
         assert!(
             strat != f64::INFINITY,
@@ -235,6 +236,7 @@ impl RegretParams {
     /// Parameters for vanilla CFR
     ///
     /// Vanilla CFR has no discounting and picks the uniform strategy for negative regret infosets.
+    #[must_use]
     pub fn vanilla() -> Self {
         RegretParams {
             pos_regret: f64::INFINITY,
@@ -247,6 +249,7 @@ impl RegretParams {
     /// Linear discounted CFR
     ///
     /// Regret and strategies are weighted proportional to the iteration number.
+    #[must_use]
     pub fn lcfr() -> Self {
         RegretParams {
             pos_regret: 1.0,
@@ -260,6 +263,7 @@ impl RegretParams {
     ///
     /// Negative regrets are forgotten and strategies are weighted proportional to the square of
     /// the iteration number.
+    #[must_use]
     pub fn cfr_plus() -> Self {
         RegretParams {
             pos_regret: f64::INFINITY,
@@ -272,6 +276,7 @@ impl RegretParams {
     /// Discounted CFR
     ///
     /// The loosely empirically optimal selection of parameters from the DCFR paper. (α: 1.5, β: 0, γ: 2)
+    #[must_use]
     pub fn dcfr() -> Self {
         RegretParams {
             pos_regret: 1.5,
@@ -285,6 +290,7 @@ impl RegretParams {
     ///
     /// A slight modification of DCFRs parameters that allows pruning negative regret actions. (α:
     /// 1.5, β: 0.5, γ: 2)
+    #[must_use]
     pub fn dcfr_prune() -> Self {
         RegretParams {
             pos_regret: 1.5,
@@ -385,7 +391,7 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn cum_regret<R: ?Sized>(&self, it: u64, cum_reg: &mut R) -> f64
+    pub(super) fn cum_regret<R: ?Sized>(it: u64, cum_reg: &mut R) -> f64
     where
         for<'a> &'a mut R: IntoFloatsMut<'a>,
     {
@@ -411,6 +417,13 @@ impl Default for RegretParams {
 impl Eq for RegretParams {}
 
 #[cfg(test)]
+#[allow(
+    clippy::float_cmp,
+    clippy::similar_names,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless,
+    unused_must_use
+)]
 mod tests {
     use super::RegretParams;
 
@@ -507,11 +520,11 @@ mod tests {
     #[test]
     fn cum_regret() {
         let mut regs = [1.0, 2.0, 1.0, -3.0];
-        let res = RegretParams::default().cum_regret(1, &mut regs);
+        let res = RegretParams::cum_regret(1, &mut regs);
         assert_eq!(res, 4.0);
-        let res = RegretParams::default().cum_regret(2, &mut regs);
+        let res = RegretParams::cum_regret(2, &mut regs);
         assert_eq!(res, 2.0);
-        let res = RegretParams::default().cum_regret(4, &mut regs);
+        let res = RegretParams::cum_regret(4, &mut regs);
         assert_eq!(res, 1.0);
     }
 

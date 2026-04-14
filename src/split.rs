@@ -13,9 +13,9 @@ impl<'a, T, I: Iterator<Item = usize>> Iterator for SplitsBy<'a, T, I> {
     fn next(&mut self) -> Option<Self::Item> {
         match self.lens.next() {
             Some(len) => {
-                let (ret, rest) = self.slice.split_at(len);
-                self.slice = rest;
-                Some(ret)
+                let (head, tail) = self.slice.split_at(len);
+                self.slice = tail;
+                Some(head)
             }
             None => None,
         }
@@ -46,9 +46,9 @@ impl<'a, T, I: Iterator<Item = usize>> Iterator for SplitsByMut<'a, T, I> {
         match self.lens.next() {
             Some(len) => {
                 let tmp = mem::take(&mut self.slice);
-                let (ret, rest) = tmp.split_at_mut(len);
-                self.slice = rest;
-                Some(ret)
+                let (head, tail) = tmp.split_at_mut(len);
+                self.slice = tail;
+                Some(head)
             }
             None => None,
         }
@@ -72,8 +72,8 @@ mod tests {
 
     #[test]
     fn test_ref() {
-        let slices = [1, 2, 3, 4, 5, 6, 7, 8];
-        let sliced: Box<[&[_]]> = super::split_by(&slices, [1, 3, 4]).collect();
+        let input = [1, 2, 3, 4, 5, 6, 7, 8];
+        let sliced: Box<[&[_]]> = super::split_by(&input, [1, 3, 4]).collect();
         assert_eq!(*sliced, [vec![1], vec![2, 3, 4], vec![5, 6, 7, 8]]);
     }
 

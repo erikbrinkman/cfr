@@ -9,7 +9,7 @@
 //! identical keys to the same index and assocaited values. Then we destruct it and move it into
 //! the final boxed slice once we've processed everything.
 //!
-//! This module contains [Builder] and [OptBuilder]. The only difference is that the latter allows
+//! This module contains [Builder] and [`OptBuilder`]. The only difference is that the latter allows
 //! pushing optional values with guaranteed uniqueness (no key).
 use indexmap::{map, IndexMap};
 use std::hash::Hash;

@@ -23,6 +23,7 @@ struct PlayState<const D: usize> {
 
 type Combinations<const D: usize> = impl Iterator<Item = ([u8; D], u64)>;
 
+#[define_opaque(Combinations)]
 fn combinations<const D: usize>(num: u8) -> Combinations<D> {
     assert_ne!(D, 0);
     let mut vals = [0; D];
@@ -50,6 +51,7 @@ fn combinations<const D: usize>(num: u8) -> Combinations<D> {
 
 type Rolls<const D: usize> = impl Iterator<Item = (f64, State<D>)>;
 
+#[define_opaque(Rolls)]
 fn roll<const D: usize>(player_dice: u8) -> Rolls<D> {
     combinations(player_dice).flat_map(move |(one_dice, p_one)| {
         combinations(player_dice).map(move |(two_dice, p_two)| {
@@ -69,6 +71,7 @@ fn roll<const D: usize>(player_dice: u8) -> Rolls<D> {
 type Actions<const D: usize> = impl Iterator<Item = (Action, State<D>)>;
 
 impl<const D: usize> PlayState<D> {
+    #[define_opaque(Actions)]
     fn into_actions(self) -> Actions<D> {
         let PlayState {
             total_dice,
