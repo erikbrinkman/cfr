@@ -1,4 +1,5 @@
 //! Vanilla and sampled cfr implementations
+#![allow(clippy::cast_precision_loss)]
 use super::data;
 use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
@@ -44,7 +45,7 @@ impl ChanceRecurse for RefCell<SampledChance> {
     }
 
     fn advance(&mut self) {
-        self.get_mut().reset()
+        self.get_mut().reset();
     }
 }
 
@@ -55,7 +56,7 @@ impl ChanceRecurse for Mutex<SampledChance> {
     }
 
     fn advance(&mut self) {
-        self.get_mut().unwrap().reset()
+        self.get_mut().unwrap().reset();
     }
 }
 
@@ -76,7 +77,7 @@ impl PlayerRecurse for RegretInfoset {
         params.regret_match(&mut *self.cum_regret, &mut self.strat);
         params.discount_cum_regret(it, &mut *self.cum_regret);
         params.discount_average_strat(it, &mut self.cum_strat);
-        params.cum_regret(it, &mut *self.cum_regret)
+        RegretParams::cum_regret(it, &mut *self.cum_regret)
     }
 }
 
@@ -90,9 +91,8 @@ struct MutexRegretInfoset {
 impl MutexRegretInfoset {
     fn new(num_actions: usize) -> Self {
         MutexRegretInfoset {
-            cum_regret: iter::repeat(())
+            cum_regret: iter::repeat_with(|| AtomicF64::new(0.0))
                 .take(num_actions)
-                .map(|_| AtomicF64::new(0.0))
                 .collect(),
             cum_strat: Mutex::new(vec![0.0; num_actions].into()),
             strat: vec![1.0 / num_actions as f64; num_actions].into(),
@@ -127,7 +127,7 @@ impl MutexPlayerRecurse for MutexRegretInfoset {
         params.regret_match(&mut *self.cum_regret, &mut self.strat);
         params.discount_cum_regret(it, &mut *self.cum_regret);
         params.discount_average_strat(it, self.cum_strat.get_mut().unwrap());
-        params.cum_regret(it, &mut *self.cum_regret)
+        RegretParams::cum_regret(it, &mut *self.cum_regret)
     }
 }
 
@@ -174,7 +174,7 @@ fn recurse_single(
                     recurse_single(next, chance_infosets, player_infosets, p_chance, p_next)
                 },
             );
-            for val in info.cum_regret.iter_mut() {
+            for val in &mut info.cum_regret {
                 *val -= sub;
             }
             res
@@ -223,7 +223,7 @@ fn recurse_player(
         .actions
         .iter()
         .zip(strat.iter())
-        .zip(cum_regret.into_iter())
+        .zip(cum_regret)
     {
         let mut p_next = p_player;
         *player.num.ind_mut(&mut p_next) *= prob;
@@ -285,7 +285,7 @@ fn recurse_multi(
                         )
                     },
                 );
-                for val in info.cum_regret.iter() {
+                for val in &info.cum_regret {
                     val.fetch_sub(sub, Ordering::Relaxed);
                 }
                 res
@@ -581,7 +581,9 @@ mod tests {
         }
     }
 
-    fn new_game() -> (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]) {
+    type Game = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
+
+    fn new_game() -> Game {
         let root = Node::Chance(Chance {
             outcomes: vec![
                 Node::Player(Player {
@@ -654,23 +656,19 @@ mod tests {
                 } else {
                     PlayerNum::Two
                 },
-                actions: [
-                    Node::Terminal(0.0),
-                    recurse_simple_node(steps - 1, payoff * -1.0),
-                ]
-                .into(),
+                actions: [Node::Terminal(0.0), recurse_simple_node(steps - 1, -payoff)].into(),
                 infoset: (steps - 1) / 3,
             }),
             _ => panic!(),
         }
     }
 
-    fn large_game(num: usize) -> (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]) {
+    fn large_game(num: usize) -> Game {
         let root = recurse_simple_node(num, 1.0);
         let chance = vec![Cinfo(vec![0.5, 0.5].into()); (num + 1) / 3].into();
         let players = [
             vec![Pinfo(2); num / 3].into(),
-            vec![Pinfo(2); (num + 2) / 3].into(),
+            vec![Pinfo(2); num.div_ceil(3)].into(),
         ];
         (root, chance, players)
     }
@@ -688,7 +686,7 @@ mod tests {
             &RegretParams::vanilla(),
         )
         .unwrap();
-        assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);
+        assert!(f64::max(reg_one, reg_two) < 0.1, "{reg_one} {reg_two}");
     }
 
     #[test]
@@ -704,6 +702,6 @@ mod tests {
             &RegretParams::vanilla(),
         )
         .unwrap();
-        assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);
+        assert!(f64::max(reg_one, reg_two) < 0.1, "{reg_one} {reg_two}");
     }
 }

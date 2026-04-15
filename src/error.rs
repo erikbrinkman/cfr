@@ -6,7 +6,7 @@ use std::fmt::{Display, Error as FmtError, Formatter};
 
 /// Errors that result from game definition errors
 ///
-/// If the object passed into [Game::from_root] doesn't conform to necessary
+/// If the object passed into [`Game::from_root`] doesn't conform to necessary
 /// invariants, one of these will be returned.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
@@ -40,7 +40,7 @@ pub enum GameError {
 
 impl Display for GameError {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(fmt, "{:?}", self)
+        write!(fmt, "{self:?}")
     }
 }
 
@@ -213,7 +213,7 @@ mod game_errors {
 
 /// Errors that result from incompatible strategy representation
 ///
-/// If a strategy object passed to [Game::from_named] doesn't match the games information and
+/// If a strategy object passed to [`Game::from_named`] doesn't match the games information and
 /// action structure, one of these errors will be returned.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
@@ -230,7 +230,7 @@ pub enum StratError {
 
 impl Display for StratError {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(fmt, "{:?}", self)
+        write!(fmt, "{self:?}")
     }
 }
 
@@ -369,7 +369,7 @@ pub enum SolveError {
 }
 impl Display for SolveError {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> Result<(), FmtError> {
-        write!(fmt, "{:?}", self)
+        write!(fmt, "{self:?}")
     }
 }
 

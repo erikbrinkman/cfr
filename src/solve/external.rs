@@ -3,8 +3,8 @@ use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, Solv
 use super::multinomial::Multinomial;
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use by_address::ByAddress;
-use rand::thread_rng;
-use rand_distr::Distribution;
+use rand::distr::Distribution;
+use rand::rng;
 use rayon::iter::{
     IntoParallelRefMutIterator, ParallelDrainRange, ParallelExtend, ParallelIterator,
 };
@@ -34,7 +34,7 @@ impl CachedInfoset {
     /// Sample an action from the current strategy, caches between resets
     fn sample(&mut self) -> usize {
         if self.cached == 0 {
-            let res = Multinomial::new(&self.reg.strat).sample(&mut thread_rng());
+            let res = Multinomial::new(&self.reg.strat).sample(&mut rng());
             self.cached = res + 1;
             res
         } else {
@@ -56,13 +56,13 @@ impl ChanceInfo for SampledChance {
     }
 
     fn advance(&mut self) {
-        self.reset()
+        self.reset();
     }
 }
 
-/// Abstraction over wrappers of ChanceInfo
+/// Abstraction over wrappers of `ChanceInfo`
 ///
-/// This allows recursing over RefCells or Mutex
+/// This allows recursing over `RefCells` or Mutex
 trait ChanceRecurse {
     fn next<'a>(&self, chance: &'a Chance) -> &'a Node;
 }
@@ -148,7 +148,7 @@ impl ActiveInfo for CachedInfoset {
         }
 
         // account for only adding utility to cum_regret
-        for cum_reg in self.reg.cum_regret.iter_mut() {
+        for cum_reg in &mut self.reg.cum_regret {
             *cum_reg -= expected;
         }
         expected
@@ -162,7 +162,7 @@ impl ActiveInfo for CachedInfoset {
         // strat, they'll actually have nothing acumulated, so we actualy want to update on the
         // second round
         params.discount_average_strat(if FIRST { it - 1 } else { it }, &mut self.reg.cum_strat);
-        params.cum_regret(it, &mut *self.reg.cum_regret)
+        RegretParams::cum_regret(it, &mut *self.reg.cum_regret)
     }
 }
 
@@ -342,9 +342,9 @@ fn single_player_iter<'a, const FIRST: bool>(
 
     // update all infosets
     work.payoffs.clear();
-    chance_infosets
-        .iter_mut()
-        .for_each(|info| info.get_mut().unwrap().advance());
+    for info in chance_infosets.iter_mut() {
+        info.get_mut().unwrap().advance();
+    }
     active_player_infosets
         .par_iter_mut()
         .map(|info| info.get_mut().unwrap().advance::<FIRST>(it, params))
@@ -515,23 +515,21 @@ mod tests {
                 } else {
                     PlayerNum::Two
                 },
-                actions: [
-                    Node::Terminal(0.0),
-                    recurse_simple_node(steps - 1, payoff * -1.0),
-                ]
-                .into(),
+                actions: [Node::Terminal(0.0), recurse_simple_node(steps - 1, -payoff)].into(),
                 infoset: (steps - 1) / 3,
             }),
             _ => panic!(),
         }
     }
 
-    fn large_game(num: usize) -> (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]) {
+    type Game = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
+
+    fn large_game(num: usize) -> Game {
         let root = recurse_simple_node(num, 1.0);
         let chance = vec![Cinfo(vec![0.5, 0.5].into()); (num + 1) / 3].into();
         let players = [
             vec![Pinfo(2); num / 3].into(),
-            vec![Pinfo(2); (num + 2) / 3].into(),
+            vec![Pinfo(2); num.div_ceil(3)].into(),
         ];
         (root, chance, players)
     }
@@ -549,10 +547,10 @@ mod tests {
             &RegretParams::vanilla(),
         )
         .unwrap();
-        assert!(f64::max(reg_one, reg_two) < 0.1, "{} {}", reg_one, reg_two);
+        assert!(f64::max(reg_one, reg_two) < 0.1, "{reg_one} {reg_two}");
     }
 
-    fn simple_game() -> (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]) {
+    fn simple_game() -> Game {
         let root = Node::Chance(Chance {
             outcomes: vec![
                 Node::Player(Player {
@@ -574,7 +572,7 @@ mod tests {
         (root, chance, players)
     }
 
-    fn even_or_odd() -> (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]) {
+    fn even_or_odd() -> Game {
         let root = Node::Player(Player {
             num: PlayerNum::One,
             actions: vec![
@@ -625,8 +623,8 @@ mod tests {
             0.005,
             &RegretParams::vanilla(),
         );
-        assert!((strat_one[1] - 0.5).abs() < 0.05, "{:?}", strat_one);
-        assert!((strat_two[0] - 0.5).abs() < 0.05, "{:?}", strat_two);
+        assert!((strat_one[1] - 0.5).abs() < 0.05, "{strat_one:?}");
+        assert!((strat_two[0] - 0.5).abs() < 0.05, "{strat_two:?}");
         assert!(reg_one < 0.05);
         assert!(reg_two < 0.05);
     }
