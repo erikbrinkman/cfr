@@ -19,6 +19,7 @@ jobs:
     - uses: actions/checkout@v3
     - name: Install nightly toolchain
       run: rustup toolchain install nightly --component clippy
+    - uses: Swatinem/rust-cache@v2
     - name: Build lib
       run: cargo build --verbose --no-default-features
     - name: Build bin
