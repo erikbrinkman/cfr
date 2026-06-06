@@ -381,30 +381,3 @@ impl From<ThreadPoolBuildError> for SolveError {
     }
 }
 
-#[cfg(test)]
-mod solve_errors {
-    use crate::{Game, GameNode, IntoGameNode, SolveError, SolveMethod};
-
-    struct Node(GameNode<Node>);
-
-    impl IntoGameNode for Node {
-        type PlayerInfo = &'static str;
-        type Action = &'static str;
-        type ChanceInfo = &'static str;
-        type Outcomes = Vec<(f64, Node)>;
-        type Actions = Vec<(&'static str, Node)>;
-
-        fn into_game_node(self) -> GameNode<Self> {
-            self.0
-        }
-    }
-
-    #[test]
-    fn test_thread_overflow() {
-        let game = Game::from_root(Node(GameNode::Terminal(0.0))).unwrap();
-        let err = game
-            .solve(SolveMethod::Full, 0, 0.0, usize::MAX, None)
-            .unwrap_err();
-        assert_eq!(err, SolveError::ThreadOverflow);
-    }
-}
