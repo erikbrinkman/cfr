@@ -309,21 +309,6 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn discount_cum_regret<R: ?Sized>(&self, it: u64, cum_reg: &mut R)
-    where
-        for<'a> &'a mut R: IntoFloatsMut<'a>,
-    {
-        let pos = Self::gen_discount(it, self.pos_regret);
-        let neg = Self::gen_discount(it, self.neg_regret);
-        for reg in cum_reg.into_floats_mut() {
-            if reg > &mut 0.0 {
-                *reg *= pos;
-            } else if reg < &mut 0.0 {
-                *reg *= neg;
-            }
-        }
-    }
-
     pub(super) fn gen_discount(it: u64, discount: f64) -> f64 {
         if discount == f64::NEG_INFINITY {
             0.0
@@ -338,23 +323,101 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn discount_average_strat(&self, it: u64, avg_strat: &mut [f64]) {
-        if self.strat == f64::INFINITY {
-            for avg in avg_strat.iter_mut() {
-                *avg = 0.0;
-            }
-        } else if self.strat > 0.0 {
-            let float = it as f64;
-            let ratio = (float / (float + 1.0)).powf(self.strat);
-            for avg in avg_strat.iter_mut() {
-                *avg *= ratio;
+}
+
+/// The average strategy discount for a single iteration
+///
+/// The discount applied to the average strategy depends only on the iteration, so we resolve it
+/// once per sweep instead of branching on `strat` for every infoset.
+enum StratDiscount {
+    /// Forget the entire accumulated average (`γ` is infinite)
+    Forget,
+    /// Scale the accumulated average by a factor (`γ > 0`)
+    Scale(f64),
+    /// Leave the accumulated average untouched (`γ == 0`)
+    Keep,
+}
+
+/// Precomputed discount factors for a single update sweep
+///
+/// The regret and average-strategy discounts depend only on the iteration number, not on the
+/// infoset, so they're computed once per sweep here rather than recomputing the underlying
+/// transcendental functions ([`RegretParams::gen_discount`] and `powf`) for every infoset. A
+/// borrowed [`RegretParams`] is carried along so callers can run regret matching through the same
+/// handle.
+pub(super) struct Discounts<'a> {
+    params: &'a RegretParams,
+    it: u64,
+    // factor applied to positive cumulative regret
+    pos: f64,
+    // factor applied to negative cumulative regret
+    neg: f64,
+    // factor applied to the accumulated average strategy
+    strat: StratDiscount,
+}
+
+impl<'a> Discounts<'a> {
+    /// Resolve the discounts for iteration `it`
+    ///
+    /// `strat_it` is the iteration used for the average-strategy discount, which can differ from
+    /// `it` when players alternate updates (the lagging player hasn't accumulated anything yet).
+    pub(super) fn new(params: &'a RegretParams, it: u64, strat_it: u64) -> Self {
+        let strat = if params.strat == f64::INFINITY {
+            StratDiscount::Forget
+        } else if params.strat > 0.0 {
+            let float = strat_it as f64;
+            StratDiscount::Scale((float / (float + 1.0)).powf(params.strat))
+        } else {
+            StratDiscount::Keep
+        };
+        Discounts {
+            params,
+            it,
+            pos: RegretParams::gen_discount(it, params.pos_regret),
+            neg: RegretParams::gen_discount(it, params.neg_regret),
+            strat,
+        }
+    }
+
+    /// Run regret matching for an infoset through the carried parameters
+    pub(super) fn regret_match<R: ?Sized>(&self, cum_reg: &mut R, strat: &mut [f64])
+    where
+        for<'b> &'b mut R: IntoFloatsMut<'b>,
+    {
+        self.params.regret_match(cum_reg, strat);
+    }
+
+    /// Discount cumulative regret with the precomputed factors
+    pub(super) fn discount_cum_regret<R: ?Sized>(&self, cum_reg: &mut R)
+    where
+        for<'b> &'b mut R: IntoFloatsMut<'b>,
+    {
+        for reg in cum_reg.into_floats_mut() {
+            if *reg > 0.0 {
+                *reg *= self.pos;
+            } else if *reg < 0.0 {
+                *reg *= self.neg;
             }
         }
     }
 
-    pub(super) fn cum_regret<R: ?Sized>(it: u64, cum_reg: &mut R) -> f64
+    /// Discount the accumulated average strategy with the precomputed factor
+    pub(super) fn discount_average_strat(&self, avg_strat: &mut [f64]) {
+        match self.strat {
+            StratDiscount::Forget => avg_strat.fill(0.0),
+            StratDiscount::Scale(ratio) => {
+                for avg in avg_strat.iter_mut() {
+                    *avg *= ratio;
+                }
+            }
+            StratDiscount::Keep => {}
+        }
+    }
+
+    /// The regret bound contributed by an infoset given its cumulative regret
+    pub(super) fn regret_bound<R: ?Sized>(&self, cum_reg: &mut R) -> f64
     where
-        for<'a> &'a mut R: IntoFloatsMut<'a>,
+        for<'b> &'b mut R: IntoFloatsMut<'b>,
     {
         2.0 * f64::max(
             cum_reg
@@ -363,7 +426,7 @@ impl RegretParams {
                 .reduce(f64::max)
                 .unwrap_or(0.0),
             0.0,
-        ) / it as f64
+        ) / self.it as f64
     }
 }
 
@@ -386,7 +449,7 @@ impl Eq for RegretParams {}
     unused_must_use
 )]
 mod tests {
-    use super::RegretParams;
+    use super::{Discounts, RegretParams};
 
     #[test]
     fn avg_strat() {
@@ -428,21 +491,21 @@ mod tests {
     #[test]
     fn discount_regs() {
         let mut regs = [1.0, -1.0];
-        RegretParams::new(0.0, 0.0, 0.0, 0.0).discount_cum_regret(2, &mut regs);
+        Discounts::new(&RegretParams::new(0.0, 0.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut regs);
         assert_eq!(regs, [0.5, -0.5]);
 
         let mut regs = [1.0, -1.0];
-        RegretParams::new(f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0)
-            .discount_cum_regret(2, &mut regs);
+        Discounts::new(&RegretParams::new(f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0), 2, 2)
+            .discount_cum_regret(&mut regs);
         assert_eq!(regs, [1.0, 0.0]);
 
         let mut regs = [1.0, -1.0];
-        RegretParams::new(f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0)
-            .discount_cum_regret(2, &mut regs);
+        Discounts::new(&RegretParams::new(f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0), 2, 2)
+            .discount_cum_regret(&mut regs);
         assert_eq!(regs, [0.0, -1.0]);
 
         let mut regs = [1.0, -1.0];
-        RegretParams::new(1.0, 1.0, 0.0, 0.0).discount_cum_regret(2, &mut regs);
+        Discounts::new(&RegretParams::new(1.0, 1.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut regs);
         let [a, b] = regs;
         assert!((0.6..0.9).contains(&a), "{}", a);
         assert!((-0.9..-0.6).contains(&b), "{}", b);
@@ -451,19 +514,20 @@ mod tests {
     #[test]
     fn discount_average_strat() {
         let mut cum_strat = [1.0, 2.0];
-        RegretParams::new(0.0, 0.0, 0.0, 0.0).discount_average_strat(1, &mut cum_strat);
+        Discounts::new(&RegretParams::new(0.0, 0.0, 0.0, 0.0), 1, 1)
+            .discount_average_strat(&mut cum_strat);
         assert_eq!(cum_strat, [1.0, 2.0]);
 
         let mut cum_strat = [1.0, 2.0];
-        RegretParams::lcfr().discount_average_strat(1, &mut cum_strat);
+        Discounts::new(&RegretParams::lcfr(), 1, 1).discount_average_strat(&mut cum_strat);
         assert_eq!(cum_strat, [0.5, 1.0]);
 
         let mut cum_strat = [1.0, 2.0];
-        RegretParams::cfr_plus().discount_average_strat(1, &mut cum_strat);
+        Discounts::new(&RegretParams::cfr_plus(), 1, 1).discount_average_strat(&mut cum_strat);
         assert_eq!(cum_strat, [0.25, 0.5]);
 
         let mut cum_strat = [1.0, 2.0];
-        RegretParams::lcfr().discount_average_strat(2, &mut cum_strat);
+        Discounts::new(&RegretParams::lcfr(), 2, 2).discount_average_strat(&mut cum_strat);
         let [a, b] = cum_strat;
         assert!((0.6..0.9).contains(&a), "{}", a);
         assert!((1.1..1.9).contains(&b), "{}", b);
@@ -472,20 +536,20 @@ mod tests {
         let mut cum_strat = [0.0];
         for t in 1..=5 {
             cum_strat[0] += 1.0;
-            params.discount_average_strat(t, &mut cum_strat);
+            Discounts::new(&params, t, t).discount_average_strat(&mut cum_strat);
         }
         let expected = (1..=5).sum::<usize>() as f64 / (5 + 1) as f64;
         assert!((cum_strat[0] - expected).abs() < 1e-6, "{}", cum_strat[0]);
     }
 
     #[test]
-    fn cum_regret() {
+    fn regret_bound() {
         let mut regs = [1.0, 2.0, 1.0, -3.0];
-        let res = RegretParams::cum_regret(1, &mut regs);
+        let res = Discounts::new(&RegretParams::vanilla(), 1, 1).regret_bound(&mut regs);
         assert_eq!(res, 4.0);
-        let res = RegretParams::cum_regret(2, &mut regs);
+        let res = Discounts::new(&RegretParams::vanilla(), 2, 2).regret_bound(&mut regs);
         assert_eq!(res, 2.0);
-        let res = RegretParams::cum_regret(4, &mut regs);
+        let res = Discounts::new(&RegretParams::vanilla(), 4, 4).regret_bound(&mut regs);
         assert_eq!(res, 1.0);
     }
 

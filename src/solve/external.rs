@@ -1,5 +1,5 @@
 //! External regret solving
-use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, SolveInfo};
+use super::data::{CachedPayoff, Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use super::multinomial::Multinomial;
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use rand::distr::Distribution;
@@ -65,7 +65,7 @@ impl<T: ChanceInfo> ChanceRecurse for RefCell<T> {
 trait ActiveInfo {
     fn recurse(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64;
 
-    fn advance<const FIRST: bool>(&mut self, it: u64, params: &RegretParams) -> f64;
+    fn advance(&mut self, discounts: &Discounts) -> f64;
 }
 
 trait ActiveRecurse {
@@ -121,15 +121,12 @@ impl ActiveInfo for CachedInfoset {
         expected
     }
 
-    fn advance<const FIRST: bool>(&mut self, it: u64, params: &RegretParams) -> f64 {
+    fn advance(&mut self, discounts: &Discounts) -> f64 {
         self.cached = 0;
-        params.regret_match(&mut *self.reg.cum_regret, &mut self.reg.strat);
-        params.discount_cum_regret(it, &mut *self.reg.cum_regret);
-        // NOTE since we alternate updates, when we do the first discounting of player one's average
-        // strat, they will actually have nothing accumulated, so we actually want to update on the
-        // second round
-        params.discount_average_strat(if FIRST { it - 1 } else { it }, &mut self.reg.cum_strat);
-        RegretParams::cum_regret(it, &mut *self.reg.cum_regret)
+        discounts.regret_match(&mut *self.reg.cum_regret, &mut self.reg.strat);
+        discounts.discount_cum_regret(&mut *self.reg.cum_regret);
+        discounts.discount_average_strat(&mut self.reg.cum_strat);
+        discounts.regret_bound(&mut *self.reg.cum_regret)
     }
 }
 
@@ -219,18 +216,22 @@ pub(crate) fn solve_external_single(
         chance_infosets
             .iter_mut()
             .for_each(|info| info.get_mut().advance());
+        // the leading player has nothing accumulated on its first average-strat discount, so it
+        // discounts against `it - 1` (see `single_player_iter`)
+        let discounts_one = Discounts::new(params, it, it - 1);
         reg_one = player_one
             .iter_mut()
-            .map(|info| info.get_mut().advance::<true>(it, params))
+            .map(|info| info.get_mut().advance(&discounts_one))
             .sum();
         // player two
         recurse_regret::<false>(start, &chance_infosets, &player_two, &player_one, &());
         chance_infosets
             .iter_mut()
             .for_each(|info| info.get_mut().advance());
+        let discounts_two = Discounts::new(params, it, it);
         reg_two = player_two
             .iter_mut()
-            .map(|info| info.get_mut().advance::<false>(it, params))
+            .map(|info| info.get_mut().advance(&discounts_two))
             .sum();
         // check to terminate
         if f64::max(reg_one, reg_two) < max_reg {
