@@ -1,4 +1,5 @@
 //! External regret solving
+use super::data;
 use super::data::{CachedPayoff, Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use super::multinomial::Multinomial;
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
@@ -190,6 +191,29 @@ fn recurse_regret<const FIRST: bool>(
     }
 }
 
+/// Advance every infoset of a player, returning the summed regret bound on a check iteration
+///
+/// On a non-check iteration the advance still runs for its side effects, but the regret bound isn't
+/// needed, so we skip summing it and return infinity (which never satisfies an early-termination
+/// test).
+fn advance_player(
+    player: &mut [RefCell<CachedInfoset>],
+    discounts: &Discounts,
+    check: bool,
+) -> f64 {
+    if check {
+        player
+            .iter_mut()
+            .map(|info| info.get_mut().advance(discounts))
+            .sum()
+    } else {
+        for info in player.iter_mut() {
+            info.get_mut().advance(discounts);
+        }
+        f64::INFINITY
+    }
+}
+
 pub(crate) fn solve_external_single(
     start: &Node,
     chance_info: &[impl ChanceInfoset],
@@ -197,6 +221,7 @@ pub(crate) fn solve_external_single(
     max_iter: u64,
     max_reg: f64,
     params: &RegretParams,
+    check_interval: u64,
 ) -> SolveInfo {
     let mut chance_infosets: Box<[_]> = chance_info
         .iter()
@@ -210,6 +235,7 @@ pub(crate) fn solve_external_single(
     });
     let [mut reg_one, mut reg_two] = [f64::INFINITY; 2];
     for it in 1..=max_iter {
+        let check = data::should_check(it, max_iter, check_interval);
         // player one
         recurse_regret::<true>(start, &chance_infosets, &player_one, &player_two, &());
         chance_infosets
@@ -218,22 +244,16 @@ pub(crate) fn solve_external_single(
         // the leading player has nothing accumulated on its first average-strat discount, so it
         // discounts against `it - 1` (see `single_player_iter`)
         let discounts_one = Discounts::new(params, it, it - 1);
-        reg_one = player_one
-            .iter_mut()
-            .map(|info| info.get_mut().advance(&discounts_one))
-            .sum();
+        reg_one = advance_player(&mut player_one, &discounts_one, check);
         // player two
         recurse_regret::<false>(start, &chance_infosets, &player_two, &player_one, &());
         chance_infosets
             .iter_mut()
             .for_each(|info| info.get_mut().advance());
         let discounts_two = Discounts::new(params, it, it);
-        reg_two = player_two
-            .iter_mut()
-            .map(|info| info.get_mut().advance(&discounts_two))
-            .sum();
+        reg_two = advance_player(&mut player_two, &discounts_two, check);
         // check to terminate
-        if f64::max(reg_one, reg_two) < max_reg {
+        if check && f64::max(reg_one, reg_two) < max_reg {
             break;
         }
     }
@@ -329,6 +349,7 @@ mod tests {
             1000,
             0.0,
             &RegretParams::vanilla(),
+            256,
         );
         assert!(strat_one[1] < 0.05);
         assert!(strat_two[0] < 0.05);
@@ -346,6 +367,7 @@ mod tests {
             10_000,
             0.005,
             &RegretParams::vanilla(),
+            256,
         );
         assert!((strat_one[1] - 0.5).abs() < 0.05, "{strat_one:?}");
         assert!((strat_two[0] - 0.5).abs() < 0.05, "{strat_two:?}");

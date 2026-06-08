@@ -1,5 +1,6 @@
 //! Vanilla and sampled cfr implementations
 #![allow(clippy::cast_precision_loss)]
+use super::data;
 use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use std::cell::RefCell;
@@ -155,6 +156,7 @@ fn solve_generic_single(
     iter: u64,
     max_reg: f64,
     params: &RegretParams,
+    check_interval: u64,
 ) -> SolveInfo {
     let mut regs = [f64::INFINITY; 2];
     for it in 1..=iter {
@@ -167,15 +169,23 @@ fn solve_generic_single(
             [1.0; 2],
         );
         chance_infosets.iter_mut().for_each(ChanceRecurse::advance);
+        let check = data::should_check(it, iter, check_interval);
         let discounts = Discounts::new(params, it, it);
         for (reg, infos) in regs.iter_mut().zip(player_infosets.iter_mut()) {
-            *reg = infos
-                .iter_mut()
-                .map(|info| info.get_mut().advance(&discounts))
-                .sum();
+            *reg = if check {
+                infos
+                    .iter_mut()
+                    .map(|info| info.get_mut().advance(&discounts))
+                    .sum()
+            } else {
+                for info in infos.iter_mut() {
+                    info.get_mut().advance(&discounts);
+                }
+                f64::INFINITY
+            };
         }
         let [reg_one, reg_two] = regs;
-        if f64::max(reg_one, reg_two) < max_reg {
+        if check && f64::max(reg_one, reg_two) < max_reg {
             break;
         }
     }
@@ -195,6 +205,7 @@ pub(crate) fn solve_full_single(
     max_iter: u64,
     max_reg: f64,
     params: &RegretParams,
+    check_interval: u64,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -213,6 +224,7 @@ pub(crate) fn solve_full_single(
         max_iter,
         max_reg,
         params,
+        check_interval,
     )
 }
 
@@ -223,6 +235,7 @@ pub(crate) fn solve_sampled_single(
     max_iter: u64,
     max_reg: f64,
     params: &RegretParams,
+    check_interval: u64,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -241,6 +254,7 @@ pub(crate) fn solve_sampled_single(
         max_iter,
         max_reg,
         params,
+        check_interval,
     )
 }
 
@@ -304,6 +318,7 @@ mod tests {
             100,
             0.0,
             &RegretParams::vanilla(),
+            256,
         );
         assert_eq!(*strat_one, [0.995, 0.005]);
         assert_eq!(*strat_two, [0.005, 0.995]);
@@ -321,6 +336,7 @@ mod tests {
             100,
             0.0,
             &RegretParams::vanilla(),
+            256,
         );
         assert!(strat_one[1] < 0.05);
         assert!(strat_two[0] < 0.05);
