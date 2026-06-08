@@ -2,18 +2,9 @@
 use super::data::{CachedPayoff, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use super::multinomial::Multinomial;
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
-use by_address::ByAddress;
 use rand::distr::Distribution;
 use rand::rng;
-use rayon::iter::{
-    IntoParallelRefMutIterator, ParallelDrainRange, ParallelExtend, ParallelIterator,
-};
-use rayon::{ThreadPoolBuildError, ThreadPoolBuilder};
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::mem;
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
 
 /// A variant of the standard regret infoset that caches the last selected external sampled strat
 #[derive(Debug)]
@@ -61,8 +52,6 @@ impl ChanceInfo for SampledChance {
 }
 
 /// Abstraction over wrappers of `ChanceInfo`
-///
-/// This allows recursing over `RefCells` or Mutex
 trait ChanceRecurse {
     fn next<'a>(&self, chance: &'a Chance) -> &'a Node;
 }
@@ -70,12 +59,6 @@ trait ChanceRecurse {
 impl<T: ChanceInfo> ChanceRecurse for RefCell<T> {
     fn next<'a>(&self, chance: &'a Chance) -> &'a Node {
         self.borrow_mut().next(chance)
-    }
-}
-
-impl<T: ChanceInfo> ChanceRecurse for Mutex<T> {
-    fn next<'a>(&self, chance: &'a Chance) -> &'a Node {
-        self.lock().unwrap().next(chance)
     }
 }
 
@@ -92,16 +75,6 @@ trait ActiveRecurse {
 impl<T: ActiveInfo> ActiveRecurse for RefCell<T> {
     fn recurse(&self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
         self.borrow_mut().recurse(player, rec)
-    }
-}
-
-impl<T: ActiveInfo> ActiveRecurse for Mutex<T> {
-    fn recurse(&self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
-        // NOTE we technically don't need to lock here as the perfect recall guarantees ensure that
-        // this is the unique visit to this infoset this iteration, however in practice switching
-        // to unsafe rust didn't actually improve performance, likely because the locking isn't a
-        // huge bottleneck
-        self.try_lock().unwrap().recurse(player, rec)
     }
 }
 
@@ -123,12 +96,6 @@ trait ExternalRecurse {
 impl<T: ExternalInfo> ExternalRecurse for RefCell<T> {
     fn next_update<'a>(&self, player: &'a Player) -> &'a Node {
         self.borrow_mut().next_update(player)
-    }
-}
-
-impl<T: ExternalInfo> ExternalRecurse for Mutex<T> {
-    fn next_update<'a>(&self, player: &'a Player) -> &'a Node {
-        self.lock().unwrap().next_update(player)
     }
 }
 
@@ -158,8 +125,8 @@ impl ActiveInfo for CachedInfoset {
         self.cached = 0;
         params.regret_match(&mut *self.reg.cum_regret, &mut self.reg.strat);
         params.discount_cum_regret(it, &mut *self.reg.cum_regret);
-        // NOTE since we alternate updates, when do the first discounting of player one's average
-        // strat, they'll actually have nothing acumulated, so we actualy want to update on the
+        // NOTE since we alternate updates, when we do the first discounting of player one's average
+        // strat, they will actually have nothing accumulated, so we actually want to update on the
         // second round
         params.discount_average_strat(if FIRST { it - 1 } else { it }, &mut self.reg.cum_strat);
         RegretParams::cum_regret(it, &mut *self.reg.cum_regret)
@@ -174,35 +141,6 @@ impl ExternalInfo for CachedInfoset {
     fn update_cum_strat<'a>(&mut self) {
         for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
             *cum += val;
-        }
-    }
-}
-
-fn next_nodes<'a, const FIRST: bool>(
-    mut node: &'a Node,
-    chance_infosets: &mut [Mutex<SampledChance>],
-    external_player_infosets: &mut [Mutex<CachedInfoset>],
-) -> Option<impl IntoIterator<Item = &'a Node>> {
-    loop {
-        match node {
-            Node::Terminal(_) => return None,
-            Node::Chance(chance) => {
-                node = chance_infosets[chance.infoset]
-                    .get_mut()
-                    .unwrap()
-                    .next(chance);
-            }
-            Node::Player(player) => match (player.num, FIRST) {
-                (PlayerNum::One, true) | (PlayerNum::Two, false) => {
-                    return Some(&*player.actions);
-                }
-                (PlayerNum::Two, true) | (PlayerNum::One, false) => {
-                    node = external_player_infosets[player.infoset]
-                        .get_mut()
-                        .unwrap()
-                        .next(player);
-                }
-            },
         }
     }
 }
@@ -254,169 +192,6 @@ fn recurse_regret<const FIRST: bool>(
             },
         }
     }
-}
-
-/// Explore out from root returning a large enough frontier to make multi-threaded recursion fast
-fn thread_threshold<'a, const FIRST: bool>(
-    root: &'a Node,
-    chance_infosets: &mut [Mutex<SampledChance>],
-    external_player_infosets: &mut [Mutex<CachedInfoset>],
-    target: NonZeroUsize,
-    queue: &mut Vec<&'a Node>,
-    work: &mut Vec<&'a Node>,
-) {
-    queue.push(root);
-    while !(queue.is_empty() && work.is_empty()) && queue.len() + work.len() < target.get() {
-        if let Some(node) = queue.pop() {
-            if let Some(nexts) =
-                next_nodes::<FIRST>(node, chance_infosets, external_player_infosets)
-            {
-                work.extend(nexts);
-            }
-        } else {
-            mem::swap(queue, work);
-        }
-    }
-}
-
-/// workspace needed between iterations to avoid excess allocation
-struct Workspace<'a> {
-    queue: Vec<&'a Node>,
-    work: Vec<&'a Node>,
-    payoffs: HashMap<ByAddress<&'a Node>, f64>,
-}
-
-impl Workspace<'_> {
-    fn with_capacity(capacity: usize) -> Self {
-        Workspace {
-            queue: Vec::with_capacity(capacity),
-            work: Vec::with_capacity(capacity),
-            payoffs: HashMap::with_capacity(capacity),
-        }
-    }
-}
-
-/// solve for a single player returning their regret
-///
-/// When doing single threaded we can just call recurse immediately, but we need to do some extra
-/// prep here
-fn single_player_iter<'a, const FIRST: bool>(
-    root: &'a Node,
-    chance_infosets: &mut [Mutex<SampledChance>],
-    player_infosets: [&mut [Mutex<CachedInfoset>]; 2],
-    target: NonZeroUsize,
-    work: &mut Workspace<'a>,
-    it: u64,
-    params: &RegretParams,
-) -> f64 {
-    let [active_player_infosets, external_player_infosets] = player_infosets;
-    // compute threashold of `target` nodes for efficient multi threading
-    thread_threshold::<FIRST>(
-        root,
-        chance_infosets,
-        external_player_infosets,
-        target,
-        &mut work.queue,
-        &mut work.work,
-    );
-    // send threshold to threads for computation
-    work.payoffs
-        .par_extend(work.queue.par_drain(..).map(|node| {
-            let payoff = recurse_regret::<FIRST>(
-                node,
-                chance_infosets,
-                active_player_infosets,
-                external_player_infosets,
-                &(),
-            );
-            (ByAddress(node), payoff)
-        }));
-    // now actually recurse, having cached results from threaded computation
-    recurse_regret::<FIRST>(
-        root,
-        chance_infosets,
-        active_player_infosets,
-        external_player_infosets,
-        &work.payoffs,
-    );
-
-    // update all infosets
-    work.payoffs.clear();
-    for info in chance_infosets.iter_mut() {
-        info.get_mut().unwrap().advance();
-    }
-    active_player_infosets
-        .par_iter_mut()
-        .map(|info| info.get_mut().unwrap().advance::<FIRST>(it, params))
-        .sum()
-}
-
-pub(crate) fn solve_external_multi(
-    root: &Node,
-    chance_info: &[impl ChanceInfoset],
-    player_info: [&[impl PlayerInfoset]; 2],
-    max_iter: u64,
-    max_reg: f64,
-    thread_info: (NonZeroUsize, NonZeroUsize),
-    params: &RegretParams,
-) -> Result<SolveInfo, ThreadPoolBuildError> {
-    let (num_threads, target) = thread_info;
-    // NOTE these are Box's not Arcs so that at the end of the threaded computation we can move
-    // them out
-    let mut chance_infosets: Box<[_]> = chance_info
-        .iter()
-        .map(|info| Mutex::new(SampledChance::new(info.probs())))
-        .collect();
-    let [mut player_one, mut player_two] = player_info.map(|infos| {
-        infos
-            .iter()
-            .map(|info| Mutex::new(CachedInfoset::new(info.num_actions())))
-            .collect::<Box<[_]>>()
-    });
-    let [mut reg_one, mut reg_two] = [f64::INFINITY; 2];
-
-    // create channels
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(num_threads.get())
-        .build()?;
-    pool.scope(|_| {
-        // initialize workspace
-        let mut work = Workspace::with_capacity(target.get());
-
-        // loop through iters, these will send data to to the threads
-        for it in 1..=max_iter {
-            reg_one = single_player_iter::<true>(
-                root,
-                &mut chance_infosets,
-                [&mut player_one, &mut player_two],
-                target,
-                &mut work,
-                it,
-                params,
-            );
-            reg_two = single_player_iter::<false>(
-                root,
-                &mut chance_infosets,
-                [&mut player_two, &mut player_one],
-                target,
-                &mut work,
-                it,
-                params,
-            );
-            // check to terminate
-            if f64::max(reg_one, reg_two) < max_reg {
-                break;
-            }
-        }
-    });
-
-    let strats = [player_one, player_two].map(|player| {
-        Vec::from(player)
-            .into_iter()
-            .flat_map(|info| Vec::from(info.into_inner().unwrap().reg.into_avg_strat()))
-            .collect()
-    });
-    Ok(([reg_one, reg_two], strats))
 }
 
 pub(crate) fn solve_external_single(
@@ -474,7 +249,6 @@ pub(crate) fn solve_external_single(
 #[cfg(test)]
 mod tests {
     use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams};
-    use std::num::NonZeroUsize;
 
     #[derive(Debug, Clone)]
     struct Pinfo(usize);
@@ -498,57 +272,7 @@ mod tests {
         }
     }
 
-    fn recurse_simple_node(steps: usize, payoff: f64) -> Node {
-        match (steps, steps % 3) {
-            (0, _) => Node::Terminal(payoff),
-            (_, 2) => Node::Chance(Chance {
-                outcomes: vec![
-                    recurse_simple_node(steps - 1, payoff),
-                    recurse_simple_node(steps - 2, payoff),
-                ]
-                .into(),
-                infoset: steps / 3,
-            }),
-            (_, num @ (0 | 1)) => Node::Player(Player {
-                num: if num == 0 {
-                    PlayerNum::One
-                } else {
-                    PlayerNum::Two
-                },
-                actions: [Node::Terminal(0.0), recurse_simple_node(steps - 1, -payoff)].into(),
-                infoset: (steps - 1) / 3,
-            }),
-            _ => panic!(),
-        }
-    }
-
     type Game = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
-
-    fn large_game(num: usize) -> Game {
-        let root = recurse_simple_node(num, 1.0);
-        let chance = vec![Cinfo(vec![0.5, 0.5].into()); (num + 1) / 3].into();
-        let players = [
-            vec![Pinfo(2); num / 3].into(),
-            vec![Pinfo(2); num.div_ceil(3)].into(),
-        ];
-        (root, chance, players)
-    }
-
-    #[test]
-    fn test_multi() {
-        let (root, cinfo, [pone, ptwo]) = large_game(10);
-        let ([reg_one, reg_two], _) = super::solve_external_multi(
-            &root,
-            &cinfo,
-            [&pone, &ptwo],
-            1000,
-            0.0,
-            (NonZeroUsize::new(2).unwrap(), NonZeroUsize::new(1).unwrap()),
-            &RegretParams::vanilla(),
-        )
-        .unwrap();
-        assert!(f64::max(reg_one, reg_two) < 0.1, "{reg_one} {reg_two}");
-    }
 
     fn simple_game() -> Game {
         let root = Node::Chance(Chance {
