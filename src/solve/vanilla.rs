@@ -1,6 +1,6 @@
 //! Vanilla and sampled cfr implementations
 #![allow(clippy::cast_precision_loss)]
-use super::data::{RegretInfoset, RegretParams, SampledChance, SolveInfo};
+use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
 use std::cell::RefCell;
 use std::iter::Zip;
@@ -41,7 +41,7 @@ impl ChanceRecurse for RefCell<SampledChance> {
 trait PlayerRecurse {
     fn update_cum_strat(&mut self, prob: f64);
 
-    fn advance(&mut self, it: u64, params: &RegretParams) -> f64;
+    fn advance(&mut self, discounts: &Discounts) -> f64;
 }
 
 impl PlayerRecurse for RegretInfoset {
@@ -51,11 +51,11 @@ impl PlayerRecurse for RegretInfoset {
         }
     }
 
-    fn advance(&mut self, it: u64, params: &RegretParams) -> f64 {
-        params.regret_match(&mut *self.cum_regret, &mut self.strat);
-        params.discount_cum_regret(it, &mut *self.cum_regret);
-        params.discount_average_strat(it, &mut self.cum_strat);
-        RegretParams::cum_regret(it, &mut *self.cum_regret)
+    fn advance(&mut self, discounts: &Discounts) -> f64 {
+        discounts.regret_match(&mut *self.cum_regret, &mut self.strat);
+        discounts.discount_cum_regret(&mut *self.cum_regret);
+        discounts.discount_average_strat(&mut self.cum_strat);
+        discounts.regret_bound(&mut *self.cum_regret)
     }
 }
 
@@ -168,10 +168,11 @@ fn solve_generic_single(
             [1.0; 2],
         );
         chance_infosets.iter_mut().for_each(ChanceRecurse::advance);
+        let discounts = Discounts::new(params, it, it);
         for (reg, infos) in regs.iter_mut().zip(player_infosets.iter_mut()) {
             *reg = infos
                 .iter_mut()
-                .map(|info| info.get_mut().advance(it, params))
+                .map(|info| info.get_mut().advance(&discounts))
                 .sum();
         }
         let [reg_one, reg_two] = regs;
