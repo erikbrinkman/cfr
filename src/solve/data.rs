@@ -379,12 +379,44 @@ impl<'a> Discounts<'a> {
         }
     }
 
-    /// Run regret matching for an infoset through the carried parameters
-    pub(super) fn regret_match<R: ?Sized>(&self, cum_reg: &mut R, strat: &mut [f64])
+    /// Run a full infoset update and return its regret-bound contribution
+    ///
+    /// This performs regret matching (writing the next strategy), discounts the cumulative regret,
+    /// and computes the regret bound. The common case -- at least one action has positive
+    /// cumulative regret -- is fused into a single pass over the cumulative regret that writes the
+    /// strategy, applies the discount, and tracks the running maximum used for the bound. The rare
+    /// all-non-positive case (where the strategy is chosen by the `no_positive` policy rather than
+    /// proportionally to regret) falls back to the standalone primitives.
+    pub(super) fn advance_infoset<R: ?Sized>(&self, cum_reg: &mut R, strat: &mut [f64]) -> f64
     where
         for<'b> &'b mut R: IntoFloatsMut<'b>,
     {
-        self.params.regret_match(cum_reg, strat);
+        let positive_norm: f64 = cum_reg
+            .into_floats_mut()
+            .map(|&mut v| v)
+            .filter(|v| *v > 0.0)
+            .sum();
+        if positive_norm > 0.0 {
+            let mut max = f64::NEG_INFINITY;
+            for (reg, val) in cum_reg.into_floats_mut().zip(strat.iter_mut()) {
+                let cur = *reg;
+                *val = if cur > 0.0 { cur / positive_norm } else { 0.0 };
+                let discounted = if cur > 0.0 {
+                    cur * self.pos
+                } else if cur < 0.0 {
+                    cur * self.neg
+                } else {
+                    cur
+                };
+                *reg = discounted;
+                max = f64::max(max, discounted);
+            }
+            2.0 * f64::max(max, 0.0) / self.it as f64
+        } else {
+            self.params.regret_match(cum_reg, strat);
+            self.discount_cum_regret(cum_reg);
+            self.regret_bound(cum_reg)
+        }
     }
 
     /// Discount cumulative regret with the precomputed factors
@@ -551,6 +583,48 @@ mod tests {
         assert_eq!(res, 2.0);
         let res = Discounts::new(&RegretParams::vanilla(), 4, 4).regret_bound(&mut regs);
         assert_eq!(res, 1.0);
+    }
+
+    // The fused `advance_infoset` must produce exactly the same strategy, discounted cumulative
+    // regret, and regret bound as running regret matching, regret discounting, and the regret bound
+    // separately.
+    #[test]
+    fn advance_infoset_matches_unfused() {
+        let cases = [
+            vec![1.0, 2.0, 1.0, -3.0], // mixed signs, positive norm
+            vec![5.0, 0.0, -1.0],      // includes an exact zero
+            vec![-1.0, -2.0, -0.5],    // all non-positive, hits the fallback
+            vec![0.0, 0.0],            // all zero, hits the fallback
+            vec![3.0],                 // single positive action
+        ];
+        let params_list = [
+            RegretParams::vanilla(),
+            RegretParams::dcfr(),
+            RegretParams::cfr_plus(),
+            RegretParams::lcfr(),
+        ];
+        for params in &params_list {
+            for it in [1_u64, 2, 7] {
+                for case in &cases {
+                    let discounts = Discounts::new(params, it, it);
+
+                    let mut fused_reg = case.clone();
+                    let mut fused_strat = vec![0.0; case.len()];
+                    let fused_bound =
+                        discounts.advance_infoset(&mut fused_reg[..], &mut fused_strat);
+
+                    let mut reg = case.clone();
+                    let mut strat = vec![0.0; case.len()];
+                    params.regret_match(&mut reg[..], &mut strat);
+                    discounts.discount_cum_regret(&mut reg[..]);
+                    let bound = discounts.regret_bound(&mut reg[..]);
+
+                    assert_eq!(fused_strat, strat, "strat {params:?} it={it} {case:?}");
+                    assert_eq!(fused_reg, reg, "cum_regret {params:?} it={it} {case:?}");
+                    assert_eq!(fused_bound, bound, "bound {params:?} it={it} {case:?}");
+                }
+            }
+        }
     }
 
     #[test]

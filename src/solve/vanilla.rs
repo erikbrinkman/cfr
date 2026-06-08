@@ -52,10 +52,9 @@ impl PlayerRecurse for RegretInfoset {
     }
 
     fn advance(&mut self, discounts: &Discounts) -> f64 {
-        discounts.regret_match(&mut *self.cum_regret, &mut self.strat);
-        discounts.discount_cum_regret(&mut *self.cum_regret);
+        let bound = discounts.advance_infoset(&mut *self.cum_regret, &mut self.strat);
         discounts.discount_average_strat(&mut self.cum_strat);
-        discounts.regret_bound(&mut *self.cum_regret)
+        bound
     }
 }
 
