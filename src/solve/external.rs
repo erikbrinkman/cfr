@@ -123,10 +123,9 @@ impl ActiveInfo for CachedInfoset {
 
     fn advance(&mut self, discounts: &Discounts) -> f64 {
         self.cached = 0;
-        discounts.regret_match(&mut *self.reg.cum_regret, &mut self.reg.strat);
-        discounts.discount_cum_regret(&mut *self.reg.cum_regret);
+        let bound = discounts.advance_infoset(&mut *self.reg.cum_regret, &mut self.reg.strat);
         discounts.discount_average_strat(&mut self.reg.cum_strat);
-        discounts.regret_bound(&mut *self.reg.cum_regret)
+        bound
     }
 }
 
