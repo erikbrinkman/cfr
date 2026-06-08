@@ -78,10 +78,8 @@ use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::iter::{self, FusedIterator, Once, Zip};
-use std::num::NonZeroUsize;
 use std::ptr;
 use std::slice;
-use std::thread;
 
 /// An enum indicating a player
 ///
@@ -113,7 +111,7 @@ impl PlayerNum {
     }
 }
 
-/// An intemediary representation of a node in a game tree
+/// An intermediary representation of a node in a game tree
 ///
 /// This enum represents a conversion type from custom data to a game node that can be turned
 /// into a full game representation. By implementing [`IntoGameNode`] on a custom tree-like object,
@@ -138,7 +136,7 @@ pub enum GameNode<T: IntoGameNode + ?Sized> {
     ///   outcome probabilities, and a type that can be converted into a [`GameNode`]. See
     ///   [`IntoGameNode::Outcomes`] for more details.
     Chance(Option<T::ChanceInfo>, T::Outcomes),
-    /// A player node indicate a place where agents make a strategic decision
+    /// A player node indicates a place where agents make a strategic decision
     ///
     /// # Fields
     ///
@@ -158,7 +156,7 @@ pub enum GameNode<T: IntoGameNode + ?Sized> {
 /// your game is represented. Here zero-copy means none of the types need to implement [Copy] or
 /// [Clone], but the conversion will still allocate memory for the different branches.
 ///
-/// The trait ultimately resolves to converting each of your tree nodes into a coresponding
+/// The trait ultimately resolves to converting each of your tree nodes into a corresponding
 /// [`GameNode`] that contains all the information necessary for the internal game structure.
 ///
 /// # Examples
@@ -290,7 +288,7 @@ pub trait IntoGameNode {
 
     /// Convert this type into a `GameNode`
     ///
-    /// Note that the `GameNode` is just an intemediary representation meant to convert custom types
+    /// Note that the `GameNode` is just an intermediary representation meant to convert custom types
     /// into a [Game].
     fn into_game_node(self) -> GameNode<Self>;
 }
@@ -338,7 +336,7 @@ impl ChanceInfosetData {
 
 /// This is a builder for played infosets
 ///
-/// It omits the actual infoset because we need to as a key, when inpacking back into a vec we'll
+/// It omits the actual infoset because we need to as a key, when unpacking back into a vec we'll
 /// take ownership again.
 #[derive(Debug)]
 struct PlayerInfosetBuilder<A> {
@@ -620,7 +618,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
 #[non_exhaustive]
 pub enum SolveMethod {
     /// This method indicates vanilla counterfactual regret minimization, which does no random
-    /// sampling. This can be good for small games, espcially ones with very unlikely chance
+    /// sampling. This can be good for small games, especially ones with very unlikely chance
     /// outcomes, but otherwise spends a lot of computation exploring unimportant areas of the game
     /// tree.
     Full,
@@ -630,7 +628,7 @@ pub enum SolveMethod {
     /// relevant chance outcomes.
     ///
     /// Since this is sampled, there's a chance that it terminates early with a small regret bound
-    /// that's slighly incorrect because it didn't sample enough chance outcomes.
+    /// that's slightly incorrect because it didn't sample enough chance outcomes.
     Sampled,
     /// This method indicates external sampled counterfactual regret minimization, which alternates
     /// between players, and only fully explores the actions of one player, while sampling the
@@ -638,7 +636,7 @@ pub enum SolveMethod {
     /// the other methods because it doesn't explore sections of the game tree with low value.
     ///
     /// Since this is sampled, there's a chance that it terminates early with a small regret bound
-    /// that's slighly incorrect because it didn't sample enough chance outcomes.
+    /// that's slightly incorrect because it didn't sample enough chance outcomes.
     External,
 }
 
@@ -684,71 +682,34 @@ impl<I, A> Game<I, A> {
         params: Option<RegretParams>,
     ) -> Result<(Strategies<'_, I, A>, RegretBound), SolveError> {
         let [first_player, second_player] = &self.player_infosets;
-        let threads = NonZeroUsize::new(num_threads)
-            .or_else(|| thread::available_parallelism().ok())
-            .unwrap_or(NonZeroUsize::new(1).unwrap());
+        // multi-threaded solving has been removed; every method runs single-threaded for now
+        let _ = num_threads;
         let params = params.unwrap_or_default();
-        let (regrets, probs) = if threads == NonZeroUsize::new(1).unwrap() {
-            match method {
-                SolveMethod::Full => vanilla::solve_full_single(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    &params,
-                ),
-                SolveMethod::Sampled => vanilla::solve_sampled_single(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    &params,
-                ),
-                SolveMethod::External => external::solve_external_single(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    &params,
-                ),
-            }
-        } else {
-            // number of tasks to send to num_threads
-            let target = threads
-                .checked_mul(NonZeroUsize::new(3).unwrap())
-                .ok_or(SolveError::ThreadOverflow)?;
-            match method {
-                SolveMethod::Full => vanilla::solve_full_multi(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    (threads, target),
-                    &params,
-                ),
-                SolveMethod::Sampled => vanilla::solve_sampled_multi(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    (threads, target),
-                    &params,
-                ),
-                SolveMethod::External => external::solve_external_multi(
-                    &self.root,
-                    &self.chance_infosets,
-                    [first_player, second_player],
-                    max_iter,
-                    max_reg,
-                    (threads, target),
-                    &params,
-                ),
-            }?
+        let (regrets, probs) = match method {
+            SolveMethod::Full => vanilla::solve_full_single(
+                &self.root,
+                &self.chance_infosets,
+                [first_player, second_player],
+                max_iter,
+                max_reg,
+                &params,
+            ),
+            SolveMethod::Sampled => vanilla::solve_sampled_single(
+                &self.root,
+                &self.chance_infosets,
+                [first_player, second_player],
+                max_iter,
+                max_reg,
+                &params,
+            ),
+            SolveMethod::External => external::solve_external_single(
+                &self.root,
+                &self.chance_infosets,
+                [first_player, second_player],
+                max_iter,
+                max_reg,
+                &params,
+            ),
         };
         Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
     }
@@ -764,7 +725,7 @@ impl<I, A> Game<I, A> {
 impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     /// Convert a named strategy into [Strategies]
     ///
-    /// The input can be any set of types that vaguelly iterates over pairs of information sets and
+    /// The input can be any set of types that vaguely iterate over pairs of information sets and
     /// then actions paired to weights. Weights can be any non-negative f64, which will be
     /// normalized in the final strategy. There are no restrictions on iteration order.
     ///

@@ -1,13 +1,9 @@
 //! Common data structures for solving games
 #![allow(clippy::cast_precision_loss)]
 use crate::Node;
-use by_address::ByAddress;
 use logaddexp::LogAddExp;
-use portable_atomic::AtomicF64;
 use rand::rng;
 use rand_distr::{weighted::WeightedAliasIndex, Distribution};
-use std::collections::HashMap;
-use std::iter::FusedIterator;
 use std::slice;
 
 /// A chance information set for cached sampling
@@ -26,7 +22,7 @@ impl SampledChance {
         }
     }
 
-    /// Sample a chace outcome index
+    /// Sample a chance outcome index
     ///
     /// This will return the same value on successive calls until reset is called
     pub fn sample(&mut self) -> usize {
@@ -70,7 +66,7 @@ impl RegretInfoset {
     }
 }
 
-/// Normalize a cumulartive strategy
+/// Normalize a cumulative strategy
 pub fn avg_strat(cum_strat: &mut [f64]) {
     let norm: f64 = cum_strat.iter().sum();
     if norm == 0.0 {
@@ -84,17 +80,10 @@ pub fn avg_strat(cum_strat: &mut [f64]) {
 
 /// A trait for the option of cached payoffs
 ///
-/// When doing multi threaded solving sometimes we'll have payoff data cached for a node when
-/// bringing back the result of the computation from various threads. This trait represents that
-/// wither with a node hashmap, or an empty tuple for when no cached payoffs exist.
+/// The external solver recurses with a payoff oracle that is normally the empty tuple (no cached
+/// payoffs); the trait leaves room for a node-keyed cache.
 pub(super) trait CachedPayoff {
     fn get_payoff(&self, node: &Node) -> Option<f64>;
-}
-
-impl CachedPayoff for HashMap<ByAddress<&Node>, f64> {
-    fn get_payoff(&self, node: &Node) -> Option<f64> {
-        self.get(&ByAddress(node)).copied()
-    }
 }
 
 impl CachedPayoff for () {
@@ -121,7 +110,7 @@ pub struct RegretParams {
     ///
     /// Positive cumulative regrets are discounted by `tᵅ/(tᵅ + 1)` every iteration `t`. Setting
     /// alpha closer to infinity implies no discounting, while setting it at negative infinity
-    /// means imediate forgetting. Note that any non-positive value is probably not desired.
+    /// means immediate forgetting. Note that any non-positive value is probably not desired.
     pub pos_regret: f64,
     /// The discount factor for negative cumulative regret or `β`
     ///
@@ -144,10 +133,9 @@ pub struct RegretParams {
     pub no_positive: f64,
 }
 
-/// Trait for &mut [f64] or &mut [`AtomicF64`]
+/// Trait for `&mut [f64]` or `&mut [f64; N]`
 ///
-/// This is mut because we have mut in all instances, and `AtomicF64` can be more efficient because
-/// we don't need to synchronize.
+/// This is mut because we have mut in all instances.
 pub(super) trait IntoFloatsMut<'a> {
     type Floats: Iterator<Item = &'a mut f64>;
 
@@ -169,33 +157,6 @@ impl<'a, const N: usize> IntoFloatsMut<'a> for &'a mut [f64; N] {
         self.iter_mut()
     }
 }
-
-impl<'a> IntoFloatsMut<'a> for &'a mut [AtomicF64] {
-    type Floats = AtomicIter<'a>;
-
-    fn into_floats_mut(self) -> Self::Floats {
-        AtomicIter(self.iter_mut())
-    }
-}
-
-pub(super) struct AtomicIter<'a>(slice::IterMut<'a, AtomicF64>);
-
-impl<'a> Iterator for AtomicIter<'a> {
-    type Item = &'a mut f64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(AtomicF64::get_mut)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.len();
-        (len, Some(len))
-    }
-}
-
-impl FusedIterator for AtomicIter<'_> {}
-
-impl ExactSizeIterator for AtomicIter<'_> {}
 
 impl RegretParams {
     /// Create a new arbitrary set of regret parameters
