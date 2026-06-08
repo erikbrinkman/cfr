@@ -21,7 +21,7 @@
 //! like:
 //!
 //! ```
-//! # use cfr::{GameNode, Game, IntoGameNode, SolveMethod};
+//! # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, SolveParams};
 //! # struct ExData {}
 //! impl IntoGameNode for ExData {
 //! # type PlayerInfo = ();
@@ -40,7 +40,7 @@
 //!     100,  // number of iterations
 //!     0.0,  // early termination regret
 //!     1,    // number of threads
-//!     None, // advanced options
+//!     SolveParams::default(), // advanced options
 //! ).unwrap();
 //! // get named versions, i.e. exportable version
 //! let named = strats.as_named();
@@ -640,6 +640,29 @@ pub enum SolveMethod {
     External,
 }
 
+/// Tuning knobs for a solve that aren't part of the regret-matching math. Every field has a sensible
+/// default, so override one at a time with struct-update syntax:
+/// `SolveParams { check_interval: 1000, ..Default::default() }`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SolveParams {
+    /// The regret-matching / DCFR style. Swap this independently of everything else (for example
+    /// [`RegretParams::vanilla`] for undiscounted CFR).
+    pub regret: RegretParams,
+    /// How often (in iterations) the regret bound is evaluated for early termination. Evaluating it
+    /// is a reduction over every infoset, so checking less often is cheaper but overshoots the regret
+    /// target by up to `check_interval - 1` iterations.
+    pub check_interval: u64,
+}
+
+impl Default for SolveParams {
+    fn default() -> Self {
+        SolveParams {
+            regret: RegretParams::default(),
+            check_interval: 256,
+        }
+    }
+}
+
 impl<I, A> Game<I, A> {
     /// Find an approximate Nash equilibrium of the current game
     ///
@@ -679,12 +702,15 @@ impl<I, A> Game<I, A> {
         max_iter: u64,
         max_reg: f64,
         num_threads: usize,
-        params: Option<RegretParams>,
+        params: SolveParams,
     ) -> Result<(Strategies<'_, I, A>, RegretBound), SolveError> {
         let [first_player, second_player] = &self.player_infosets;
         // multi-threaded solving has been removed; every method runs single-threaded for now
         let _ = num_threads;
-        let params = params.unwrap_or_default();
+        let SolveParams {
+            regret,
+            check_interval,
+        } = params;
         let (regrets, probs) = match method {
             SolveMethod::Full => vanilla::solve_full_single(
                 &self.root,
@@ -692,7 +718,8 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &params,
+                &regret,
+                check_interval,
             ),
             SolveMethod::Sampled => vanilla::solve_sampled_single(
                 &self.root,
@@ -700,7 +727,8 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &params,
+                &regret,
+                check_interval,
             ),
             SolveMethod::External => external::solve_external_single(
                 &self.root,
@@ -708,7 +736,8 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &params,
+                &regret,
+                check_interval,
             ),
         };
         Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
@@ -1018,7 +1047,7 @@ impl<'a, I, A> Strategies<'a, I, A> {
     /// # Examples
     ///
     /// ```
-    /// # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, PlayerNum};
+    /// # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, SolveParams, PlayerNum};
     /// # struct ExData {}
     /// # impl IntoGameNode for ExData {
     /// # type PlayerInfo = ();
@@ -1033,7 +1062,7 @@ impl<'a, I, A> Strategies<'a, I, A> {
     /// # Game::from_root(data).unwrap();
     /// let (strats, _) = game.solve(
     ///     // ...
-    /// # SolveMethod::External, 1, 0.0, 1, None
+    /// # SolveMethod::External, 1, 0.0, 1, SolveParams::default()
     /// ).unwrap();
     /// let [player_one_strat, player_two_strat] = strats.as_named();
     /// for (infoset, actions) in player_one_strat {
@@ -1290,7 +1319,7 @@ impl<A> ExactSizeIterator for NamedStrategyActionIter<'_, A> {}
 #[cfg(test)]
 #[allow(clippy::float_cmp, unused_must_use)]
 mod tests {
-    use super::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod};
+    use super::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
 
     struct Node(GameNode<Node>);
 
@@ -1361,10 +1390,12 @@ mod tests {
     #[should_panic(expected = "same game")]
     fn test_distance_game_panic() {
         let game_one = create_game();
-        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
+        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+            .unwrap();
 
         let game_two = create_game();
-        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
+        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+            .unwrap();
 
         strat_one.distance(&strat_two, 1.0);
     }
@@ -1373,8 +1404,10 @@ mod tests {
     #[should_panic(expected = "`p` must be positive")]
     fn test_distance_p_panic() {
         let game = create_game();
-        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
-        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, None).unwrap();
+        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+            .unwrap();
+        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+            .unwrap();
         strat_one.distance(&strat_two, 0.0);
     }
 }
