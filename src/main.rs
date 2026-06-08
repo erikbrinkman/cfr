@@ -2,7 +2,7 @@ mod auto;
 mod gambit;
 mod json;
 
-use cfr::{PlayerNum, RegretParams, SolveMethod};
+use cfr::{PlayerNum, RegretParams, SolveMethod, SolveParams};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::borrow::Borrow;
@@ -195,7 +195,10 @@ fn main() {
             max_iters,
             args.max_regret,
             args.parallel,
-            Some(args.discount.into_params()),
+            SolveParams {
+                regret: args.discount.into_params(),
+                ..Default::default()
+            },
         )
         .unwrap();
     let mut info = strategies.get_info();

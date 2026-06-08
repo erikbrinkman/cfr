@@ -95,6 +95,16 @@ impl CachedPayoff for () {
 /// the result returned from solve functions
 pub type SolveInfo = ([f64; 2], [Box<[f64]>; 2]);
 
+/// Whether iteration `it` should evaluate the regret bound and test for early termination
+///
+/// Evaluating the regret bound is a reduction over every infoset, so rather than checking it every
+/// iteration we only check every `check_interval` iterations (and always on the final iteration). As
+/// a result solving runs at most `check_interval - 1` iterations past the point the regret target is
+/// first met.
+pub(super) fn should_check(it: u64, max_iter: u64, check_interval: u64) -> bool {
+    it.is_multiple_of(check_interval) || it == max_iter
+}
+
 /// Advanced parameters for regret calculation
 ///
 /// These parameters govern fine tuned details about how regrets and average strategies are

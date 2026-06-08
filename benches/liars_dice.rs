@@ -1,7 +1,7 @@
 #![feature(test, never_type, type_alias_impl_trait)]
 extern crate test;
 
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod};
+use cfr::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
 use std::hash::Hash;
 use std::iter;
 use test::Bencher;
@@ -162,7 +162,7 @@ fn small_external_single(b: &mut Bencher) {
     // 2 2-sided dice
     let game = Game::from_root(State::<2>::Init(2)).unwrap();
     b.iter(|| {
-        game.solve(SolveMethod::External, 1000, 0.0, 1, None)
+        game.solve(SolveMethod::External, 1000, 0.0, 1, SolveParams::default())
             .unwrap()
     });
 }

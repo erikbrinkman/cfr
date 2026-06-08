@@ -1,5 +1,5 @@
 //! An example implementation of IntoGameNode for Kuhn Poker
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod};
+use cfr::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
 use clap::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,7 +178,7 @@ fn main() {
             args.iterations,
             0.0,
             args.parallel,
-            None,
+            SolveParams::default(),
         )
         .unwrap();
     strats.truncate(5e-3); // not visible
@@ -214,7 +214,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::Action;
-    use cfr::{PlayerNum, RegretParams, SolveMethod, Strategies};
+    use cfr::{PlayerNum, RegretParams, SolveMethod, SolveParams, Strategies};
     use rand::{rng, RngExt};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -356,7 +356,10 @@ mod tests {
                     10_000_000,
                     0.005,
                     threads,
-                    Some(RegretParams::vanilla()),
+                    SolveParams {
+                        regret: RegretParams::vanilla(),
+                        ..Default::default()
+                    },
                 )
                 .unwrap();
             strategies.truncate(1e-3);
@@ -428,7 +431,16 @@ mod tests {
         .for_each(|(name, params)| {
             rng().fill(&mut [0; 8]);
             let (mut strategies, _) = game
-                .solve(SolveMethod::Full, 10_000, 0.0, 1, Some(params))
+                .solve(
+                    SolveMethod::Full,
+                    10_000,
+                    0.0,
+                    1,
+                    SolveParams {
+                        regret: params,
+                        ..Default::default()
+                    },
+                )
                 .unwrap();
             strategies.truncate(1e-3);
             let info = strategies.get_info();
