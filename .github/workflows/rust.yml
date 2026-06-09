@@ -29,8 +29,4 @@ jobs:
     - name: Run examples tests
       run: cargo test --verbose --examples
     - name: Run lints
-      run: cargo clippy --verbose -- -D warnings
-    - name: Run examples lints
-      run: cargo clippy --verbose --examples -- -D warnings
-    - name: Run bench lints
-      run: cargo +nightly clippy --verbose --benches -- -D warnings
+      run: cargo +nightly clippy --verbose --all-targets --all-features -- -D warnings
