@@ -12,7 +12,6 @@ by_address = "1.0"
 clap = { version = "4.0", features = ["derive", "wrap_help"], optional = true }
 gambit-parser = { version = "0.2", optional = true }
 indexmap = "2.0"
-portable-atomic = { version = "1.4", features = ["float"] }
 rand = "0.10"
 rand_distr = "0.6"
 num-traits = "0.2"

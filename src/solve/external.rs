@@ -1,4 +1,7 @@
 //! External regret solving
+// f32 cumulant storage casts f64 math down to f32 throughout; that truncation is intentional, so it
+// is allowed module-wide. Lossy int->float casts (cast_precision_loss) are handled per-site instead.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 use super::data;
 use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use super::multinomial::Multinomial;
@@ -53,7 +56,7 @@ impl CachedInfoset {
     /// the average is normalized.
     fn accumulate_strat_weighted(&mut self, weight: f64) {
         for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
-            *cum += val * weight;
+            *cum += f64::from(*val) * weight;
         }
     }
 
@@ -68,9 +71,9 @@ impl CachedInfoset {
         let neg_factor = (target_log_neg - self.base_log_neg).exp();
         for reg in &mut *self.reg.cum_regret {
             if *reg > 0.0 {
-                *reg *= pos_factor;
+                *reg = (f64::from(*reg) * pos_factor) as f32;
             } else if *reg < 0.0 {
-                *reg *= neg_factor;
+                *reg = (f64::from(*reg) * neg_factor) as f32;
             }
         }
         self.base_log_pos = target_log_pos;
@@ -101,14 +104,14 @@ impl CachedInfoset {
             .zip(self.reg.cum_regret.iter_mut())
         {
             let util = rec(next);
-            expected += prob * util;
-            *cum_reg += util;
+            expected += f64::from(*prob) * util;
+            *cum_reg += util as f32;
         }
         for cum_reg in &mut *self.reg.cum_regret {
-            *cum_reg -= expected;
+            *cum_reg -= expected as f32;
         }
         // regret match for the next iteration and apply this iteration's discount
-        discounts.advance_infoset(&mut *self.reg.cum_regret, &mut self.reg.strat);
+        discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
         // this infoset is now caught up through the current iteration's discount
         self.base_log_pos = lazy.cum_log_pos + lazy.log_pos_step;
         self.base_log_neg = lazy.cum_log_neg + lazy.log_neg_step;
@@ -125,7 +128,7 @@ impl CachedInfoset {
             self.reg
                 .cum_regret
                 .iter()
-                .copied()
+                .map(|&reg| f64::from(reg))
                 .fold(f64::NEG_INFINITY, f64::max),
             0.0,
         ) / iters
@@ -367,6 +370,8 @@ mod tests {
         }
 
         /// Abstraction over wrappers of `ChanceInfo`
+        ///
+        /// This allows recursing over `RefCells` or Mutex
         trait ChanceRecurse {
             fn next<'a>(&self, chance: &'a Chance) -> &'a Node;
         }
@@ -425,20 +430,20 @@ mod tests {
                     .zip(self.reg.cum_regret.iter_mut())
                 {
                     let util = rec(next);
-                    expected += prob * util;
-                    *cum_reg += util;
+                    expected += f64::from(*prob) * util;
+                    *cum_reg += util as f32;
                 }
 
                 // account for only adding utility to cum_regret
                 for cum_reg in &mut self.reg.cum_regret {
-                    *cum_reg -= expected;
+                    *cum_reg -= expected as f32;
                 }
                 expected
             }
 
             fn advance(&mut self, discounts: &Discounts) -> f64 {
                 self.cached = 0;
-                let bound = discounts.advance_infoset(&mut *self.reg.cum_regret, &mut self.reg.strat);
+                let bound = discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
                 discounts.discount_average_strat(&mut self.reg.cum_strat);
                 bound
             }
@@ -451,7 +456,7 @@ mod tests {
 
             fn update_cum_strat<'a>(&mut self) {
                 for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
-                    *cum += val;
+                    *cum += f64::from(*val);
                 }
             }
         }
@@ -560,7 +565,7 @@ mod tests {
                     .iter_mut()
                     .for_each(|info| info.get_mut().advance());
                 // the leading player has nothing accumulated on its first average-strat discount, so it
-                // discounts against `it - 1` (see `single_player_iter`)
+                // discounts against `it - 1` (see the note in `solve_external_single`)
                 let discounts_one = Discounts::new(params, it, it - 1);
                 reg_one = advance_player(&mut player_one, &discounts_one, check);
                 // player two
