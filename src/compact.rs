@@ -47,6 +47,7 @@ impl<K: Hash + Eq, V> IntoIterator for Builder<K, V> {
     }
 }
 
+#[derive(Debug)]
 pub struct IntoIter<K, V> {
     iter: map::IntoIter<K, (usize, V)>,
 }
@@ -107,6 +108,7 @@ impl<K: Hash + Eq, V> IntoIterator for OptBuilder<K, V> {
     }
 }
 
+#[derive(Debug)]
 pub struct OptIntoIter<K, V> {
     iter: map::IntoIter<Result<K, usize>, (usize, V)>,
 }
@@ -128,6 +130,7 @@ impl<K, V> FusedIterator for OptIntoIter<K, V> {}
 
 impl<K, V> ExactSizeIterator for OptIntoIter<K, V> {}
 
+#[derive(Debug)]
 pub struct VacantEntry<'a, K, V> {
     ind: usize,
     ent: map::VacantEntry<'a, K, (usize, V)>,
@@ -140,6 +143,7 @@ impl<K: Hash + Eq, V> VacantEntry<'_, K, V> {
     }
 }
 
+#[derive(Debug)]
 pub struct OccupiedEntry<'a, K, V> {
     ent: map::OccupiedEntry<'a, K, (usize, V)>,
 }
@@ -151,6 +155,7 @@ impl<'a, K: Hash + Eq, V> OccupiedEntry<'a, K, V> {
     }
 }
 
+#[derive(Debug)]
 pub enum Entry<'a, K, V> {
     Vacant(VacantEntry<'a, K, V>),
     Occupied(OccupiedEntry<'a, K, V>),

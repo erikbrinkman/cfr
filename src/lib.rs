@@ -736,8 +736,7 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &regret,
-                check_interval,
+                &params,
             ),
         };
         Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
@@ -1190,6 +1189,7 @@ impl RegretBound {
 }
 
 /// Information about the regret and utility of a specific strategy profile
+#[derive(Debug)]
 pub struct StrategiesInfo {
     util: f64,
     regrets: [f64; 2],
@@ -1321,6 +1321,7 @@ impl<A> ExactSizeIterator for NamedStrategyActionIter<'_, A> {}
 mod tests {
     use super::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
 
+    #[derive(Debug)]
     struct Node(GameNode<Node>);
 
     impl IntoGameNode for Node {

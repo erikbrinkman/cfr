@@ -118,7 +118,7 @@ struct Args {
     output: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Strategy(HashMap<String, HashMap<String, f64>>);
 
 impl<I, A, S, T, N> From<I> for Strategy
@@ -149,7 +149,7 @@ where
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct Output {
     regret: f64,
     player_one_utility: f64,

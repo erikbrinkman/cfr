@@ -1,6 +1,5 @@
 //! Common data structures for solving games
 #![allow(clippy::cast_precision_loss)]
-use crate::Node;
 use logaddexp::LogAddExp;
 use rand::rng;
 use rand_distr::{weighted::WeightedAliasIndex, Distribution};
@@ -75,20 +74,6 @@ pub fn avg_strat(cum_strat: &mut [f64]) {
         for prob in cum_strat.iter_mut() {
             *prob /= norm;
         }
-    }
-}
-
-/// A trait for the option of cached payoffs
-///
-/// The external solver recurses with a payoff oracle that is normally the empty tuple (no cached
-/// payoffs); the trait leaves room for a node-keyed cache.
-pub(super) trait CachedPayoff {
-    fn get_payoff(&self, node: &Node) -> Option<f64>;
-}
-
-impl CachedPayoff for () {
-    fn get_payoff(&self, _: &Node) -> Option<f64> {
-        None
     }
 }
 
@@ -339,6 +324,7 @@ impl RegretParams {
 ///
 /// The discount applied to the average strategy depends only on the iteration, so we resolve it
 /// once per sweep instead of branching on `strat` for every infoset.
+#[derive(Debug)]
 enum StratDiscount {
     /// Forget the entire accumulated average (`γ` is infinite)
     Forget,
@@ -355,6 +341,7 @@ enum StratDiscount {
 /// transcendental functions ([`RegretParams::gen_discount`] and `powf`) for every infoset. A
 /// borrowed [`RegretParams`] is carried along so callers can run regret matching through the same
 /// handle.
+#[derive(Debug)]
 pub(super) struct Discounts<'a> {
     params: &'a RegretParams,
     it: u64,
