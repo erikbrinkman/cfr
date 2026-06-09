@@ -9,8 +9,6 @@ use std::slice;
 
 type ChanceIter<'a, 'b> = Zip<slice::Iter<'a, f64>, slice::Iter<'b, Node>>;
 
-// NOTE ideally this trait would define it's own iterator type, but without GAT we can't do that
-// nicely
 trait ChanceRecurse {
     fn next_nodes<'a>(&self, chance: &'a Chance) -> ChanceIter<'_, 'a>;
 
