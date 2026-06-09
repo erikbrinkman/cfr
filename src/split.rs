@@ -2,6 +2,7 @@
 use std::iter::FusedIterator;
 use std::mem;
 
+#[derive(Debug)]
 pub struct SplitsBy<'a, T, I> {
     slice: &'a [T],
     lens: I,
@@ -34,6 +35,7 @@ pub fn split_by<T, I: Iterator<Item = usize>, N: IntoIterator<IntoIter = I>>(
     }
 }
 
+#[derive(Debug)]
 pub struct SplitsByMut<'a, T, I> {
     slice: &'a mut [T],
     lens: I,

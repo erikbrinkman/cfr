@@ -50,6 +50,7 @@ impl Error for GameError {}
 mod game_errors {
     use crate::{Game, GameError, GameNode, IntoGameNode, PlayerNum};
 
+    #[derive(Debug)]
     struct Node(GameNode<Node>);
 
     impl IntoGameNode for Node {
@@ -240,6 +241,7 @@ impl Error for StratError {}
 mod strat_errors {
     use crate::{Game, GameNode, IntoGameNode, PlayerNum, StratError};
 
+    #[derive(Debug)]
     struct Node(GameNode<Node>);
 
     impl IntoGameNode for Node {

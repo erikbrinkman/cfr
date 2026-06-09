@@ -1,6 +1,7 @@
 use rand::distr::Distribution;
 use rand::{Rng, RngExt};
 
+#[derive(Debug)]
 pub struct Multinomial<'a> {
     // We store all be the last, since that should sum to one
     init_probs: &'a [f64],

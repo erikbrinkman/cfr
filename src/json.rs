@@ -6,7 +6,7 @@ use std::io::Read;
 use std::iter::FusedIterator;
 // NOTE we use BTree map to easily gain consistent ordering which is necessary for cfr
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum State {
     Terminal(f64),
@@ -21,7 +21,7 @@ enum State {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Outcome {
     prob: f64,
     state: State,
@@ -29,6 +29,7 @@ struct Outcome {
 
 type ActionIter = BTreeMap<String, State>;
 
+#[derive(Debug)]
 struct OutcomeIter(btree_map::IntoIter<String, Outcome>);
 
 impl OutcomeIter {

@@ -4,12 +4,14 @@ use num_traits::cast::ToPrimitive;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
+#[derive(Debug)]
 struct JoinedNode<'a> {
     node: &'a Node<'a>,
     info: &'a GlobalInfo,
     cum_payoff: f64,
 }
 
+#[derive(Debug)]
 struct GlobalInfo {
     infoset_names: [HashMap<u64, String>; 2],
     outcomes: HashMap<u64, f64>,
