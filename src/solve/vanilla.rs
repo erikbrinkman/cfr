@@ -302,6 +302,7 @@ mod tests {
                 regret: RegretParams::vanilla(),
                 check_interval: 256,
                 seed: 0,
+                fork_depth: 3,
             },
         );
         assert_eq!(*strat_one, [0.995, 0.005]);
@@ -323,6 +324,7 @@ mod tests {
                 regret: RegretParams::vanilla(),
                 check_interval: 256,
                 seed: 0,
+                fork_depth: 3,
             },
         );
         assert!(strat_one[1] < 0.05);

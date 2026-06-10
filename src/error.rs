@@ -19,10 +19,9 @@ pub enum GameError {
     ProbabilitiesNotEqual,
     /// Returned when a game's infosets don't exhibit perfect recall
     ///
-    /// If a game does have perfect recall, then a player's infosets must form a tree, that is for
-    /// all game nodes with a given infoset, the infoset of the player's previous action must be
-    /// identical. We ignore this criterion for single action infosets since they don't actually
-    /// reflect a decision.
+    /// For perfect recall a player's infosets must form a tree: every node sharing an infoset must
+    /// agree on both the player's previous infoset and the action they took out of it. Single-action
+    /// infosets are exempt since they reflect no decision.
     ImperfectRecall,
     /// Returned when a player node has no actions
     EmptyPlayer,
@@ -36,6 +35,11 @@ pub enum GameError {
     ///
     /// Make sure that all actions of a player node are unique.
     ActionsNotUnique,
+    /// Returned when a game has more chance or player infosets than fit in a `u32`
+    ///
+    /// The solver keys its sampler on `u32` infoset ids, so each player's infoset count and the
+    /// chance infoset count must not exceed [`u32::MAX`].
+    TooManyInfosets,
 }
 
 impl Display for GameError {
@@ -152,6 +156,30 @@ mod game_errors {
                     )),
                 ),
             ],
+        ));
+        let err = Game::from_root(err_game).unwrap_err();
+        assert_eq!(err, GameError::ImperfectRecall);
+    }
+
+    #[test]
+    fn imperfect_recall_forgotten_action() {
+        // both of player one's actions at "p" reach the same infoset "x", so at "x" the player can't
+        // tell whether they played "a" or "b". Comparing only the previous infoset misses this (both
+        // reach "x" from "p"); the action taken out of "p" is what distinguishes them.
+        fn branch() -> Node {
+            Node(GameNode::Player(
+                PlayerNum::One,
+                "x",
+                vec![
+                    ("c", Node(GameNode::Terminal(0.0))),
+                    ("d", Node(GameNode::Terminal(0.0))),
+                ],
+            ))
+        }
+        let err_game = Node(GameNode::Player(
+            PlayerNum::One,
+            "p",
+            vec![("a", branch()), ("b", branch())],
         ));
         let err = Game::from_root(err_game).unwrap_err();
         assert_eq!(err, GameError::ImperfectRecall);
