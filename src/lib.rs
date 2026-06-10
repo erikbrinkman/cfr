@@ -652,6 +652,10 @@ pub struct SolveParams {
     /// is a reduction over every infoset, so checking less often is cheaper but overshoots the regret
     /// target by up to `check_interval - 1` iterations.
     pub check_interval: u64,
+    /// Seed for the deterministic outcome sampler. A solve is reproducible for a fixed seed; vary it
+    /// to draw independent sampled runs. Only the sampled methods ([`SolveMethod::Sampled`],
+    /// [`SolveMethod::External`]) consult it.
+    pub seed: u64,
 }
 
 impl Default for SolveParams {
@@ -659,6 +663,7 @@ impl Default for SolveParams {
         SolveParams {
             regret: RegretParams::default(),
             check_interval: 256,
+            seed: 0,
         }
     }
 }
@@ -682,20 +687,15 @@ impl<I, A> Game<I, A> {
     ///   other parameters, this should be set lower than the desired regret.
     /// - `num_threads` - The number of threads to use for solving. Zero selects based off of
     ///   [`thread::available_parallelism`]. One uses a single threaded variant that's more efficient
-    ///   when not in a threaded environment.
-    /// - `param` - Advanced parameters that govern the behavior of the regret and strategy
-    ///   updates. See [`RegretParams`] for more details, or set to [None] to use the
-    ///   [default][RegretParams::default].
+    ///   when not in a threaded environment. Every method runs single threaded, so this
+    ///   argument is accepted but ignored.
+    /// - `params` - Solver parameters bundled in a [`SolveParams`]: the [`RegretParams`] discount
+    ///   style, how often the regret bound is checked, and the sampler seed. Use
+    ///   [`SolveParams::default`] for sensible defaults.
     ///
     /// # Errors
     ///
-    /// If `num_threads` is too large, and this tries to spawn too many threads, or if there are
-    /// problems spawning threads. This will not error when `num_threads` is 1.
-    ///
-    /// # Panics
-    ///
-    /// Will not panic; the internal `unwrap_or` fallback constructs `NonZeroUsize::new(1)` which
-    /// is statically valid.
+    /// Never returns an error; every method runs single threaded.
     pub fn solve(
         &self,
         method: SolveMethod,
@@ -705,13 +705,8 @@ impl<I, A> Game<I, A> {
         params: SolveParams,
     ) -> Result<(Strategies<'_, I, A>, RegretBound), SolveError> {
         let [first_player, second_player] = &self.player_infosets;
-        // NOTE multi-threaded solving is being reworked (within-iteration fork-join for external
-        // sampling); for now every method runs single threaded and `num_threads` is ignored
+        // every method runs single threaded; num_threads is unused
         let _ = num_threads;
-        let SolveParams {
-            regret,
-            check_interval,
-        } = params;
         let (regrets, probs) = match method {
             SolveMethod::Full => vanilla::solve_full_single(
                 &self.root,
@@ -719,8 +714,7 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &regret,
-                check_interval,
+                &params,
             ),
             SolveMethod::Sampled => vanilla::solve_sampled_single(
                 &self.root,
@@ -728,8 +722,7 @@ impl<I, A> Game<I, A> {
                 [first_player, second_player],
                 max_iter,
                 max_reg,
-                &regret,
-                check_interval,
+                &params,
             ),
             SolveMethod::External => external::solve_external_single(
                 &self.root,
@@ -1392,11 +1385,13 @@ mod tests {
     #[should_panic(expected = "same game")]
     fn test_distance_game_panic() {
         let game_one = create_game();
-        let (strat_one, _) = game_one.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+        let (strat_one, _) = game_one
+            .solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
             .unwrap();
 
         let game_two = create_game();
-        let (strat_two, _) = game_two.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+        let (strat_two, _) = game_two
+            .solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
             .unwrap();
 
         strat_one.distance(&strat_two, 1.0);
@@ -1406,9 +1401,11 @@ mod tests {
     #[should_panic(expected = "`p` must be positive")]
     fn test_distance_p_panic() {
         let game = create_game();
-        let (strat_one, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+        let (strat_one, _) = game
+            .solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
             .unwrap();
-        let (strat_two, _) = game.solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
+        let (strat_two, _) = game
+            .solve(SolveMethod::Full, 0, 0.0, 1, SolveParams::default())
             .unwrap();
         strat_one.distance(&strat_two, 0.0);
     }

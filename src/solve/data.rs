@@ -1,14 +1,85 @@
 //! Common data structures for solving games
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+use core::convert::Infallible;
 use logaddexp::LogAddExp;
-use rand::rng;
+use rand::TryRng;
 use rand_distr::{weighted::WeightedAliasIndex, Distribution};
 
-/// A chance information set for cached sampling
+/// The splitmix64 increment (the golden-ratio gamma constant)
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// The splitmix64 finalizer that scrambles a state word into an output
+fn finalize(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Fold a value into a running splitmix64 state (mix in the value, then finalize)
+fn fold(state: u64, value: u64) -> u64 {
+    finalize((state ^ value).wrapping_add(SPLITMIX_GAMMA))
+}
+
+/// A deterministic, seedable counter-based RNG (splitmix64) for sampling
+///
+/// Driving the samplers with an RNG keyed by `(seed, iteration, sweep, infoset)` makes a solve
+/// reproducible -- even in parallel, since a draw depends only on its key and not on thread
+/// scheduling -- and gives external sampling its consistency (the same infoset draws the same way
+/// within a sweep) without any shared cache.
+#[derive(Debug)]
+pub(super) struct DetRng(u64);
+
+impl DetRng {
+    fn step(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
+        finalize(self.0)
+    }
+}
+
+impl TryRng for DetRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok((self.step() >> 32) as u32)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(self.step())
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        let mut chunks = dst.chunks_exact_mut(8);
+        for chunk in &mut chunks {
+            chunk.copy_from_slice(&self.step().to_le_bytes());
+        }
+        let rem = chunks.into_remainder();
+        if !rem.is_empty() {
+            let bytes = self.step().to_le_bytes();
+            rem.copy_from_slice(&bytes[..rem.len()]);
+        }
+        Ok(())
+    }
+}
+
+/// The sampling key for one sweep: seed + iteration + sweep, producing a per-infoset [`DetRng`]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SampleKey(u64);
+
+impl SampleKey {
+    pub(super) fn new(seed: u64, iteration: u64, sweep: u64) -> Self {
+        SampleKey(fold(fold(seed, iteration), sweep))
+    }
+
+    /// A fresh deterministic RNG for the given infoset
+    pub(super) fn rng(self, infoset: u32) -> DetRng {
+        DetRng(fold(self.0, u64::from(infoset)))
+    }
+}
+
+/// A chance information set
 #[derive(Debug)]
 pub struct SampledChance {
     index: WeightedAliasIndex<f64>,
-    cached: usize,
 }
 
 impl SampledChance {
@@ -16,26 +87,12 @@ impl SampledChance {
     pub fn new(probs: &[f64]) -> Self {
         SampledChance {
             index: WeightedAliasIndex::new(probs.to_vec()).unwrap(),
-            cached: 0,
         }
     }
 
-    /// Sample a chance outcome index
-    ///
-    /// This will return the same value on successive calls until reset is called
-    pub fn sample(&mut self) -> usize {
-        if self.cached == 0 {
-            let res = self.index.sample(&mut rng());
-            self.cached = res + 1;
-            res
-        } else {
-            self.cached - 1
-        }
-    }
-
-    /// Reset the infoset allowing different samples
-    pub fn reset(&mut self) {
-        self.cached = 0;
+    /// Deterministically sample a chance outcome index from the given RNG
+    pub(super) fn sample(&self, rng: &mut DetRng) -> usize {
+        self.index.sample(rng)
     }
 }
 
