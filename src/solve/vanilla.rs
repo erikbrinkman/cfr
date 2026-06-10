@@ -1,39 +1,31 @@
 //! Vanilla and sampled cfr implementations
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 use super::data;
-use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
-use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
+use super::data::{Discounts, RegretInfoset, SampleKey, SampledChance, SolveInfo};
+use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
 use std::cell::RefCell;
 use std::iter::Zip;
 use std::slice;
 
 type ChanceIter<'a, 'b> = Zip<slice::Iter<'a, f64>, slice::Iter<'b, Node>>;
 
-trait ChanceRecurse: Send {
-    fn next_nodes<'a>(&self, chance: &'a Chance) -> ChanceIter<'_, 'a>;
-
-    fn advance(&mut self);
+trait ChanceRecurse {
+    fn next_nodes<'a>(&self, chance: &'a Chance, key: SampleKey) -> ChanceIter<'_, 'a>;
 }
 
 #[derive(Debug)]
 struct FullChance<'a>(&'a [f64]);
 
 impl ChanceRecurse for FullChance<'_> {
-    fn next_nodes<'b>(&self, chance: &'b Chance) -> ChanceIter<'_, 'b> {
+    fn next_nodes<'b>(&self, chance: &'b Chance, _key: SampleKey) -> ChanceIter<'_, 'b> {
         self.0.iter().zip(chance.outcomes.iter())
     }
-
-    fn advance(&mut self) {}
 }
 
-impl ChanceRecurse for RefCell<SampledChance> {
-    fn next_nodes<'b>(&self, chance: &'b Chance) -> ChanceIter<'_, 'b> {
-        let ind = self.borrow_mut().sample();
+impl ChanceRecurse for SampledChance {
+    fn next_nodes<'b>(&self, chance: &'b Chance, key: SampleKey) -> ChanceIter<'_, 'b> {
+        let ind = self.sample(&mut key.rng(chance.infoset as u32));
         [1.0].iter().zip(chance.outcomes[ind..=ind].iter())
-    }
-
-    fn advance(&mut self) {
-        self.get_mut().reset();
     }
 }
 
@@ -61,6 +53,7 @@ fn recurse_single(
     node: &Node,
     chance_infosets: &[impl ChanceRecurse],
     player_infosets: [&[RefCell<RegretInfoset>]; 2],
+    key: SampleKey,
     p_chance: f64,
     p_player: [f64; 2],
 ) -> f64 {
@@ -68,11 +61,12 @@ fn recurse_single(
         Node::Terminal(payoff) => *payoff,
         Node::Chance(chance) => {
             let mut expected = 0.0;
-            for (prob, next) in chance_infosets[chance.infoset].next_nodes(chance) {
+            for (prob, next) in chance_infosets[chance.infoset].next_nodes(chance, key) {
                 let payoff = recurse_single(
                     next,
                     chance_infosets,
                     player_infosets,
+                    key,
                     p_chance * prob,
                     p_player,
                 );
@@ -94,7 +88,7 @@ fn recurse_single(
                 strat,
                 &mut **cum_regret,
                 |next, p_next| {
-                    recurse_single(next, chance_infosets, player_infosets, p_chance, p_next)
+                    recurse_single(next, chance_infosets, player_infosets, key, p_chance, p_next)
                 },
             );
             for val in &mut info.cum_regret {
@@ -140,24 +134,27 @@ fn recurse_player<'a>(
 
 fn solve_generic_single(
     start: &Node,
-    mut chance_infosets: Box<[impl ChanceRecurse]>,
+    chance_infosets: &[impl ChanceRecurse],
     mut player_infosets: [Box<[RefCell<RegretInfoset>]>; 2],
     iter: u64,
     max_reg: f64,
-    params: &RegretParams,
-    check_interval: u64,
+    sp: &SolveParams,
 ) -> SolveInfo {
+    let params = &sp.regret;
+    let check_interval = sp.check_interval;
+    let seed = sp.seed;
     let mut regs = [f64::INFINITY; 2];
     for it in 1..=iter {
         let [player_one, player_two] = &player_infosets;
+        // a single full/sampled traversal updates both players, so there is one sweep per iteration
         recurse_single(
             start,
-            &chance_infosets,
+            chance_infosets,
             [player_one, player_two],
+            SampleKey::new(seed, it, 0),
             1.0,
             [1.0; 2],
         );
-        chance_infosets.iter_mut().for_each(ChanceRecurse::advance);
         let check = data::should_check(it, iter, check_interval);
         let discounts = Discounts::new(params, it, it);
         for (reg, infos) in regs.iter_mut().zip(player_infosets.iter_mut()) {
@@ -193,8 +190,7 @@ pub(crate) fn solve_full_single(
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    params: &RegretParams,
-    check_interval: u64,
+    sp: &SolveParams,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -202,28 +198,27 @@ pub(crate) fn solve_full_single(
             .map(|info| RefCell::new(RegretInfoset::new(info.num_actions())))
             .collect()
     });
-    let chance_infosets = chance_info
+    let chance_infosets: Box<[_]> = chance_info
         .iter()
         .map(|info| FullChance(info.probs()))
         .collect();
     solve_generic_single(
         start,
-        chance_infosets,
+        &chance_infosets,
         player_infosets,
         max_iter,
         max_reg,
-        params,
-        check_interval,
+        sp,
     )
 }
+
 pub(crate) fn solve_sampled_single(
     start: &Node,
     chance_info: &[impl ChanceInfoset],
     player_info: [&[impl PlayerInfoset]; 2],
     max_iter: u64,
     max_reg: f64,
-    params: &RegretParams,
-    check_interval: u64,
+    sp: &SolveParams,
 ) -> SolveInfo {
     let player_infosets = player_info.map(|infos| {
         infos
@@ -231,23 +226,22 @@ pub(crate) fn solve_sampled_single(
             .map(|info| RefCell::new(RegretInfoset::new(info.num_actions())))
             .collect()
     });
-    let chance_infosets = chance_info
+    let chance_infosets: Box<[_]> = chance_info
         .iter()
-        .map(|info| RefCell::new(SampledChance::new(info.probs())))
+        .map(|info| SampledChance::new(info.probs()))
         .collect();
     solve_generic_single(
         start,
-        chance_infosets,
+        &chance_infosets,
         player_infosets,
         max_iter,
         max_reg,
-        params,
-        check_interval,
+        sp,
     )
 }
 #[cfg(test)]
 mod tests {
-    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams};
+    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams, SolveParams};
 
     #[derive(Clone, Debug)]
     struct Pinfo(usize);
@@ -304,8 +298,11 @@ mod tests {
             [&*one, &*two],
             100,
             0.0,
-            &RegretParams::vanilla(),
-            256,
+            &SolveParams {
+                regret: RegretParams::vanilla(),
+                check_interval: 256,
+                seed: 0,
+            },
         );
         assert_eq!(*strat_one, [0.995, 0.005]);
         assert_eq!(*strat_two, [0.005, 0.995]);
@@ -322,8 +319,11 @@ mod tests {
             [&*one, &*two],
             100,
             0.0,
-            &RegretParams::vanilla(),
-            256,
+            &SolveParams {
+                regret: RegretParams::vanilla(),
+                check_interval: 256,
+                seed: 0,
+            },
         );
         assert!(strat_one[1] < 0.05);
         assert!(strat_two[0] < 0.05);

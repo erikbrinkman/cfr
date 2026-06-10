@@ -3,20 +3,18 @@
 // is allowed module-wide. Lossy int->float casts (cast_precision_loss) are handled per-site instead.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 use super::data;
-use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
+use super::data::{
+    Discounts, RegretInfoset, RegretParams, SampleKey, SampledChance, SolveInfo,
+};
 use super::multinomial::Multinomial;
 use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
 use rand::distr::Distribution;
-use rand::rng;
 use std::cell::RefCell;
 
-/// A variant of the standard regret infoset that caches the last selected external sampled strat
+/// A regret infoset for external sampling
 #[derive(Debug)]
 struct CachedInfoset {
     reg: RegretInfoset,
-    cached: usize,
-    /// The iteration the cached sample is valid for (lazy mode)
-    cache_gen: u64,
     /// The global `cum_log_pos` at this infoset's last cumulative-regret catch-up (lazy mode)
     base_log_pos: f64,
     /// The global `cum_log_neg` at this infoset's last cumulative-regret catch-up (lazy mode)
@@ -28,24 +26,18 @@ impl CachedInfoset {
     fn new(num_actions: usize) -> Self {
         CachedInfoset {
             reg: RegretInfoset::new(num_actions),
-            cached: 0,
-            cache_gen: 0,
             base_log_pos: 0.0,
             base_log_neg: 0.0,
         }
     }
 
-    /// Sample an action, reusing the cached draw within the same iteration `gen` (lazy mode)
+    /// Deterministically sample an action from the current strategy
     ///
-    /// External sampling requires the opponent to play consistently across every action the
-    /// updating player explores, so the draw is cached within an iteration; keying that cache on the
-    /// iteration lets us avoid an explicit per-iteration reset sweep over every infoset.
-    fn sample_gen(&mut self, generation: u64) -> usize {
-        if self.cache_gen != generation {
-            self.cached = Multinomial::new(&self.reg.strat).sample(&mut rng());
-            self.cache_gen = generation;
-        }
-        self.cached
+    /// Keying the draw on `(seed, iteration, sweep, infoset)` makes the opponent play consistently
+    /// across every action the updating player explores -- without a shared cache -- because the
+    /// same infoset draws the same way within a sweep.
+    fn sample(&self, key: SampleKey, infoset: u32) -> usize {
+        Multinomial::new(&self.reg.strat).sample(&mut key.rng(infoset))
     }
 
     /// Add the current strategy into the average, weighted for discounting (lazy mode)
@@ -148,22 +140,21 @@ struct LazyState {
     log_neg_step: f64,
     /// Weight `t^γ` applied to the current iteration's average-strategy contribution
     strat_weight: f64,
-    /// The current iteration, used to key the external sample cache
-    generation: u64,
 }
 
 /// The active/external/chance recursion for a lazy single-threaded external iteration
 ///
 /// Mirrors [`recurse_regret`] but folds the active-player infoset update into the visit (so
-/// unvisited infosets are never touched), accumulates the opponent's average strategy with the
-/// discount weight instead of discounting it, and keys the opponent's sample cache on the iteration.
+/// unvisited infosets are never touched) and accumulates the opponent's average strategy with the
+/// discount weight instead of discounting it.
 fn recurse_lazy<const FIRST: bool>(
     node: &Node,
-    chance_infosets: &[RefCell<SampledChance>],
+    chance_infosets: &[SampledChance],
     active_player_infosets: &[RefCell<CachedInfoset>],
     external_player_infosets: &[RefCell<CachedInfoset>],
     lazy: &LazyState,
     discounts: &Discounts,
+    key: SampleKey,
 ) -> f64 {
     match node {
         Node::Terminal(payoff) => {
@@ -174,7 +165,7 @@ fn recurse_lazy<const FIRST: bool>(
             }
         }
         Node::Chance(chance) => {
-            let next = chance_infosets[chance.infoset].borrow_mut().sample();
+            let next = chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
             recurse_lazy::<FIRST>(
                 &chance.outcomes[next],
                 chance_infosets,
@@ -182,6 +173,7 @@ fn recurse_lazy<const FIRST: bool>(
                 external_player_infosets,
                 lazy,
                 discounts,
+                key,
             )
         }
         Node::Player(player) => match (player.num, FIRST) {
@@ -196,13 +188,14 @@ fn recurse_lazy<const FIRST: bool>(
                         external_player_infosets,
                         lazy,
                         discounts,
+                        key,
                     )
                 }),
             (PlayerNum::Two, true) | (PlayerNum::One, false) => {
                 let next = {
                     let mut info = external_player_infosets[player.infoset].borrow_mut();
                     info.accumulate_strat_weighted(lazy.strat_weight);
-                    &player.actions[info.sample_gen(lazy.generation)]
+                    &player.actions[info.sample(key, player.infoset as u32)]
                 };
                 recurse_lazy::<FIRST>(
                     next,
@@ -211,6 +204,7 @@ fn recurse_lazy<const FIRST: bool>(
                     external_player_infosets,
                     lazy,
                     discounts,
+                    key,
                 )
             }
         },
@@ -232,9 +226,10 @@ pub(crate) fn solve_external_single(
 ) -> SolveInfo {
     let params = &sp.regret;
     let check_interval = sp.check_interval;
+    let seed = sp.seed;
     let chance_infosets: Box<[_]> = chance_info
         .iter()
-        .map(|info| RefCell::new(SampledChance::new(info.probs())))
+        .map(|info| SampledChance::new(info.probs()))
         .collect();
     let [player_one, player_two] = player_info.map(|infos| {
         infos
@@ -254,10 +249,9 @@ pub(crate) fn solve_external_single(
         #[allow(clippy::cast_precision_loss)]
         let iters = it as f64;
         lazy.strat_weight = iters.powf(params.strat);
-        lazy.generation = it;
         let discounts = Discounts::new(params, it, it);
-        // both players' active sweeps read the same pre-iteration cumulative discount; it advances
-        // once per iteration after both have run
+        // the two sweeps sample independently (distinct sweep id in the key), but both read the same
+        // pre-iteration cumulative discount, which advances once after both have run
         recurse_lazy::<true>(
             start,
             &chance_infosets,
@@ -265,10 +259,8 @@ pub(crate) fn solve_external_single(
             &player_two,
             &lazy,
             &discounts,
+            SampleKey::new(seed, it, 0),
         );
-        for info in &chance_infosets {
-            info.borrow_mut().reset();
-        }
         recurse_lazy::<false>(
             start,
             &chance_infosets,
@@ -276,10 +268,8 @@ pub(crate) fn solve_external_single(
             &player_one,
             &lazy,
             &discounts,
+            SampleKey::new(seed, it, 1),
         );
-        for info in &chance_infosets {
-            info.borrow_mut().reset();
-        }
         lazy.cum_log_pos += lazy.log_pos_step;
         lazy.cum_log_neg += lazy.log_neg_step;
         if check {
@@ -320,108 +310,13 @@ mod tests {
 
     mod eager {
         use super::super::CachedInfoset;
-        use super::super::Multinomial;
-        use super::super::data::{Discounts, SampledChance, should_check, SolveInfo};
-        use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
-        use rand::distr::Distribution;
-        use rand::rng;
+        use super::super::data::{Discounts, SampledChance, SampleKey, should_check, SolveInfo};
+        use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
         use std::cell::RefCell;
 
-        /// Sample an action from the current strategy, caches between resets
-        fn sample(info: &mut CachedInfoset) -> usize {
-            if info.cached == 0 {
-                let res = Multinomial::new(&info.reg.strat).sample(&mut rng());
-                info.cached = res + 1;
-                res
-            } else {
-                info.cached - 1
-            }
-        }
-
-        /// A trait for the option of cached payoffs
-        ///
-        /// The external solver recurses with a payoff oracle that is normally the empty tuple (no
-        /// cached payoffs); the trait leaves room for a node-keyed cache.
-        trait CachedPayoff {
-            fn get_payoff(&self, node: &Node) -> Option<f64>;
-        }
-
-        impl CachedPayoff for () {
-            fn get_payoff(&self, _: &Node) -> Option<f64> {
-                None
-            }
-        }
-
-        /// Extra implementations for chance infosets for external sampling
-        trait ChanceInfo {
-            fn next<'a>(&mut self, chance: &'a Chance) -> &'a Node;
-
-            fn advance(&mut self);
-        }
-
-        impl ChanceInfo for SampledChance {
-            fn next<'a>(&mut self, chance: &'a Chance) -> &'a Node {
-                &chance.outcomes[self.sample()]
-            }
-
-            fn advance(&mut self) {
-                self.reset();
-            }
-        }
-
-        /// Abstraction over wrappers of `ChanceInfo`
-        ///
-        /// This allows recursing over `RefCells` or Mutex
-        trait ChanceRecurse {
-            fn next<'a>(&self, chance: &'a Chance) -> &'a Node;
-        }
-
-        impl<T: ChanceInfo> ChanceRecurse for RefCell<T> {
-            fn next<'a>(&self, chance: &'a Chance) -> &'a Node {
-                self.borrow_mut().next(chance)
-            }
-        }
-
-        trait ActiveInfo {
-            fn recurse(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64;
-
-            fn advance(&mut self, discounts: &Discounts) -> f64;
-        }
-
-        trait ActiveRecurse {
-            fn recurse(&self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64;
-        }
-
-        impl<T: ActiveInfo> ActiveRecurse for RefCell<T> {
-            fn recurse(&self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
-                self.borrow_mut().recurse(player, rec)
-            }
-        }
-
-        trait ExternalInfo {
-            fn next<'a>(&mut self, player: &'a Player) -> &'a Node;
-
-            fn update_cum_strat(&mut self);
-
-            fn next_update<'a>(&mut self, player: &'a Player) -> &'a Node {
-                self.update_cum_strat();
-                self.next(player)
-            }
-        }
-
-        trait ExternalRecurse {
-            fn next_update<'a>(&self, player: &'a Player) -> &'a Node;
-        }
-
-        impl<T: ExternalInfo> ExternalRecurse for RefCell<T> {
-            fn next_update<'a>(&self, player: &'a Player) -> &'a Node {
-                self.borrow_mut().next_update(player)
-            }
-        }
-
-        impl ActiveInfo for CachedInfoset {
-            fn recurse(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
-                // recurse and get expected utility
+        impl CachedInfoset {
+            /// Accumulate this iteration's counterfactual regret over the active player's actions (eager)
+            fn recurse_active(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
                 let mut expected = 0.0;
                 for ((next, prob), cum_reg) in player
                     .actions
@@ -433,7 +328,6 @@ mod tests {
                     expected += f64::from(*prob) * util;
                     *cum_reg += util as f32;
                 }
-
                 // account for only adding utility to cum_regret
                 for cum_reg in &mut self.reg.cum_regret {
                     *cum_reg -= expected as f32;
@@ -441,20 +335,15 @@ mod tests {
                 expected
             }
 
+            /// Regret match the next strategy and discount the cumulative regret (eager)
             fn advance(&mut self, discounts: &Discounts) -> f64 {
-                self.cached = 0;
                 let bound = discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
                 discounts.discount_average_strat(&mut self.reg.cum_strat);
                 bound
             }
-        }
 
-        impl ExternalInfo for CachedInfoset {
-            fn next<'a>(&mut self, player: &'a Player) -> &'a Node {
-                &player.actions[sample(self)]
-            }
-
-            fn update_cum_strat<'a>(&mut self) {
+            /// Add the current strategy into the average (eager)
+            fn update_cum_strat(&mut self) {
                 for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
                     *cum += f64::from(*val);
                 }
@@ -463,50 +352,58 @@ mod tests {
 
         fn recurse_regret<const FIRST: bool>(
             node: &Node,
-            chance_infosets: &[impl ChanceRecurse],
-            active_player_infosets: &[impl ActiveRecurse],
-            external_player_infosets: &[impl ExternalRecurse],
-            cached: &impl CachedPayoff,
+            chance_infosets: &[SampledChance],
+            active_player_infosets: &[RefCell<CachedInfoset>],
+            external_player_infosets: &[RefCell<CachedInfoset>],
+            key: SampleKey,
         ) -> f64 {
-            if let Some(pay) = cached.get_payoff(node) {
-                pay
-            } else {
-                match node {
-                    Node::Terminal(payoff) => {
-                        if FIRST {
-                            *payoff
-                        } else {
-                            -payoff
-                        }
+            match node {
+                Node::Terminal(payoff) => {
+                    if FIRST {
+                        *payoff
+                    } else {
+                        -payoff
                     }
-                    Node::Chance(chance) => recurse_regret::<FIRST>(
-                        chance_infosets[chance.infoset].next(chance),
+                }
+                Node::Chance(chance) => {
+                    let ind =
+                        chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                    recurse_regret::<FIRST>(
+                        &chance.outcomes[ind],
                         chance_infosets,
                         active_player_infosets,
                         external_player_infosets,
-                        cached,
-                    ),
-                    Node::Player(player) => match (player.num, FIRST) {
-                        (PlayerNum::One, true) | (PlayerNum::Two, false) => {
-                            active_player_infosets[player.infoset].recurse(player, |next| {
-                                recurse_regret::<FIRST>(
-                                    next,
-                                    chance_infosets,
-                                    active_player_infosets,
-                                    external_player_infosets,
-                                    cached,
-                                )
-                            })
-                        }
-                        (PlayerNum::One, false) | (PlayerNum::Two, true) => recurse_regret::<FIRST>(
-                            external_player_infosets[player.infoset].next_update(player),
+                        key,
+                    )
+                }
+                Node::Player(player) => match (player.num, FIRST) {
+                    (PlayerNum::One, true) | (PlayerNum::Two, false) => active_player_infosets
+                        [player.infoset]
+                        .borrow_mut()
+                        .recurse_active(player, |next| {
+                            recurse_regret::<FIRST>(
+                                next,
+                                chance_infosets,
+                                active_player_infosets,
+                                external_player_infosets,
+                                key,
+                            )
+                        }),
+                    (PlayerNum::One, false) | (PlayerNum::Two, true) => {
+                        let next = {
+                            let mut info = external_player_infosets[player.infoset].borrow_mut();
+                            info.update_cum_strat();
+                            &player.actions[info.sample(key, player.infoset as u32)]
+                        };
+                        recurse_regret::<FIRST>(
+                            next,
                             chance_infosets,
                             active_player_infosets,
                             external_player_infosets,
-                            cached,
-                        ),
-                    },
-                }
+                            key,
+                        )
+                    }
+                },
             }
         }
 
@@ -546,9 +443,10 @@ mod tests {
         ) -> SolveInfo {
             let params = &sp.regret;
             let check_interval = sp.check_interval;
-            let mut chance_infosets: Box<[_]> = chance_info
+            let seed = sp.seed;
+            let chance_infosets: Box<[_]> = chance_info
                 .iter()
-                .map(|info| RefCell::new(SampledChance::new(info.probs())))
+                .map(|info| SampledChance::new(info.probs()))
                 .collect();
             let [mut player_one, mut player_two] = player_info.map(|infos| {
                 infos
@@ -559,20 +457,26 @@ mod tests {
             let [mut reg_one, mut reg_two] = [f64::INFINITY; 2];
             for it in 1..=max_iter {
                 let check = should_check(it, max_iter, check_interval);
-                // player one
-                recurse_regret::<true>(start, &chance_infosets, &player_one, &player_two, &());
-                chance_infosets
-                    .iter_mut()
-                    .for_each(|info| info.get_mut().advance());
+                // player one (the two sweeps sample independently via distinct sweep ids in the key)
+                recurse_regret::<true>(
+                    start,
+                    &chance_infosets,
+                    &player_one,
+                    &player_two,
+                    SampleKey::new(seed, it, 0),
+                );
                 // the leading player has nothing accumulated on its first average-strat discount, so it
-                // discounts against `it - 1` (see the note in `solve_external_single`)
+                // discounts against `it - 1`
                 let discounts_one = Discounts::new(params, it, it - 1);
                 reg_one = advance_player(&mut player_one, &discounts_one, check);
                 // player two
-                recurse_regret::<false>(start, &chance_infosets, &player_two, &player_one, &());
-                chance_infosets
-                    .iter_mut()
-                    .for_each(|info| info.get_mut().advance());
+                recurse_regret::<false>(
+                    start,
+                    &chance_infosets,
+                    &player_two,
+                    &player_one,
+                    SampleKey::new(seed, it, 1),
+                );
                 let discounts_two = Discounts::new(params, it, it);
                 reg_two = advance_player(&mut player_two, &discounts_two, check);
                 // check to terminate
@@ -664,6 +568,7 @@ mod tests {
         let params = SolveParams {
             regret: RegretParams::vanilla(),
             check_interval: 256,
+            seed: 0,
         };
         // the deferred (lazy) production solver and the eager reference must agree
         for eager in [false, true] {
@@ -685,6 +590,7 @@ mod tests {
         let params = SolveParams {
             regret: RegretParams::vanilla(),
             check_interval: 256,
+            seed: 0,
         };
         for eager in [false, true] {
             let (root, chance, [one, two]) = even_or_odd();

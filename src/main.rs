@@ -97,6 +97,13 @@ struct Args {
     #[clap(short, long, value_parser, default_value_t = 0)]
     parallel: usize,
 
+    /// Seed for deterministic outcome sampling
+    ///
+    /// Sampling is fully deterministic given this seed, so repeated runs with the same seed produce
+    /// identical strategies. Vary it to get independent samples.
+    #[clap(short, long, value_parser, default_value_t = 0)]
+    seed: u64,
+
     /// Method to use for game solving
     #[clap(short, long, value_enum, default_value_t = Method::External)]
     method: Method,
@@ -197,6 +204,7 @@ fn main() {
             args.parallel,
             SolveParams {
                 regret: args.discount.into_params(),
+                seed: args.seed,
                 ..Default::default()
             },
         )
