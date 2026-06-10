@@ -40,18 +40,6 @@ impl CachedInfoset {
         Multinomial::new(&self.reg.strat).sample(&mut key.rng(infoset))
     }
 
-    /// Add the current strategy into the average, weighted for discounting (lazy mode)
-    ///
-    /// Discounting the average strategy by `(t/(t+1))^γ` every iteration is equivalent to weighting
-    /// iteration `t`'s contribution by `t^γ` and normalizing at the end, which avoids a per-iteration
-    /// discount pass over every infoset. The shared `t^γ` and the global normalizer both cancel when
-    /// the average is normalized.
-    fn accumulate_strat_weighted(&mut self, weight: f64) {
-        for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
-            *cum += f64::from(*val) * weight;
-        }
-    }
-
     /// Apply the deferred cumulative-regret discount for the iterations since the last catch-up
     ///
     /// `target_log_pos`/`target_log_neg` are the global cumulative log-discounts to bring this
@@ -83,23 +71,36 @@ impl CachedInfoset {
         player: &Player,
         lazy: &LazyState,
         discounts: &Discounts,
-        rec: impl Fn(&Node) -> f64,
+        reach: f64,
+        rec: impl Fn(&Node, f64) -> f64,
     ) -> f64 {
         // bring cumulative regret up to the start of this iteration
         self.catch_up(lazy.cum_log_pos, lazy.cum_log_neg);
-        // accumulate this iteration's counterfactual regret
+        // accumulate this iteration's counterfactual regret and average-strategy contribution. The
+        // average accumulates this player's own strategy weighted by their reach times the lazy
+        // discount weight `t^γ` (deferred so the normalizer cancels at the end); the opponent never
+        // touches these infosets, which keeps a fork over the active player's actions write-disjoint.
+        let avg_weight = reach * lazy.strat_weight;
+        let RegretInfoset {
+            strat,
+            cum_regret,
+            cum_strat,
+        } = &mut self.reg;
         let mut expected = 0.0;
-        for ((next, prob), cum_reg) in player
+        for (((next, prob), cum_reg), cum_str) in player
             .actions
             .iter()
-            .zip(self.reg.strat.iter())
-            .zip(self.reg.cum_regret.iter_mut())
+            .zip(strat.iter())
+            .zip(cum_regret.iter_mut())
+            .zip(cum_strat.iter_mut())
         {
-            let util = rec(next);
-            expected += f64::from(*prob) * util;
+            let prob = f64::from(*prob);
+            let util = rec(next, reach * prob);
+            expected += prob * util;
             *cum_reg += util as f32;
+            *cum_str += prob * avg_weight;
         }
-        for cum_reg in &mut *self.reg.cum_regret {
+        for cum_reg in cum_regret.iter_mut() {
             *cum_reg -= expected as f32;
         }
         // regret match for the next iteration and apply this iteration's discount
@@ -145,8 +146,10 @@ struct LazyState {
 /// The active/external/chance recursion for a lazy single-threaded external iteration
 ///
 /// Mirrors [`recurse_regret`] but folds the active-player infoset update into the visit (so
-/// unvisited infosets are never touched) and accumulates the opponent's average strategy with the
-/// discount weight instead of discounting it.
+/// unvisited infosets are never touched). The active player accumulates its own average strategy at
+/// its own infosets; the opponent is only sampled, so the active player's `reach` carries through
+/// opponent and chance nodes unchanged.
+#[allow(clippy::too_many_arguments)]
 fn recurse_lazy<const FIRST: bool>(
     node: &Node,
     chance_infosets: &[SampledChance],
@@ -154,6 +157,7 @@ fn recurse_lazy<const FIRST: bool>(
     external_player_infosets: &[RefCell<CachedInfoset>],
     lazy: &LazyState,
     discounts: &Discounts,
+    reach: f64,
     key: SampleKey,
 ) -> f64 {
     match node {
@@ -173,6 +177,7 @@ fn recurse_lazy<const FIRST: bool>(
                 external_player_infosets,
                 lazy,
                 discounts,
+                reach,
                 key,
             )
         }
@@ -180,7 +185,7 @@ fn recurse_lazy<const FIRST: bool>(
             (PlayerNum::One, true) | (PlayerNum::Two, false) => active_player_infosets
                 [player.infoset]
                 .borrow_mut()
-                .visit_lazy(player, lazy, discounts, |next| {
+                .visit_lazy(player, lazy, discounts, reach, |next, child_reach| {
                     recurse_lazy::<FIRST>(
                         next,
                         chance_infosets,
@@ -188,13 +193,13 @@ fn recurse_lazy<const FIRST: bool>(
                         external_player_infosets,
                         lazy,
                         discounts,
+                        child_reach,
                         key,
                     )
                 }),
             (PlayerNum::Two, true) | (PlayerNum::One, false) => {
                 let next = {
-                    let mut info = external_player_infosets[player.infoset].borrow_mut();
-                    info.accumulate_strat_weighted(lazy.strat_weight);
+                    let info = external_player_infosets[player.infoset].borrow();
                     &player.actions[info.sample(key, player.infoset as u32)]
                 };
                 recurse_lazy::<FIRST>(
@@ -204,6 +209,7 @@ fn recurse_lazy<const FIRST: bool>(
                     external_player_infosets,
                     lazy,
                     discounts,
+                    reach,
                     key,
                 )
             }
@@ -259,6 +265,7 @@ pub(crate) fn solve_external_single(
             &player_two,
             &lazy,
             &discounts,
+            1.0,
             SampleKey::new(seed, it, 0),
         );
         recurse_lazy::<false>(
@@ -268,6 +275,7 @@ pub(crate) fn solve_external_single(
             &player_one,
             &lazy,
             &discounts,
+            1.0,
             SampleKey::new(seed, it, 1),
         );
         lazy.cum_log_pos += lazy.log_pos_step;
@@ -310,26 +318,40 @@ mod tests {
 
     mod eager {
         use super::super::CachedInfoset;
-        use super::super::data::{Discounts, SampledChance, SampleKey, should_check, SolveInfo};
+        use super::super::data::{Discounts, RegretInfoset, SampledChance, SampleKey, should_check, SolveInfo};
         use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
         use std::cell::RefCell;
 
         impl CachedInfoset {
-            /// Accumulate this iteration's counterfactual regret over the active player's actions (eager)
-            fn recurse_active(&mut self, player: &Player, rec: impl Fn(&Node) -> f64) -> f64 {
+            /// Accumulate this iteration's counterfactual regret and average strategy (eager)
+            ///
+            /// `reach` is the active player's own reach probability to this infoset (the product of their
+            /// action probabilities along the path). The average strategy accumulates this player's own
+            /// strategy weighted by `reach`, so every write lands on this player's (disjoint) infosets -- the
+            /// opponent's infosets are only read to sample, never written, which is what lets a fork over the
+            /// active player's actions run without synchronization.
+            fn recurse_active(&mut self, player: &Player, reach: f64, rec: impl Fn(&Node, f64) -> f64) -> f64 {
+                let RegretInfoset {
+                    strat,
+                    cum_regret,
+                    cum_strat,
+                } = &mut self.reg;
                 let mut expected = 0.0;
-                for ((next, prob), cum_reg) in player
+                for (((next, prob), cum_reg), cum_str) in player
                     .actions
                     .iter()
-                    .zip(self.reg.strat.iter())
-                    .zip(self.reg.cum_regret.iter_mut())
+                    .zip(strat.iter())
+                    .zip(cum_regret.iter_mut())
+                    .zip(cum_strat.iter_mut())
                 {
-                    let util = rec(next);
-                    expected += f64::from(*prob) * util;
+                    let prob = f64::from(*prob);
+                    let util = rec(next, reach * prob);
+                    expected += prob * util;
                     *cum_reg += util as f32;
+                    *cum_str += prob * reach;
                 }
                 // account for only adding utility to cum_regret
-                for cum_reg in &mut self.reg.cum_regret {
+                for cum_reg in cum_regret.iter_mut() {
                     *cum_reg -= expected as f32;
                 }
                 expected
@@ -341,13 +363,6 @@ mod tests {
                 discounts.discount_average_strat(&mut self.reg.cum_strat);
                 bound
             }
-
-            /// Add the current strategy into the average (eager)
-            fn update_cum_strat(&mut self) {
-                for (val, cum) in self.reg.strat.iter().zip(self.reg.cum_strat.iter_mut()) {
-                    *cum += f64::from(*val);
-                }
-            }
         }
 
         fn recurse_regret<const FIRST: bool>(
@@ -355,6 +370,7 @@ mod tests {
             chance_infosets: &[SampledChance],
             active_player_infosets: &[RefCell<CachedInfoset>],
             external_player_infosets: &[RefCell<CachedInfoset>],
+            reach: f64,
             key: SampleKey,
         ) -> f64 {
             match node {
@@ -373,6 +389,7 @@ mod tests {
                         chance_infosets,
                         active_player_infosets,
                         external_player_infosets,
+                        reach,
                         key,
                     )
                 }
@@ -380,19 +397,21 @@ mod tests {
                     (PlayerNum::One, true) | (PlayerNum::Two, false) => active_player_infosets
                         [player.infoset]
                         .borrow_mut()
-                        .recurse_active(player, |next| {
+                        .recurse_active(player, reach, |next, child_reach| {
                             recurse_regret::<FIRST>(
                                 next,
                                 chance_infosets,
                                 active_player_infosets,
                                 external_player_infosets,
+                                child_reach,
                                 key,
                             )
                         }),
+                    // the opponent is only sampled here -- their average strategy is accumulated during
+                    // their own sweep, so the active player's reach carries through unchanged
                     (PlayerNum::One, false) | (PlayerNum::Two, true) => {
                         let next = {
-                            let mut info = external_player_infosets[player.infoset].borrow_mut();
-                            info.update_cum_strat();
+                            let info = external_player_infosets[player.infoset].borrow();
                             &player.actions[info.sample(key, player.infoset as u32)]
                         };
                         recurse_regret::<FIRST>(
@@ -400,6 +419,7 @@ mod tests {
                             chance_infosets,
                             active_player_infosets,
                             external_player_infosets,
+                            reach,
                             key,
                         )
                     }
@@ -457,28 +477,28 @@ mod tests {
             let [mut reg_one, mut reg_two] = [f64::INFINITY; 2];
             for it in 1..=max_iter {
                 let check = should_check(it, max_iter, check_interval);
-                // player one (the two sweeps sample independently via distinct sweep ids in the key)
+                // each player accumulates its own regret and average strategy during its own sweep, then
+                // advances; the two sweeps sample independently via distinct sweep ids in the key
                 recurse_regret::<true>(
                     start,
                     &chance_infosets,
                     &player_one,
                     &player_two,
+                    1.0,
                     SampleKey::new(seed, it, 0),
                 );
-                // the leading player has nothing accumulated on its first average-strat discount, so it
-                // discounts against `it - 1`
-                let discounts_one = Discounts::new(params, it, it - 1);
-                reg_one = advance_player(&mut player_one, &discounts_one, check);
+                let discounts = Discounts::new(params, it, it);
+                reg_one = advance_player(&mut player_one, &discounts, check);
                 // player two
                 recurse_regret::<false>(
                     start,
                     &chance_infosets,
                     &player_two,
                     &player_one,
+                    1.0,
                     SampleKey::new(seed, it, 1),
                 );
-                let discounts_two = Discounts::new(params, it, it);
-                reg_two = advance_player(&mut player_two, &discounts_two, check);
+                reg_two = advance_player(&mut player_two, &discounts, check);
                 // check to terminate
                 if check && f64::max(reg_one, reg_two) < max_reg {
                     break;
