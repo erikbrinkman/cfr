@@ -705,7 +705,8 @@ impl<I, A> Game<I, A> {
         params: SolveParams,
     ) -> Result<(Strategies<'_, I, A>, RegretBound), SolveError> {
         let [first_player, second_player] = &self.player_infosets;
-        // multi-threaded solving has been removed; every method runs single-threaded for now
+        // NOTE multi-threaded solving is being reworked (within-iteration fork-join for external
+        // sampling); for now every method runs single threaded and `num_threads` is ignored
         let _ = num_threads;
         let SolveParams {
             regret,

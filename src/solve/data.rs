@@ -1,9 +1,8 @@
 //! Common data structures for solving games
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 use logaddexp::LogAddExp;
 use rand::rng;
 use rand_distr::{weighted::WeightedAliasIndex, Distribution};
-use std::slice;
 
 /// A chance information set for cached sampling
 #[derive(Debug)]
@@ -41,11 +40,16 @@ impl SampledChance {
 }
 
 /// A player infoset for doing regret matching and tracking regret
+///
+/// Cumulative regret and the current strategy are stored as `f32` to halve their memory footprint
+/// and let the inner loops pack more lanes; sums over them use `f64` accumulators. The average
+/// strategy accumulator stays `f64` because it grows large (the discount weighting can be `tᵞ`) and
+/// is summed over every iteration.
 #[derive(Debug)]
 pub struct RegretInfoset {
-    pub cum_regret: Box<[f64]>,
+    pub cum_regret: Box<[f32]>,
     pub cum_strat: Box<[f64]>,
-    pub strat: Box<[f64]>,
+    pub strat: Box<[f32]>,
 }
 
 impl RegretInfoset {
@@ -54,7 +58,7 @@ impl RegretInfoset {
         RegretInfoset {
             cum_regret: vec![0.0; num_actions].into_boxed_slice(),
             cum_strat: vec![0.0; num_actions].into_boxed_slice(),
-            strat: vec![1.0 / num_actions as f64; num_actions].into_boxed_slice(),
+            strat: vec![1.0 / num_actions as f32; num_actions].into_boxed_slice(),
         }
     }
 
@@ -126,31 +130,6 @@ pub struct RegretParams {
     /// playing the strategy with the highest regret. Zero is equivalent to playing each action
     /// uniformly. No other values are recommend, but interpolate between those extremes.
     pub no_positive: f64,
-}
-
-/// Trait for `&mut [f64]` or `&mut [f64; N]`
-///
-/// This is mut because we have mut in all instances.
-pub(super) trait IntoFloatsMut<'a> {
-    type Floats: Iterator<Item = &'a mut f64>;
-
-    fn into_floats_mut(self) -> Self::Floats;
-}
-
-impl<'a> IntoFloatsMut<'a> for &'a mut [f64] {
-    type Floats = slice::IterMut<'a, f64>;
-
-    fn into_floats_mut(self) -> Self::Floats {
-        self.iter_mut()
-    }
-}
-
-impl<'a, const N: usize> IntoFloatsMut<'a> for &'a mut [f64; N] {
-    type Floats = slice::IterMut<'a, f64>;
-
-    fn into_floats_mut(self) -> Self::Floats {
-        self.iter_mut()
-    }
 }
 
 impl RegretParams {
@@ -256,33 +235,35 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn regret_match<R: ?Sized>(&self, cum_reg: &mut R, strat: &mut [f64])
-    where
-        for<'a> &'a mut R: IntoFloatsMut<'a>,
+    pub(super) fn regret_match(&self, cum_reg: &mut [f32], strat: &mut [f32])
     {
-        debug_assert_eq!(cum_reg.into_floats_mut().count(), strat.len());
+        debug_assert_eq!(cum_reg.len(), strat.len());
         let norm: f64 = cum_reg
-            .into_floats_mut()
-            .map(|&mut v| v)
-            .filter(|v| v > &0.0)
+            .iter_mut()
+            .map(|&mut v| f64::from(v))
+            .filter(|v| *v > 0.0)
             .sum();
         if norm > 0.0 {
-            for (&mut reg, val) in cum_reg.into_floats_mut().zip(strat.iter_mut()) {
-                *val = if reg > 0.0 { reg / norm } else { 0.0 }
+            for (&mut reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
+                *val = if reg > 0.0 {
+                    (f64::from(reg) / norm) as f32
+                } else {
+                    0.0
+                }
             }
         } else if self.no_positive == f64::INFINITY {
             let (ind, _) = cum_reg
-                .into_floats_mut()
+                .iter_mut()
                 .enumerate()
                 .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap())
                 .unwrap();
             strat.fill(0.0);
             strat[ind] = 1.0;
         } else if self.no_positive == 0.0 {
-            strat.fill(1.0 / strat.len() as f64);
+            strat.fill(1.0 / strat.len() as f32);
         } else if self.no_positive == f64::NEG_INFINITY {
             let (ind, _) = cum_reg
-                .into_floats_mut()
+                .iter_mut()
                 .enumerate()
                 .min_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap())
                 .unwrap();
@@ -290,16 +271,16 @@ impl RegretParams {
             strat[ind] = 1.0;
         } else {
             let max = cum_reg
-                .into_floats_mut()
-                .map(|&mut v| v)
+                .iter_mut()
+                .map(|&mut v| f64::from(v))
                 .reduce(f64::max)
                 .unwrap();
             let norm: f64 = cum_reg
-                .into_floats_mut()
-                .map(|&mut reg| ((reg - max) * self.no_positive).exp())
+                .iter_mut()
+                .map(|&mut reg| ((f64::from(reg) - max) * self.no_positive).exp())
                 .sum();
-            for (&mut reg, val) in cum_reg.into_floats_mut().zip(strat.iter_mut()) {
-                *val = ((reg - max) * self.no_positive).exp() / norm;
+            for (&mut reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
+                *val = (((f64::from(reg) - max) * self.no_positive).exp() / norm) as f32;
             }
         }
     }
@@ -384,20 +365,22 @@ impl<'a> Discounts<'a> {
     /// strategy, applies the discount, and tracks the running maximum used for the bound. The rare
     /// all-non-positive case (where the strategy is chosen by the `no_positive` policy rather than
     /// proportionally to regret) falls back to the standalone primitives.
-    pub(super) fn advance_infoset<R: ?Sized>(&self, cum_reg: &mut R, strat: &mut [f64]) -> f64
-    where
-        for<'b> &'b mut R: IntoFloatsMut<'b>,
+    pub(super) fn advance_infoset(&self, cum_reg: &mut [f32], strat: &mut [f32]) -> f64
     {
         let positive_norm: f64 = cum_reg
-            .into_floats_mut()
-            .map(|&mut v| v)
+            .iter_mut()
+            .map(|&mut v| f64::from(v))
             .filter(|v| *v > 0.0)
             .sum();
         if positive_norm > 0.0 {
             let mut max = f64::NEG_INFINITY;
-            for (reg, val) in cum_reg.into_floats_mut().zip(strat.iter_mut()) {
-                let cur = *reg;
-                *val = if cur > 0.0 { cur / positive_norm } else { 0.0 };
+            for (reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
+                let cur = f64::from(*reg);
+                *val = if cur > 0.0 {
+                    (cur / positive_norm) as f32
+                } else {
+                    0.0
+                };
                 let discounted = if cur > 0.0 {
                     cur * self.pos
                 } else if cur < 0.0 {
@@ -405,8 +388,9 @@ impl<'a> Discounts<'a> {
                 } else {
                     cur
                 };
-                *reg = discounted;
-                max = f64::max(max, discounted);
+                *reg = discounted as f32;
+                // read back the stored f32 so the bound matches the standalone primitives exactly
+                max = f64::max(max, f64::from(*reg));
             }
             2.0 * f64::max(max, 0.0) / self.it as f64
         } else {
@@ -417,15 +401,13 @@ impl<'a> Discounts<'a> {
     }
 
     /// Discount cumulative regret with the precomputed factors
-    pub(super) fn discount_cum_regret<R: ?Sized>(&self, cum_reg: &mut R)
-    where
-        for<'b> &'b mut R: IntoFloatsMut<'b>,
+    pub(super) fn discount_cum_regret(&self, cum_reg: &mut [f32])
     {
-        for reg in cum_reg.into_floats_mut() {
+        for reg in cum_reg.iter_mut() {
             if *reg > 0.0 {
-                *reg *= self.pos;
+                *reg = (f64::from(*reg) * self.pos) as f32;
             } else if *reg < 0.0 {
-                *reg *= self.neg;
+                *reg = (f64::from(*reg) * self.neg) as f32;
             }
         }
     }
@@ -444,14 +426,12 @@ impl<'a> Discounts<'a> {
     }
 
     /// The regret bound contributed by an infoset given its cumulative regret
-    pub(super) fn regret_bound<R: ?Sized>(&self, cum_reg: &mut R) -> f64
-    where
-        for<'b> &'b mut R: IntoFloatsMut<'b>,
+    pub(super) fn regret_bound(&self, cum_reg: &mut [f32]) -> f64
     {
         2.0 * f64::max(
             cum_reg
-                .into_floats_mut()
-                .map(|&mut r| r)
+                .iter_mut()
+                .map(|&mut r| f64::from(r))
                 .reduce(f64::max)
                 .unwrap_or(0.0),
             0.0,

@@ -4,11 +4,11 @@ use rand::{Rng, RngExt};
 #[derive(Debug)]
 pub struct Multinomial<'a> {
     // We store all be the last, since that should sum to one
-    init_probs: &'a [f64],
+    init_probs: &'a [f32],
 }
 
 impl<'a> Multinomial<'a> {
-    pub fn new(probs: &'a [f64]) -> Self {
+    pub fn new(probs: &'a [f32]) -> Self {
         Multinomial {
             init_probs: &probs[..probs.len() - 1],
         }
@@ -20,7 +20,7 @@ impl Distribution<usize> for Multinomial<'_> {
     where
         R: Rng + ?Sized,
     {
-        let mut remaining: f64 = rnd.random();
+        let mut remaining: f32 = rnd.random();
         let mut res = 0;
         for val in self.init_probs {
             if val < &remaining {

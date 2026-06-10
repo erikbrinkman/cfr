@@ -1,5 +1,5 @@
 //! Vanilla and sampled cfr implementations
-#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 use super::data;
 use super::data::{Discounts, RegretInfoset, RegretParams, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum};
@@ -9,7 +9,7 @@ use std::slice;
 
 type ChanceIter<'a, 'b> = Zip<slice::Iter<'a, f64>, slice::Iter<'b, Node>>;
 
-trait ChanceRecurse {
+trait ChanceRecurse: Send {
     fn next_nodes<'a>(&self, chance: &'a Chance) -> ChanceIter<'_, 'a>;
 
     fn advance(&mut self);
@@ -46,12 +46,12 @@ trait PlayerRecurse {
 impl PlayerRecurse for RegretInfoset {
     fn update_cum_strat(&mut self, prob: f64) {
         for (val, cum) in self.strat.iter().zip(self.cum_strat.iter_mut()) {
-            *cum += prob * val;
+            *cum += prob * f64::from(*val);
         }
     }
 
     fn advance(&mut self, discounts: &Discounts) -> f64 {
-        let bound = discounts.advance_infoset(&mut *self.cum_regret, &mut self.strat);
+        let bound = discounts.advance_infoset(&mut self.cum_regret, &mut self.strat);
         discounts.discount_average_strat(&mut self.cum_strat);
         bound
     }
@@ -98,29 +98,19 @@ fn recurse_single(
                 },
             );
             for val in &mut info.cum_regret {
-                *val -= sub;
+                *val -= sub as f32;
             }
             res
         }
     }
 }
 
-trait Add {
-    fn add(self, other: f64);
-}
-
-impl Add for &mut f64 {
-    fn add(self, other: f64) {
-        *self += other;
-    }
-}
-
-fn recurse_player(
+fn recurse_player<'a>(
     player: &Player,
     p_chance: f64,
     p_player: [f64; 2],
-    strat: &[f64],
-    cum_regret: impl IntoIterator<Item = impl Add>,
+    strat: &[f32],
+    cum_regret: impl IntoIterator<Item = &'a mut f32>,
     rec: impl Fn(&Node, [f64; 2]) -> f64,
 ) -> (f64, f64) {
     let mult = match (player.num, p_player) {
@@ -136,13 +126,14 @@ fn recurse_player(
         .zip(strat.iter())
         .zip(cum_regret)
     {
+        let prob = f64::from(*prob);
         let mut p_next = p_player;
         *player.num.ind_mut(&mut p_next) *= prob;
         let util_one = rec(next, p_next);
         let util = util_one * mult;
         expected_one += prob * util_one;
         expected += util * prob;
-        cum_reg.add(util);
+        *cum_reg += util as f32;
     }
     (expected_one, expected)
 }
@@ -225,7 +216,6 @@ pub(crate) fn solve_full_single(
         check_interval,
     )
 }
-
 pub(crate) fn solve_sampled_single(
     start: &Node,
     chance_info: &[impl ChanceInfoset],
@@ -255,7 +245,6 @@ pub(crate) fn solve_sampled_single(
         check_interval,
     )
 }
-
 #[cfg(test)]
 mod tests {
     use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams};
@@ -341,4 +330,5 @@ mod tests {
         assert!(reg_one < 0.05);
         assert!(reg_two < 0.05);
     }
+
 }
