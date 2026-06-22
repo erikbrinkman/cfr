@@ -78,8 +78,10 @@ use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::iter::{self, FusedIterator, Once, Zip};
+use std::num::NonZeroUsize;
 use std::ptr;
 use std::slice;
+use std::thread;
 
 /// An enum indicating a player
 ///
@@ -108,6 +110,12 @@ impl PlayerNum {
             (PlayerNum::One, [first, _]) => first,
             (PlayerNum::Two, [_, second]) => second,
         }
+    }
+
+    /// Return `arr` with this player's entry replaced by `value`, leaving the other player's alone.
+    fn replace<T>(self, mut arr: [T; 2], value: T) -> [T; 2] {
+        *self.ind_mut(&mut arr) = value;
+        arr
     }
 }
 
@@ -341,11 +349,11 @@ impl ChanceInfosetData {
 #[derive(Debug)]
 struct PlayerInfosetBuilder<A> {
     actions: Box<[A]>,
-    prev_infoset: Option<usize>,
+    prev_infoset: Option<(usize, usize)>,
 }
 
 impl<A> PlayerInfosetBuilder<A> {
-    fn new(actions: impl Into<Box<[A]>>, prev_infoset: Option<usize>) -> Self {
+    fn new(actions: impl Into<Box<[A]>>, prev_infoset: Option<(usize, usize)>) -> Self {
         PlayerInfosetBuilder {
             actions: actions.into(),
             prev_infoset,
@@ -357,7 +365,8 @@ impl<A> PlayerInfosetBuilder<A> {
 struct PlayerInfosetData<I, A> {
     infoset: I,
     actions: Box<[A]>,
-    prev_infoset: Option<usize>,
+    /// (infoset, action)
+    prev_infoset: Option<(usize, usize)>,
 }
 
 impl<I, A> PlayerInfosetData<I, A> {
@@ -387,7 +396,7 @@ impl<I, A> PlayerInfoset for PlayerInfosetData<I, A> {
     }
 
     fn prev_infoset(&self) -> Option<usize> {
-        self.prev_infoset
+        self.prev_infoset.map(|(infoset, _action)| infoset)
     }
 }
 
@@ -432,8 +441,8 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
     /// # Errors
     ///
     /// Returns a [`GameError`] if the input tree is malformed: empty, contains non-zero-sum
-    /// payoffs, has inconsistent infoset action sets, violates perfect recall, or contains
-    /// invalid chance probabilities.
+    /// payoffs, has inconsistent infoset action sets, violates perfect recall, contains invalid
+    /// chance probabilities, or has more infosets than fit in a `u32`.
     pub fn from_root<T>(root: T) -> Result<Self, GameError>
     where
         T: IntoGameNode<PlayerInfo = I, Action = A>,
@@ -451,14 +460,22 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
             root,
             [None; 2],
         )?;
+        let chance_infosets: Box<[_]> = chance_infosets.into_iter().map(|(_, v)| v).collect();
+        let player_infosets = player_infosets.map(|pinfo| {
+            pinfo
+                .into_iter()
+                .map(|(infoset, builder)| PlayerInfosetData::new(infoset, builder))
+                .collect::<Box<[_]>>()
+        });
+        // the solver keys its sampler on u32 infoset ids (see `key.rng(infoset as u32)`), so every
+        // infoset index has to fit in a u32
+        let fits_u32 = |len: usize| u32::try_from(len).is_ok();
+        if !fits_u32(chance_infosets.len()) || !player_infosets.iter().all(|pinfo| fits_u32(pinfo.len())) {
+            return Err(GameError::TooManyInfosets);
+        }
         Ok(Game {
-            chance_infosets: chance_infosets.into_iter().map(|(_, v)| v).collect(),
-            player_infosets: player_infosets.map(|pinfo| {
-                pinfo
-                    .into_iter()
-                    .map(|(infoset, builder)| PlayerInfosetData::new(infoset, builder))
-                    .collect()
-            }),
+            chance_infosets,
+            player_infosets,
             single_infosets: single_infosets.map(|sinfo| sinfo.into_iter().collect()),
             root,
         })
@@ -470,7 +487,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
         player_infosets: &mut [&mut Builder<I, PlayerInfosetBuilder<A>>; 2],
         single_infosets: &mut [&mut HashMap<I, A>; 2],
         node: T,
-        mut prev_infosets: [Option<usize>; 2],
+        prev_infosets: [Option<(usize, usize)>; 2],
     ) -> Result<Node, GameError>
     where
         T: IntoGameNode<PlayerInfo = I, Action = A>,
@@ -576,16 +593,20 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                                 }
                             }
                         }?;
-                        *player_num.ind_mut(&mut prev_infosets) = Some(info_ind);
                         let next_verts: Result<Box<[_]>, _> = nexts
                             .into_iter()
-                            .map(|next| {
+                            .enumerate()
+                            .map(|(action_ind, next)| {
+                                // record the action taken, so a later node sharing this infoset
+                                // must also share the action (else imperfect recall)
+                                let next_prev =
+                                    player_num.replace(prev_infosets, Some((info_ind, action_ind)));
                                 Game::init_recurse(
                                     chance_infosets,
                                     player_infosets,
                                     single_infosets,
                                     next,
-                                    prev_infosets,
+                                    next_prev,
                                 )
                             })
                             .collect();
@@ -656,6 +677,10 @@ pub struct SolveParams {
     /// to draw independent sampled runs. Only the sampled methods ([`SolveMethod::Sampled`],
     /// [`SolveMethod::External`]) consult it.
     pub seed: u64,
+    /// How many active-player decision levels the parallel external solver forks over before each
+    /// subtree runs serially; higher fills the pool with more tasks. Performance only, never the
+    /// result, and consulted only by [`SolveMethod::External`] with `num_threads > 1`.
+    pub fork_depth: u32,
 }
 
 impl Default for SolveParams {
@@ -664,6 +689,7 @@ impl Default for SolveParams {
             regret: RegretParams::default(),
             check_interval: 256,
             seed: 0,
+            fork_depth: 3,
         }
     }
 }
@@ -685,17 +711,17 @@ impl<I, A> Game<I, A> {
     ///   than this value. With this current implementation this is only valid when the method is
     ///   [Full][SolveMethod::Full] and the params are [vanilla][RegretParams::vanilla]. If using
     ///   other parameters, this should be set lower than the desired regret.
-    /// - `num_threads` - The number of threads to use for solving. Zero selects based off of
+    /// - `num_threads` - The number of threads the external solver uses. Zero selects based off of
     ///   [`thread::available_parallelism`]. One uses a single threaded variant that's more efficient
-    ///   when not in a threaded environment. Every method runs single threaded, so this
-    ///   argument is accepted but ignored.
+    ///   when not in a threaded environment. The full-tree and outcome-sampled methods always run
+    ///   single threaded and ignore this argument.
     /// - `params` - Solver parameters bundled in a [`SolveParams`]: the [`RegretParams`] discount
     ///   style, how often the regret bound is checked, and the sampler seed. Use
     ///   [`SolveParams::default`] for sensible defaults.
     ///
     /// # Errors
     ///
-    /// Never returns an error; every method runs single threaded.
+    /// If a multi-threaded external solve is requested and the thread pool fails to build.
     pub fn solve(
         &self,
         method: SolveMethod,
@@ -705,8 +731,6 @@ impl<I, A> Game<I, A> {
         params: SolveParams,
     ) -> Result<(Strategies<'_, I, A>, RegretBound), SolveError> {
         let [first_player, second_player] = &self.player_infosets;
-        // every method runs single threaded; num_threads is unused
-        let _ = num_threads;
         let (regrets, probs) = match method {
             SolveMethod::Full => vanilla::solve_full_single(
                 &self.root,
@@ -724,14 +748,22 @@ impl<I, A> Game<I, A> {
                 max_reg,
                 &params,
             ),
-            SolveMethod::External => external::solve_external_single(
-                &self.root,
-                &self.chance_infosets,
-                [first_player, second_player],
-                max_iter,
-                max_reg,
-                &params,
-            ),
+            SolveMethod::External => {
+                let threads = if num_threads == 0 {
+                    thread::available_parallelism().map_or(1, NonZeroUsize::get)
+                } else {
+                    num_threads
+                };
+                external::solve_external_single(
+                    &self.root,
+                    &self.chance_infosets,
+                    [first_player, second_player],
+                    max_iter,
+                    max_reg,
+                    &params,
+                    threads,
+                )?
+            }
         };
         Ok((Strategies { game: self, probs }, RegretBound::new(regrets)))
     }
