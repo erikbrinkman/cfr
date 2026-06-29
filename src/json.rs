@@ -1,128 +1,149 @@
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum};
+use cfr::{Game, Moves, NodeType, Outcomes, PlayerNum};
+use indexmap::IndexMap;
 use serde::Deserialize;
-use serde_json::Error;
-use std::collections::{btree_map, BTreeMap};
-use std::io::Read;
-use std::iter::FusedIterator;
-// NOTE we use BTree map to easily gain consistent ordering which is necessary for cfr
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum State {
+pub(crate) enum State {
     Terminal(f64),
     Chance {
         infoset: Option<String>,
-        outcomes: BTreeMap<String, Outcome>,
+        outcomes: IndexMap<String, Outcome>,
     },
     Player {
         player_one: bool,
         infoset: String,
-        actions: BTreeMap<String, State>,
+        actions: IndexMap<String, State>,
     },
 }
 
 #[derive(Debug, Deserialize)]
-struct Outcome {
+pub(crate) struct Outcome {
     prob: f64,
     state: State,
 }
 
-type ActionIter = BTreeMap<String, State>;
+// A `&State` is the game directly -- it's a cheap handle into the parsed tree, so no wrapper type is
+// needed; child states are just borrows.
+impl<'a> Game for &'a State {
+    type Action = &'a str;
+    type Infoset = &'a str;
+    type ChanceInfoset = &'a str;
+    type Chance = &'a IndexMap<String, Outcome>;
+    type Player = &'a IndexMap<String, State>;
 
-#[derive(Debug)]
-struct OutcomeIter(btree_map::IntoIter<String, Outcome>);
-
-impl OutcomeIter {
-    fn new(map: BTreeMap<String, Outcome>) -> Self {
-        OutcomeIter(map.into_iter())
-    }
-}
-
-impl Iterator for OutcomeIter {
-    type Item = (f64, State);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|(_, out)| (out.prob, out.state))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.0.len();
-        (len, Some(len))
-    }
-}
-
-impl FusedIterator for OutcomeIter {}
-
-impl ExactSizeIterator for OutcomeIter {}
-
-impl IntoGameNode for State {
-    type PlayerInfo = String;
-    type Action = String;
-    type ChanceInfo = String;
-    type Outcomes = OutcomeIter;
-    type Actions = ActionIter;
-
-    fn into_game_node(self) -> GameNode<Self> {
+    fn into_node(self) -> NodeType<Self> {
         match self {
-            State::Terminal(player_one_payoff) => GameNode::Terminal(player_one_payoff),
-            State::Chance { infoset, outcomes } => {
-                GameNode::Chance(infoset, OutcomeIter::new(outcomes))
-            }
+            State::Terminal(payoff) => NodeType::Terminal(*payoff),
+            // a named infoset correlates sampling across chance nodes; `None` is a unique node
+            State::Chance { infoset, outcomes } => NodeType::Chance(infoset.as_deref(), outcomes),
             State::Player {
                 player_one,
                 infoset,
                 actions,
-            } => GameNode::Player(
-                if player_one {
+            } => NodeType::Player(
+                if *player_one {
                     PlayerNum::One
                 } else {
                     PlayerNum::Two
                 },
-                infoset,
+                infoset.as_str(),
                 actions,
             ),
         }
     }
 }
 
-pub fn from_str(raw: &str) -> Result<(Game<String, String>, f64), Error> {
-    let definition: State = serde_json::from_str(raw)?;
-    Ok(from_state(definition))
+impl<'a> Outcomes<&'a State> for &'a IndexMap<String, Outcome> {
+    fn len(&self) -> usize {
+        IndexMap::len(self)
+    }
+
+    fn get(&self, index: usize) -> (f64, &'a State) {
+        let (_, outcome) = self.get_index(index).unwrap();
+        (outcome.prob, &outcome.state)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (f64, &'a State)> + '_ {
+        self.values().map(|outcome| (outcome.prob, &outcome.state))
+    }
 }
 
-pub fn from_reader(reader: &mut impl Read) -> (Game<String, String>, f64) {
-    let definition = serde_json::from_reader(reader).expect(
-        "couldn't parse json game definition : https://github.com/erikbrinkman/cfr#json-error",
-    );
-    from_state(definition)
-}
+impl<'a> Moves<&'a State> for &'a IndexMap<String, State> {
+    fn len(&self) -> usize {
+        IndexMap::len(self)
+    }
 
-fn from_state(definition: State) -> (Game<String, String>, f64) {
-    (Game::from_root(definition).expect("couldn't extract a compact game representation due to problems with the structure : https://github.com/erikbrinkman/cfr#game-error"), 0.0)
+    fn action(&self, index: usize) -> &'a str {
+        self.get_index(index).unwrap().0.as_str()
+    }
+
+    fn apply(&self, index: usize) -> &'a State {
+        self.get_index(index).unwrap().1
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&'a str, &'a State)> + '_ {
+        self.keys()
+            .zip(self.values())
+            .map(|(action, state)| (action.as_str(), state))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use cfr::{GameTree, PlayerNum, SolveMethod, SolveParams};
+
     #[test]
-    fn test_success() {
-        super::from_reader(&mut r#"{ "terminal": 0.0 }"#.as_bytes());
+    fn parses_terminal() {
+        let state: super::State = serde_json::from_str(r#"{ "terminal": 0.0 }"#).unwrap();
+        GameTree::from_game(&state).unwrap();
     }
 
     #[test]
-    #[should_panic(expected = "couldn't parse json game definition")]
-    fn test_json_error() {
-        super::from_reader(
-            &mut r#"{ "chance": { "outcomes": { "a": { "terminal": 0.0 } } } }"#.as_bytes(),
-        );
+    fn solves_matching_pennies() {
+        // player one picks a side, player two responds from a single shared infoset (so it can't see
+        // the choice); matching pays player one. The equilibrium is 50/50 for both, value 0. This
+        // checks the rewritten Game pipeline builds a correct game, not just that errors error.
+        let state: super::State = serde_json::from_str(
+            r#"{ "player": { "player_one": true, "infoset": "p1", "actions": {
+                "heads": { "player": { "player_one": false, "infoset": "p2", "actions": {
+                    "heads": { "terminal": 1.0 }, "tails": { "terminal": -1.0 } } } },
+                "tails": { "player": { "player_one": false, "infoset": "p2", "actions": {
+                    "heads": { "terminal": -1.0 }, "tails": { "terminal": 1.0 } } } } } } }"#,
+        )
+        .unwrap();
+        let game = GameTree::from_game(&state).unwrap();
+        let (strats, bound) = game
+            .solve(SolveMethod::Full, 50_000, 0.0, 1, SolveParams::default())
+            .unwrap();
+        for player in [PlayerNum::One, PlayerNum::Two] {
+            assert!(
+                bound.player_regret_bound(player) < 0.02,
+                "player {player:?} not converged"
+            );
+        }
+        for named in strats.as_named() {
+            for (_infoset, actions) in named {
+                for (_action, prob) in actions {
+                    assert!((prob - 0.5).abs() < 0.05, "not ~50/50: {prob}");
+                }
+            }
+        }
     }
 
     #[test]
-    #[should_panic(
-        expected = "couldn't extract a compact game representation due to problems with the structure"
-    )]
-    fn test_game_error() {
-        super::from_reader(
-            &mut r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#.as_bytes(),
-        );
+    fn rejects_malformed_json() {
+        let parsed: Result<super::State, _> =
+            serde_json::from_str(r#"{ "chance": { "outcomes": { "a": { "terminal": 0.0 } } } }"#);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_game() {
+        let state: super::State = serde_json::from_str(
+            r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#,
+        )
+        .unwrap();
+        assert!(GameTree::from_game(&state).is_err());
     }
 }

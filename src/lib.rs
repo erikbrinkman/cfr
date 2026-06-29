@@ -7,34 +7,44 @@
 //! To use the command line tool, see [documentation on
 //! github](https://github.com/erikbrinkman/cfr#binary), or use `cfr --help`.
 //!
-//! To use this as a rust library, define the [`IntoGameNode`] trait for the representation of your
-//! [extensive form game](https://en.wikipedia.org/wiki/Extensive-form_game). See the trait for
-//! details and contracts of implementation. The use of [`IntoIterator`] allows this conversion to be
-//! zero-copy for expensive types, e.g. long history information sets. Once this trait is defined,
-//! create an efficient representation of the [Game] with [`from_root`][Game::from_root]. Compute an
-//! approximate equilibrium with [`Game::solve`]. You can then get equilibrium utilities and regret
+//! To use this as a rust library, implement the [`Game`] trait for your
+//! [extensive form game](https://en.wikipedia.org/wiki/Extensive-form_game) -- a state machine that
+//! classifies each state as terminal, chance, or player and yields its child states by index. See
+//! the trait for the contracts of implementation, and the `kuhn_poker` example for a full game.
+//! To solve, build a [`GameTree`] from the game with [`GameTree::from_game`] and call
+//! [`GameTree::solve`] (exact, with regret bounds). You can get equilibrium utilities and regret
 //! from [`Strategies::get_info`].
 //!
 //! # Examples
 //!
-//! Once the conversion trait, [`IntoGameNode`], is defined for your game, you solve for equilibria
-//! like:
+//! Once [`Game`] is implemented for your game, you solve for equilibria like:
 //!
 //! ```
-//! # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, SolveParams};
-//! # struct ExData {}
-//! impl IntoGameNode for ExData {
-//! # type PlayerInfo = ();
-//! # type ChanceInfo = ();
-//! # type Action = ();
-//! # type Actions = Vec<((), ExData)>;
-//! # type Outcomes = Vec<(f64, ExData)>;
-//! # fn into_game_node(self) -> GameNode<Self> { GameNode::Terminal(0.0) }
+//! # use cfr::{Game, Moves, NodeType, PlayerNum, SolveMethod, SolveParams, GameTree};
+//! # use std::convert::Infallible;
+//! # #[derive(Clone, Copy)]
+//! # enum MyGame { Start, End(f64) }
+//! impl Game for MyGame {
+//! #     type Action = bool;
+//! #     type Infoset = ();
+//! #     type ChanceInfoset = Infallible; // no chance nodes
+//! #     type Chance = Infallible;
+//! #     type Player = MyGame;
+//! #     fn into_node(self) -> NodeType<Self> {
+//! #         match self {
+//! #             MyGame::Start => NodeType::Player(PlayerNum::One, (), MyGame::Start),
+//! #             MyGame::End(payoff) => NodeType::Terminal(payoff),
+//! #         }
+//! #     }
 //!     // ...
 //! }
-//! let data: ExData = // ...
-//! # ExData {};
-//! let game = Game::from_root(data).unwrap();
+//! # impl Moves<MyGame> for MyGame {
+//! #     fn len(&self) -> usize { 2 }
+//! #     fn apply(&self, index: usize) -> MyGame { MyGame::End(if index == 0 { 1.0 } else { -1.0 }) }
+//! #     fn action(&self, index: usize) -> bool { index == 0 }
+//! # }
+//! // small game: materialize the tree and solve it exactly
+//! let game = GameTree::from_game(MyGame::Start).unwrap();
 //! let (strats, reg_bounds) = game.solve(
 //!     SolveMethod::External,
 //!     100,  // number of iterations
@@ -76,6 +86,7 @@ use split::{split_by, split_by_mut};
 use std::borrow::Borrow;
 use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::hash::Hash;
 use std::iter::{self, FusedIterator, Once, Zip};
 use std::num::NonZeroUsize;
@@ -119,186 +130,87 @@ impl PlayerNum {
     }
 }
 
-/// An intermediary representation of a node in a game tree
+/// Which kind of node a [`Game`] state is, with the data needed to enumerate its children.
 ///
-/// This enum represents a conversion type from custom data to a game node that can be turned
-/// into a full game representation. By implementing [`IntoGameNode`] on a custom tree-like object,
-/// you can specify a lazy conversion into the internal representation of a game, and then perform
-/// the conversion with [`Game::from_root`].
-#[derive(Debug)]
-pub enum GameNode<T: IntoGameNode + ?Sized> {
-    /// A terminal node represents the end of a game
-    ///
-    /// This should contain the payoff to player one. Since games are always zero-sum, the payoff
-    /// to player two is the negative.
+/// Returned by [`Game::into_node`]. Splitting the per-kind data into variants is what keeps the
+/// node-specific operations mutually exclusive: a terminal carries only a payoff, a player node an
+/// infoset, and a chance node an optional sampling key (`None` for a unique, uncorrelated node).
+pub enum NodeType<G: Game> {
+    /// A terminal state, holding the payoff to player one.
     Terminal(f64),
-    /// A chance node selects randomly between several outcomes
-    ///
-    /// # Fields
-    ///
-    /// - The first element of the chance node is an optional infoset, if omitted its assumed this
-    ///   chance node has a unique infoset. Chance nodes with the same infoset must have the same
-    ///   outcome probabilities in the same order. When random sampling, chance nodes with the same
-    ///   infoset will be sampled the same way.
-    /// - The second element should implement [`IntoIterator`] with an `Item` that's a tuple of
-    ///   outcome probabilities, and a type that can be converted into a [`GameNode`]. See
-    ///   [`IntoGameNode::Outcomes`] for more details.
-    Chance(Option<T::ChanceInfo>, T::Outcomes),
-    /// A player node indicates a place where agents make a strategic decision
-    ///
-    /// # Fields
-    ///
-    /// - The first element is which player number this node corresponds to.
-    /// - The second element is the infoset of this node. Nodes with the same infoset must specify
-    ///   the same actions in the same order.
-    /// - The final element should implement [`IntoIterator`] with an `Item` that's a tuple of an
-    ///   action and a type that can be converted into a [`GameNode`]. See [`IntoGameNode::Actions`]
-    ///   for more details.
-    Player(PlayerNum, T::PlayerInfo, T::Actions),
+    /// A chance node: an optional sampling key (`None` is a unique, uncorrelated node) and the
+    /// weighted outcomes.
+    Chance(Option<G::ChanceInfoset>, G::Chance),
+    /// A player decision: the acting player, its infoset, and the legal moves.
+    Player(PlayerNum, G::Infoset, G::Player),
 }
 
-/// A trait that defines how to convert game-tree-like data into a [Game]
+/// A two-player zero-sum game of imperfect information, expressed as a state machine.
 ///
-/// Define this trait on your custom data type to allow zero-copy conversion into the internal game
-/// tree representation to enable game solving. There are five associated types that define how
-/// your game is represented. Here zero-copy means none of the types need to implement [Copy] or
-/// [Clone], but the conversion will still allocate memory for the different branches.
+/// A state classifies itself with [`into_node`][Game::into_node] into a [`NodeType`]; chance and
+/// player nodes hand back a lazy, indexable child sequence ([`Outcomes`] / [`Moves`]), so a solver
+/// samples a child by `usize` index without ever materializing or naming an action. Action labels
+/// ([`Action`][Game::Action]) exist only to import and export named strategies. The solver walks
+/// these on demand while sampling rather than building a tree, so advancing a state should be cheap.
 ///
-/// The trait ultimately resolves to converting each of your tree nodes into a corresponding
-/// [`GameNode`] that contains all the information necessary for the internal game structure.
-///
-/// # Examples
-///
-/// If you're constructing your data from scratch and don't have a custom representation then the
-/// easiest way to structure your data is with a custom singleton wrapper. Any data types that fit
-/// the required bounds should work in this scenario, but note that information sets are defined by
-/// the order of actions, so using a structure without consistent iteration order could cause
-/// exceptions when trying to create a full game.
-///
-/// ```
-/// # use cfr::{GameNode, IntoGameNode, Game, PlayerNum};
-/// struct Node(GameNode<Node>);
-///
-/// #[derive(Hash, PartialEq, Eq)]
-/// enum Impossible {}
-///
-/// impl IntoGameNode for Node {
-///     type PlayerInfo = u64;
-///     type Action = String;
-///     type ChanceInfo = Impossible;
-///     type Outcomes = Vec<(f64, Node)>;
-///     type Actions = Vec<(String, Node)>;
-///
-///     fn into_game_node(self) -> GameNode<Self> {
-///         self.0
-///     }
-/// }
-///
-/// let game = Game::from_root(
-///     Node(GameNode::Player(PlayerNum::One, 1, vec![
-///         ("fixed".into(), Node(GameNode::Terminal(0.0))),
-///         ("random".into(), Node(GameNode::Chance(None, vec![
-///             (0.5, Node(GameNode::Terminal(1.0))),
-///             (0.5, Node(GameNode::Terminal(-1.0))),
-///         ]))),
-///     ]))
-/// );
-/// ```
-///
-/// However, this can also be used to create more advanced games in a lazy manner. This example
-/// illustrates a lazily created game, but note that the game itself is not interesting.
-///
-/// ```
-/// # use cfr::{GameNode, IntoGameNode, Game, PlayerNum};
-/// struct Node(u64);
-///
-/// #[derive(Hash, PartialEq, Eq)]
-/// enum Impossible {}
-///
-/// struct ActionIter(u64);
-///
-/// impl Iterator for ActionIter {
-///     type Item = (u64, Node);
-///
-///     fn next(&mut self) -> Option<Self::Item> {
-///         if self.0 > 2 {
-///             self.0 -= 2;
-///             Some((self.0, Node(self.0)))
-///         } else {
-///             None
-///         }
-///     }
-/// }
-///
-/// impl IntoGameNode for Node {
-///     type PlayerInfo = u64;
-///     type Action = u64;
-///     type ChanceInfo = Impossible;
-///     type Outcomes = [(f64, Node); 0];
-///     type Actions = ActionIter;
-///
-///     fn into_game_node(self) -> GameNode<Self> {
-///         if self.0 == 0 {
-///             GameNode::Terminal(0.0)
-///         } else {
-///             let num = if self.0 % 2 == 0 {
-///                 PlayerNum::One
-///             } else {
-///                 PlayerNum::Two
-///             };
-///             GameNode::Player(num, self.0, ActionIter(self.0 + 1))
-///         }
-///     }
-/// }
-///
-/// let game = Game::from_root(Node(6));
-/// ```
-pub trait IntoGameNode {
-    /// The type for player information sets
-    ///
-    /// All nodes that have the same player information set are indistinguishable from the
-    /// perspective of the acting player.  That means that they must have the same actions
-    /// available in the same order. In addition, this library only works for games with perfect
-    /// recall, which means that a player can't forget their own actions. Another way to state this
-    /// is that all nodes with the same infoset must all have followed the same previous infoset
-    /// for that player.
-    type PlayerInfo: Eq;
-    /// The type of the player action
-    ///
-    /// Player nodes have an iterator of actions attached to future states. The actual action
-    /// representation isn't important, but infosets must have the same actions in the same order.
-    /// When converting a set of strategies back into their named representations, these will be
-    /// used to represent them.
-    type Action: Eq;
-    /// The information set type for chance nodes
-    ///
-    /// Chance node information sets have the same identical actions restrictions that player
-    /// infosets do, but don't require perfect recall. The benefit of specifying chance infosets is
-    /// that sampling based methods can preserve the correlation in sampling which helps
-    /// convergence. For example if chance is revealing cards, later draws may be independent of
-    /// player actions, and so should be in the same infoset.
-    ///
-    /// Since these only help convergence, they are optional. If you know these are unspecified,
-    /// this should be set to the `!` type, or any empty type.
-    type ChanceInfo: Eq;
-    /// The type for iterating over the actions in a chance node
-    ///
-    /// For chance nodes in the same information set, these should iterate over outcomes in the
-    /// same order. The associated float for each outcome is a positive weight associated with that
-    /// outcome. Outcome occur proportional to their weight. In other words, the weights must all
-    /// be positive, but they don't have to sum to one.
-    type Outcomes: IntoIterator<Item = (f64, Self)>;
-    /// The type for iterating over the actions in a player nodes
-    ///
-    /// Actions must occur in the same order for the same information sets, so using
-    /// representations like a [`std::collections::HashMap`] is discouraged.
-    type Actions: IntoIterator<Item = (Self::Action, Self)>;
+/// Every state sharing an infoset must enumerate its children in the same order, since the regret
+/// table for that infoset is indexed by child position.
+pub trait Game: Sized {
+    /// An action label, used only to import and export named strategies -- never while sampling.
+    type Action;
+    /// The acting player's view of the state: the regret-table key and the sampling seed.
+    type Infoset;
+    /// A chance node's sampling key. Nodes sharing one sample the same outcome; use [`Infallible`]
+    /// (and always return `None`) for a game whose chance nodes are never correlated.
+    type ChanceInfoset;
+    /// The weighted child sequence at a chance node; [`Infallible`] if the game has no chance nodes.
+    type Chance: Outcomes<Self>;
+    /// The child sequence at a player node. Every game has player nodes, so this is always a real
+    /// type.
+    type Player: Moves<Self>;
 
-    /// Convert this type into a `GameNode`
-    ///
-    /// Note that the `GameNode` is just an intermediary representation meant to convert custom types
-    /// into a [Game].
-    fn into_game_node(self) -> GameNode<Self>;
+    /// Classify this state as a terminal, chance, or player node.
+    fn into_node(self) -> NodeType<Self>;
+}
+
+/// A lazy, indexable sequence of chance outcomes, each a `(probability, next state)` pair.
+#[allow(clippy::len_without_is_empty)] // a well-formed chance node always has at least one outcome
+pub trait Outcomes<G: Game> {
+    /// The number of outcomes.
+    fn len(&self) -> usize;
+    /// The `index`-th outcome as `(probability, next state)`.
+    fn get(&self, index: usize) -> (f64, G);
+    /// Walk every outcome in order.
+    fn iter(&self) -> impl Iterator<Item = (f64, G)> + '_ {
+        (0..self.len()).map(|index| self.get(index))
+    }
+}
+
+/// A lazy, indexable sequence of the legal moves at a player node.
+#[allow(clippy::len_without_is_empty)] // a well-formed player node always has at least one action
+pub trait Moves<G: Game> {
+    /// The number of legal actions.
+    fn len(&self) -> usize;
+    /// The next state after taking the `index`-th action.
+    fn apply(&self, index: usize) -> G;
+    /// The label of the `index`-th action, for importing and exporting strategies.
+    fn action(&self, index: usize) -> G::Action;
+    /// Walk every action paired with its next state.
+    fn iter(&self) -> impl Iterator<Item = (G::Action, G)> + '_ {
+        (0..self.len()).map(|index| (self.action(index), self.apply(index)))
+    }
+}
+
+/// [`Infallible`] stands in as the [`Game::Chance`] of a game with no chance nodes: its
+/// [`Outcomes`] methods are unreachable because no value can exist. There is deliberately no
+/// `Moves` impl -- every game has player nodes, so [`Game::Player`] is always a real type.
+impl<G: Game> Outcomes<G> for Infallible {
+    fn len(&self) -> usize {
+        match *self {}
+    }
+    fn get(&self, _index: usize) -> (f64, G) {
+        match *self {}
+    }
 }
 
 #[derive(Debug)]
@@ -416,7 +328,7 @@ impl ChanceInfoset for ChanceInfosetData {
 /// This structure allows computing approximate equilibria, and evaluating the regret and utility
 /// of strategy profiles.
 #[derive(Debug)]
-pub struct Game<Infoset, Action> {
+pub struct GameTree<Infoset, Action> {
     chance_infosets: Box<[ChanceInfosetData]>,
     player_infosets: [Box<[PlayerInfosetData<Infoset, Action>]>; 2],
     single_infosets: [Box<[(Infoset, Action)]>; 2],
@@ -424,36 +336,38 @@ pub struct Game<Infoset, Action> {
 }
 
 /// Two games are equal if and only if they are the same game
-impl<I, A> PartialEq for Game<I, A> {
+impl<I, A> PartialEq for GameTree<I, A> {
     fn eq(&self, other: &Self) -> bool {
         ptr::eq(self, other)
     }
 }
 
-impl<I, A> Eq for Game<I, A> {}
+impl<I, A> Eq for GameTree<I, A> {}
 
-impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
-    /// Create a game from the root node of an arbitrary game tree
+impl<I: Hash + Eq, A: Hash + Eq> GameTree<I, A> {
+    /// Build a [`GameTree`] from a [`Game`] state machine, so the exact (full-tree) solvers and
+    /// their regret bounds apply. Only suitable for games small enough to fit in memory.
     ///
-    /// For more information on how to create a game, see the necessary trait [`IntoGameNode`] for
-    /// details on how to structure the input data.
+    /// This is a single validating pass: the builder walks [`into_node`][Game::into_node]
+    /// recursively, so no intermediate tree is materialized -- each node's children are visited and
+    /// freed as the recursion unwinds.
     ///
     /// # Errors
     ///
-    /// Returns a [`GameError`] if the input tree is malformed: empty, contains non-zero-sum
-    /// payoffs, has inconsistent infoset action sets, violates perfect recall, contains invalid
-    /// chance probabilities, or has more infosets than fit in a `u32`.
-    pub fn from_root<T>(root: T) -> Result<Self, GameError>
+    /// Returns a [`GameError`] if the game is malformed: empty, contains non-zero-sum payoffs, has
+    /// inconsistent infoset action sets, violates perfect recall, contains invalid chance
+    /// probabilities, or has more infosets than fit in a `u32`.
+    pub fn from_game<G>(root: G) -> Result<Self, GameError>
     where
-        T: IntoGameNode<PlayerInfo = I, Action = A>,
-        T::ChanceInfo: Hash + Eq,
+        G: Game<Infoset = I, Action = A>,
+        G::ChanceInfoset: Hash + Eq,
     {
         let mut chance_infosets = OptBuilder::new();
         let mut player_infosets = [Builder::new(), Builder::new()];
         let mut single_infosets = [HashMap::new(), HashMap::new()];
         let [first_player, second_player] = &mut player_infosets;
         let [first_single, second_single] = &mut single_infosets;
-        let root = Game::init_recurse(
+        let root = GameTree::recurse(
             &mut chance_infosets,
             &mut [first_player, second_player],
             &mut [first_single, second_single],
@@ -470,10 +384,12 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
         // the solver keys its sampler on u32 infoset ids (see `key.rng(infoset as u32)`), so every
         // infoset index has to fit in a u32
         let fits_u32 = |len: usize| u32::try_from(len).is_ok();
-        if !fits_u32(chance_infosets.len()) || !player_infosets.iter().all(|pinfo| fits_u32(pinfo.len())) {
+        if !fits_u32(chance_infosets.len())
+            || !player_infosets.iter().all(|pinfo| fits_u32(pinfo.len()))
+        {
             return Err(GameError::TooManyInfosets);
         }
-        Ok(Game {
+        Ok(GameTree {
             chance_infosets,
             player_infosets,
             single_infosets: single_infosets.map(|sinfo| sinfo.into_iter().collect()),
@@ -482,26 +398,26 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn init_recurse<T>(
-        chance_infosets: &mut OptBuilder<T::ChanceInfo, ChanceInfosetData>,
+    fn recurse<G>(
+        chance_infosets: &mut OptBuilder<G::ChanceInfoset, ChanceInfosetData>,
         player_infosets: &mut [&mut Builder<I, PlayerInfosetBuilder<A>>; 2],
         single_infosets: &mut [&mut HashMap<I, A>; 2],
-        node: T,
+        state: G,
         prev_infosets: [Option<(usize, usize)>; 2],
     ) -> Result<Node, GameError>
     where
-        T: IntoGameNode<PlayerInfo = I, Action = A>,
-        T::ChanceInfo: Hash + Eq,
+        G: Game<Infoset = I, Action = A>,
+        G::ChanceInfoset: Hash + Eq,
     {
-        match node.into_game_node() {
-            GameNode::Terminal(payoff) => Ok(Node::Terminal(payoff)),
-            GameNode::Chance(info, raw_outcomes) => {
+        match state.into_node() {
+            NodeType::Terminal(payoff) => Ok(Node::Terminal(payoff)),
+            NodeType::Chance(info, chance) => {
                 let mut probs = Vec::new();
                 let mut outcomes = Vec::new();
-                for (prob, next) in raw_outcomes {
+                for (prob, next) in chance.iter() {
                     if prob > 0.0 && prob.is_finite() {
                         probs.push(prob);
-                        outcomes.push(Game::init_recurse(
+                        outcomes.push(GameTree::recurse(
                             chance_infosets,
                             player_infosets,
                             single_infosets,
@@ -539,10 +455,10 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                     }
                 }
             }
-            GameNode::Player(player_num, infoset, raw_actions) => {
+            NodeType::Player(player_num, infoset, moves) => {
                 let mut actions = Vec::new();
                 let mut nexts = Vec::new();
-                for (action, next) in raw_actions {
+                for (action, next) in moves.iter() {
                     actions.push(action);
                     nexts.push(next);
                 }
@@ -561,7 +477,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                             }
                         }
                         let next = nexts.pop().unwrap();
-                        Game::init_recurse(
+                        GameTree::recurse(
                             chance_infosets,
                             player_infosets,
                             single_infosets,
@@ -601,7 +517,7 @@ impl<I: Hash + Eq, A: Hash + Eq> Game<I, A> {
                                 // must also share the action (else imperfect recall)
                                 let next_prev =
                                     player_num.replace(prev_infosets, Some((info_ind, action_ind)));
-                                Game::init_recurse(
+                                GameTree::recurse(
                                     chance_infosets,
                                     player_infosets,
                                     single_infosets,
@@ -694,7 +610,7 @@ impl Default for SolveParams {
     }
 }
 
-impl<I, A> Game<I, A> {
+impl<I, A> GameTree<I, A> {
     /// Find an approximate Nash equilibrium of the current game
     ///
     /// Often you'll either want to run with `max_iter` as [`usize::MAX`] and `max_reg` as a meaningful
@@ -776,7 +692,7 @@ impl<I, A> Game<I, A> {
     }
 }
 
-impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
+impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> GameTree<I, A> {
     /// Convert a named strategy into [Strategies]
     ///
     /// The input can be any set of types that vaguely iterate over pairs of information sets and
@@ -787,30 +703,45 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     ///
     /// ```
     /// use std::collections::HashMap;
-    /// # use cfr::{GameNode, Game, IntoGameNode, PlayerNum};
-    ///
-    /// # struct Node(GameNode<Node>);
-    /// # impl IntoGameNode for Node {
-    /// # type PlayerInfo = &'static str;
-    /// # type Action = &'static str;
-    /// # type ChanceInfo = &'static str;
-    /// # type Outcomes = Vec<(f64, Node)>;
-    /// # type Actions = Vec<(&'static str, Node)>;
-    /// # fn into_game_node(self) -> GameNode<Self> { self.0 }
+    /// # use cfr::{Game, Moves, NodeType, Outcomes, PlayerNum, GameTree};
+    /// # use std::convert::Infallible;
+    /// # // a chance node leads to player one (actions A/B) or player two (actions 1/2), each at an
+    /// # // "info" infoset, then a terminal -- enough to demonstrate named strategies
+    /// # #[derive(Clone, Copy)]
+    /// # enum Demo { Root, One, Two, End }
+    /// # struct DemoDeal; // the chance node's outcomes
+    /// # impl Game for Demo {
+    /// #     type Action = &'static str;
+    /// #     type Infoset = &'static str;
+    /// #     type ChanceInfoset = Infallible;
+    /// #     type Chance = DemoDeal;
+    /// #     type Player = Demo;
+    /// #     fn into_node(self) -> NodeType<Self> {
+    /// #         match self {
+    /// #             Demo::Root => NodeType::Chance(None, DemoDeal),
+    /// #             Demo::One => NodeType::Player(PlayerNum::One, "info", Demo::One),
+    /// #             Demo::Two => NodeType::Player(PlayerNum::Two, "info", Demo::Two),
+    /// #             Demo::End => NodeType::Terminal(0.0),
+    /// #         }
+    /// #     }
+    /// # }
+    /// # impl Outcomes<Demo> for DemoDeal {
+    /// #     fn len(&self) -> usize { 2 }
+    /// #     fn get(&self, index: usize) -> (f64, Demo) { (0.5, [Demo::One, Demo::Two][index]) }
+    /// # }
+    /// # impl Moves<Demo> for Demo {
+    /// #     fn len(&self) -> usize { 2 }
+    /// #     fn apply(&self, _index: usize) -> Demo { Demo::End }
+    /// #     fn action(&self, index: usize) -> &'static str {
+    /// #         match self {
+    /// #             Demo::One => ["A", "B"][index],
+    /// #             Demo::Two => ["1", "2"][index],
+    /// #             _ => unreachable!(),
+    /// #         }
+    /// #     }
     /// # }
     /// let game = // ...
-    /// # Game::from_root(
-    /// #     Node(GameNode::Chance(None, vec![
-    /// #         (0.5, Node(GameNode::Player(PlayerNum::One, "info", vec![
-    /// #             ("A", Node(GameNode::Terminal(0.0))),
-    /// #             ("B", Node(GameNode::Terminal(0.0))),
-    /// #         ]))),
-    /// #         (0.5, Node(GameNode::Player(PlayerNum::Two, "info", vec![
-    /// #             ("1", Node(GameNode::Terminal(0.0))),
-    /// #             ("2", Node(GameNode::Terminal(0.0))),
-    /// #         ]))),
-    /// #     ]))
-    /// # ).unwrap();
+    /// # GameTree::from_game(Demo::Root).unwrap();
     /// let one: HashMap<&'static str, HashMap<&'static str, f64>> = [
     ///     ("info", [("A", 0.2), ("B", 0.8)].into())
     /// ].into();
@@ -825,7 +756,7 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     /// # Errors
     ///
     /// This will error if a valid strategy wasn't specified for every infoset, or it received
-    /// invalid infosets or actions for the current [Game].
+    /// invalid infosets or actions for the current [`GameTree`].
     pub fn from_named(
         &self,
         strats: [impl IntoIterator<
@@ -922,21 +853,21 @@ impl<I: Hash + Eq + Clone, A: Hash + Eq + Clone> Game<I, A> {
     }
 }
 
-impl<I: Eq, A: Eq> Game<I, A> {
+impl<I: Eq, A: Eq> GameTree<I, A> {
     /// Convert a named strategy into [Strategies]
     ///
     /// In case cloning is very expensive, this version doesn't require cloning or hashing, but
     /// otherwise runs in time quadratic in the number of infosets and actions, which is almost
     /// certaintly going to be worse than the cost of cloning.
     ///
-    /// Also note that currently constructing the [Game] requires hashing so that relaxation is
+    /// Also note that currently constructing the [`GameTree`] requires hashing so that relaxation is
     /// meaningless.
     ///
-    /// This is otherwise the same as [`Game::from_named`], so see that method for examples.
+    /// This is otherwise the same as [`GameTree::from_named`], so see that method for examples.
     ///
     /// # Errors
     ///
-    /// Same conditions as [`Game::from_named`]: errors if any infoset or action is unknown to the
+    /// Same conditions as [`GameTree::from_named`]: errors if any infoset or action is unknown to the
     /// game, if probabilities for an infoset don't form a valid distribution, or if any infoset
     /// is missing.
     // NOTE this is very similar to from_named, but writing it generically with traits wasn't worth
@@ -1046,10 +977,10 @@ impl<I: Eq, A: Eq> Game<I, A> {
 /// A compact strategy for both players
 ///
 /// Strategies are tied to a specific game and maintain a reference back to them. Create these from
-/// original data using [`Game::from_named`].
+/// original data using [`GameTree::from_named`].
 #[derive(Debug, Clone)]
 pub struct Strategies<'a, Infoset, Action> {
-    game: &'a Game<Infoset, Action>,
+    game: &'a GameTree<Infoset, Action>,
     probs: [Box<[f64]>; 2],
 }
 
@@ -1072,19 +1003,30 @@ impl<'a, I, A> Strategies<'a, I, A> {
     /// # Examples
     ///
     /// ```
-    /// # use cfr::{GameNode, Game, IntoGameNode, SolveMethod, SolveParams, PlayerNum};
-    /// # struct ExData {}
-    /// # impl IntoGameNode for ExData {
-    /// # type PlayerInfo = ();
-    /// # type ChanceInfo = ();
-    /// # type Action = ();
-    /// # type Actions = Vec<((), ExData)>;
-    /// # type Outcomes = Vec<(f64, ExData)>;
-    /// # fn into_game_node(self) -> GameNode<Self> { GameNode::Terminal(0.0) }
+    /// # use cfr::{Game, Moves, NodeType, PlayerNum, SolveMethod, SolveParams, GameTree};
+    /// # use std::convert::Infallible;
+    /// # #[derive(Clone, Copy)]
+    /// # enum ExData { Start, End }
+    /// # impl Game for ExData {
+    /// #     type Action = ();
+    /// #     type Infoset = ();
+    /// #     type ChanceInfoset = Infallible;
+    /// #     type Chance = Infallible;
+    /// #     type Player = ExData;
+    /// #     fn into_node(self) -> NodeType<Self> {
+    /// #         match self {
+    /// #             ExData::Start => NodeType::Player(PlayerNum::One, (), ExData::Start),
+    /// #             ExData::End => NodeType::Terminal(0.0),
+    /// #         }
+    /// #     }
     /// # }
-    /// # let data: ExData = ExData {};
+    /// # impl Moves<ExData> for ExData {
+    /// #     fn len(&self) -> usize { 1 }
+    /// #     fn apply(&self, _index: usize) -> ExData { ExData::End }
+    /// #     fn action(&self, _index: usize) {}
+    /// # }
     /// let game = // ...
-    /// # Game::from_root(data).unwrap();
+    /// # GameTree::from_game(ExData::Start).unwrap();
     /// let (strats, _) = game.solve(
     ///     // ...
     /// # SolveMethod::External, 1, 0.0, 1, SolveParams::default()
@@ -1345,50 +1287,69 @@ impl<A> ExactSizeIterator for NamedStrategyActionIter<'_, A> {}
 #[cfg(test)]
 #[allow(clippy::float_cmp, unused_must_use)]
 mod tests {
-    use super::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
+    use super::{
+        Game, GameTree, Moves, NodeType, PlayerNum, SolveMethod, SolveParams,
+    };
+    use std::convert::Infallible;
 
-    #[derive(Debug)]
-    struct Node(GameNode<Node>);
+    // A small game: player one ("x") has a forced action "a", then player two ("z") picks b/c, and on
+    // b player one ("y") picks c/d. All payoffs are 0 -- the tests only exercise infoset/action
+    // plumbing, not equilibria.
+    #[derive(Debug, Clone, Copy)]
+    enum Stage {
+        X,
+        Z,
+        Y,
+        Done,
+    }
 
-    impl IntoGameNode for Node {
-        type PlayerInfo = &'static str;
+    #[derive(Debug, Clone, Copy)]
+    struct TreeGame(Stage);
+
+    impl Game for TreeGame {
         type Action = &'static str;
-        type ChanceInfo = &'static str;
-        type Outcomes = Vec<(f64, Node)>;
-        type Actions = Vec<(&'static str, Node)>;
+        type Infoset = &'static str;
+        type ChanceInfoset = Infallible;
+        type Chance = Infallible;
+        type Player = TreeGame;
 
-        fn into_game_node(self) -> GameNode<Self> {
-            self.0
+        fn into_node(self) -> NodeType<Self> {
+            match self.0 {
+                Stage::X => NodeType::Player(PlayerNum::One, "x", self),
+                Stage::Z => NodeType::Player(PlayerNum::Two, "z", self),
+                Stage::Y => NodeType::Player(PlayerNum::One, "y", self),
+                Stage::Done => NodeType::Terminal(0.0),
+            }
         }
     }
 
-    fn create_game() -> Game<&'static str, &'static str> {
-        let node = Node(GameNode::Player(
-            PlayerNum::One,
-            "x",
-            vec![(
-                "a",
-                Node(GameNode::Player(
-                    PlayerNum::Two,
-                    "z",
-                    vec![
-                        (
-                            "b",
-                            Node(GameNode::Player(
-                                PlayerNum::One,
-                                "y",
-                                vec![
-                                    ("c", Node(GameNode::Terminal(0.0))),
-                                    ("d", Node(GameNode::Terminal(0.0))),
-                                ],
-                            )),
-                        ),
-                        ("c", Node(GameNode::Terminal(0.0))),
-                    ],
-                )),
-            )],
-        ));
-        Game::from_root(node).unwrap()
+    impl Moves<TreeGame> for TreeGame {
+        fn len(&self) -> usize {
+            match self.0 {
+                Stage::X => 1,
+                Stage::Z | Stage::Y => 2,
+                Stage::Done => unreachable!(),
+            }
+        }
+        fn action(&self, index: usize) -> &'static str {
+            match self.0 {
+                Stage::X => ["a"][index],
+                Stage::Z => ["b", "c"][index],
+                Stage::Y => ["c", "d"][index],
+                Stage::Done => unreachable!(),
+            }
+        }
+        fn apply(&self, index: usize) -> TreeGame {
+            TreeGame(match (self.0, index) {
+                (Stage::X, _) => Stage::Z,
+                (Stage::Z, 0) => Stage::Y,
+                _ => Stage::Done,
+            })
+        }
+    }
+
+    fn create_game() -> GameTree<&'static str, &'static str> {
+        GameTree::from_game(TreeGame(Stage::X)).unwrap()
     }
 
     #[test]

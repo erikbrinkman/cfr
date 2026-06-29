@@ -1,12 +1,12 @@
 #[cfg(doc)]
-use crate::Game;
+use crate::GameTree;
 use rayon::ThreadPoolBuildError;
 use std::error::Error;
 use std::fmt::{Display, Error as FmtError, Formatter};
 
 /// Errors that result from game definition errors
 ///
-/// If the object passed into [`Game::from_root`] doesn't conform to necessary
+/// If a game (via [`GameTree::from_game`][crate::GameTree::from_game]) doesn't conform to necessary
 /// invariants, one of these will be returned.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
@@ -50,114 +50,169 @@ impl Display for GameError {
 
 impl Error for GameError {}
 
+/// An explicit game tree implementing [`Game`][crate::Game], used by the tests below to feed the
+/// builder hand-crafted (often malformed) games. `&'static str` labels every infoset/action.
+///
+/// Children are shared via [`Rc`], so a node hands a child back to the builder by cloning a pointer
+/// (O(1)) instead of deep-copying the subtree -- the whole build stays linear. Use the [`terminal`],
+/// [`chance`], and [`player`] constructors so the trees read without `Rc::new` everywhere.
 #[cfg(test)]
-mod game_errors {
-    use crate::{Game, GameError, GameNode, IntoGameNode, PlayerNum};
+mod tree {
+    use crate::{Game, Moves, NodeType, Outcomes, PlayerNum};
+    use std::rc::Rc;
+
+    pub(super) type Tree = Rc<Node>;
 
     #[derive(Debug)]
-    struct Node(GameNode<Node>);
+    pub(super) enum Node {
+        Terminal(f64),
+        Chance(Option<&'static str>, Vec<(f64, Tree)>),
+        Player(PlayerNum, &'static str, Vec<(&'static str, Tree)>),
+    }
 
-    impl IntoGameNode for Node {
-        type PlayerInfo = &'static str;
+    pub(super) fn terminal(payoff: f64) -> Tree {
+        Rc::new(Node::Terminal(payoff))
+    }
+    pub(super) fn chance(infoset: Option<&'static str>, outcomes: Vec<(f64, Tree)>) -> Tree {
+        Rc::new(Node::Chance(infoset, outcomes))
+    }
+    pub(super) fn player(
+        num: PlayerNum,
+        infoset: &'static str,
+        actions: Vec<(&'static str, Tree)>,
+    ) -> Tree {
+        Rc::new(Node::Player(num, infoset, actions))
+    }
+
+    pub(super) struct TreeOutcomes(Vec<(f64, Tree)>);
+    pub(super) struct TreeMoves(Vec<(&'static str, Tree)>);
+
+    impl Game for Tree {
         type Action = &'static str;
-        type ChanceInfo = &'static str;
-        type Outcomes = Vec<(f64, Node)>;
-        type Actions = Vec<(&'static str, Node)>;
+        type Infoset = &'static str;
+        type ChanceInfoset = &'static str;
+        type Chance = TreeOutcomes;
+        type Player = TreeMoves;
 
-        fn into_game_node(self) -> GameNode<Self> {
-            self.0
+        fn into_node(self) -> NodeType<Self> {
+            // cloning a child `Vec` is shallow -- it copies pointers (and bumps refcounts), never the
+            // subtrees they point at
+            match &*self {
+                Node::Terminal(payoff) => NodeType::Terminal(*payoff),
+                Node::Chance(infoset, outcomes) => {
+                    NodeType::Chance(*infoset, TreeOutcomes(outcomes.clone()))
+                }
+                Node::Player(num, infoset, actions) => {
+                    NodeType::Player(*num, *infoset, TreeMoves(actions.clone()))
+                }
+            }
         }
     }
 
+    impl Outcomes<Tree> for TreeOutcomes {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn get(&self, index: usize) -> (f64, Tree) {
+            self.0[index].clone()
+        }
+    }
+
+    impl Moves<Tree> for TreeMoves {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn action(&self, index: usize) -> &'static str {
+            self.0[index].0
+        }
+        fn apply(&self, index: usize) -> Tree {
+            self.0[index].1.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod game_errors {
+    use super::tree::{Tree, chance, player, terminal};
+    use crate::{GameError, GameTree, PlayerNum};
+
     #[test]
     fn empty_chance() {
-        let err_game = Node(GameNode::Chance(None, [].into()));
-        let err = Game::from_root(err_game).unwrap_err();
+        let err_game = chance(None, vec![]);
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::EmptyChance);
     }
 
     #[test]
     fn non_positive_chance() {
-        let err_game = Node(GameNode::Chance(
-            None,
-            [(0.0, Node(GameNode::Terminal(0.0)))].into(),
-        ));
-        let err = Game::from_root(err_game).unwrap_err();
+        let err_game = chance(None, vec![(0.0, terminal(0.0))]);
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::NonPositiveChance);
     }
 
     #[test]
     fn probabilities_not_equal() {
-        let err_game = Node(GameNode::Chance(
+        let err_game = chance(
             None,
             vec![
                 (
                     0.5,
-                    Node(GameNode::Chance(
+                    chance(
                         Some("x"),
-                        vec![
-                            (1.0, Node(GameNode::Terminal(0.0))),
-                            (1.0, Node(GameNode::Terminal(0.0))),
-                        ],
-                    )),
+                        vec![(1.0, terminal(0.0)), (1.0, terminal(0.0))],
+                    ),
                 ),
                 (
                     0.5,
-                    Node(GameNode::Chance(
+                    chance(
                         Some("x"),
-                        vec![
-                            (1.0, Node(GameNode::Terminal(0.0))),
-                            (2.0, Node(GameNode::Terminal(0.0))),
-                        ],
-                    )),
+                        vec![(1.0, terminal(0.0)), (2.0, terminal(0.0))],
+                    ),
                 ),
             ],
-        ));
-        let err = Game::from_root(err_game).unwrap_err();
+        );
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::ProbabilitiesNotEqual);
     }
 
     #[test]
     fn imperfect_recall() {
-        let err_game = Node(GameNode::Chance(
+        let err_game = chance(
             None,
             vec![
                 (
                     0.5,
-                    Node(GameNode::Player(
+                    player(
                         PlayerNum::One,
                         "x",
-                        vec![
-                            ("a", Node(GameNode::Terminal(0.0))),
-                            ("b", Node(GameNode::Terminal(0.0))),
-                        ],
-                    )),
+                        vec![("a", terminal(0.0)), ("b", terminal(0.0))],
+                    ),
                 ),
                 (
                     0.5,
-                    Node(GameNode::Player(
+                    player(
                         PlayerNum::One,
                         "y",
                         vec![
                             (
                                 "a",
-                                Node(GameNode::Player(
+                                player(
                                     PlayerNum::One,
                                     // forgot that we played "y"
                                     "x",
                                     vec![
-                                        ("a", Node(GameNode::Terminal(0.0))),
-                                        ("b", Node(GameNode::Terminal(0.0))),
+                                        ("a", terminal(0.0)),
+                                        ("b", terminal(0.0)),
                                     ],
-                                )),
+                                ),
                             ),
-                            ("b", Node(GameNode::Terminal(0.0))),
+                            ("b", terminal(0.0)),
                         ],
-                    )),
+                    ),
                 ),
             ],
-        ));
-        let err = Game::from_root(err_game).unwrap_err();
+        );
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::ImperfectRecall);
     }
 
@@ -166,83 +221,67 @@ mod game_errors {
         // both of player one's actions at "p" reach the same infoset "x", so at "x" the player can't
         // tell whether they played "a" or "b". Comparing only the previous infoset misses this (both
         // reach "x" from "p"); the action taken out of "p" is what distinguishes them.
-        fn branch() -> Node {
-            Node(GameNode::Player(
+        fn branch() -> Tree {
+            player(
                 PlayerNum::One,
                 "x",
-                vec![
-                    ("c", Node(GameNode::Terminal(0.0))),
-                    ("d", Node(GameNode::Terminal(0.0))),
-                ],
-            ))
+                vec![("c", terminal(0.0)), ("d", terminal(0.0))],
+            )
         }
-        let err_game = Node(GameNode::Player(
-            PlayerNum::One,
-            "p",
-            vec![("a", branch()), ("b", branch())],
-        ));
-        let err = Game::from_root(err_game).unwrap_err();
+        let err_game = player(PlayerNum::One, "p", vec![("a", branch()), ("b", branch())]);
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::ImperfectRecall);
     }
 
     #[test]
     fn empty_player() {
-        let err_game = Node(GameNode::Player(PlayerNum::One, "", [].into()));
-        let err = Game::from_root(err_game).unwrap_err();
+        let err_game = player(PlayerNum::One, "", vec![]);
+        let err = GameTree::from_game(err_game).unwrap_err();
         assert_eq!(err, GameError::EmptyPlayer);
     }
 
     #[test]
     fn actions_not_equal() {
-        let ord_game = Node(GameNode::Chance(
+        let ord_game = chance(
             None,
             vec![
                 (
                     0.5,
-                    Node(GameNode::Player(
+                    player(
                         PlayerNum::One,
                         "x",
-                        vec![
-                            ("a", Node(GameNode::Terminal(0.0))),
-                            ("b", Node(GameNode::Terminal(0.0))),
-                        ],
-                    )),
+                        vec![("a", terminal(0.0)), ("b", terminal(0.0))],
+                    ),
                 ),
                 (
                     0.5,
-                    Node(GameNode::Player(
+                    player(
                         PlayerNum::One,
                         "x",
-                        vec![
-                            ("b", Node(GameNode::Terminal(0.0))),
-                            ("a", Node(GameNode::Terminal(0.0))),
-                        ],
-                    )),
+                        vec![("b", terminal(0.0)), ("a", terminal(0.0))],
+                    ),
                 ),
             ],
-        ));
-        let err = Game::from_root(ord_game).unwrap_err();
+        );
+        let err = GameTree::from_game(ord_game).unwrap_err();
         assert_eq!(err, GameError::ActionsNotEqual);
     }
 
     #[test]
     fn actions_not_unique() {
-        let dup_game = Node(GameNode::Player(
+        let dup_game = player(
             PlayerNum::One,
             "x",
-            vec![
-                ("a", Node(GameNode::Terminal(0.0))),
-                ("a", Node(GameNode::Terminal(0.0))),
-            ],
-        ));
-        let err = Game::from_root(dup_game).unwrap_err();
+            vec![("a", terminal(0.0)), ("a", terminal(0.0))],
+        );
+        let err = GameTree::from_game(dup_game).unwrap_err();
         assert_eq!(err, GameError::ActionsNotUnique);
     }
 }
 
 /// Errors that result from incompatible strategy representation
 ///
-/// If a strategy object passed to [`Game::from_named`] doesn't match the games information and
+/// If a strategy object passed to [`GameTree::from_named`] doesn't match the games information and
 /// action structure, one of these errors will be returned.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
@@ -267,50 +306,36 @@ impl Error for StratError {}
 
 #[cfg(test)]
 mod strat_errors {
-    use crate::{Game, GameNode, IntoGameNode, PlayerNum, StratError};
+    use super::tree::{player, terminal};
+    use crate::{GameTree, PlayerNum, StratError};
 
-    #[derive(Debug)]
-    struct Node(GameNode<Node>);
-
-    impl IntoGameNode for Node {
-        type PlayerInfo = &'static str;
-        type Action = &'static str;
-        type ChanceInfo = &'static str;
-        type Outcomes = Vec<(f64, Node)>;
-        type Actions = Vec<(&'static str, Node)>;
-
-        fn into_game_node(self) -> GameNode<Self> {
-            self.0
-        }
-    }
-
-    fn create_game() -> Game<&'static str, &'static str> {
-        let node = Node(GameNode::Player(
+    fn create_game() -> GameTree<&'static str, &'static str> {
+        let node = player(
             PlayerNum::One,
             "x",
             vec![(
                 "a",
-                Node(GameNode::Player(
+                player(
                     PlayerNum::Two,
                     "z",
                     vec![
                         (
                             "b",
-                            Node(GameNode::Player(
+                            player(
                                 PlayerNum::One,
                                 "y",
                                 vec![
-                                    ("c", Node(GameNode::Terminal(0.0))),
-                                    ("d", Node(GameNode::Terminal(0.0))),
+                                    ("c", terminal(0.0)),
+                                    ("d", terminal(0.0)),
                                 ],
-                            )),
+                            ),
                         ),
-                        ("c", Node(GameNode::Terminal(0.0))),
+                        ("c", terminal(0.0)),
                     ],
-                )),
+                ),
             )],
-        ));
-        Game::from_root(node).unwrap()
+        );
+        GameTree::from_game(node).unwrap()
     }
 
     #[test]
@@ -410,4 +435,3 @@ impl From<ThreadPoolBuildError> for SolveError {
         SolveError::ThreadSpawnError
     }
 }
-
