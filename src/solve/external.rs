@@ -70,7 +70,10 @@ impl<T> InfoCell<T> {
     #[cfg(debug_assertions)]
     fn mark_visited(&self) {
         let already = self.visited.swap(true, Ordering::Relaxed);
-        assert!(!already, "active infoset reached twice in one sweep -- perfect recall violated");
+        assert!(
+            !already,
+            "active infoset reached twice in one sweep -- perfect recall violated"
+        );
     }
 
     /// Clear the per-sweep visit flag (debug builds only) before a sweep begins.
@@ -278,9 +281,12 @@ fn recurse_lazy<const FIRST: bool>(
                 let info_cell = &active_player_infosets[player.infoset];
                 #[cfg(debug_assertions)]
                 info_cell.mark_visited();
-                info_cell
-                    .borrow_mut()
-                    .visit_lazy(player, lazy, discounts, reach, |next, child_reach| {
+                info_cell.borrow_mut().visit_lazy(
+                    player,
+                    lazy,
+                    discounts,
+                    reach,
+                    |next, child_reach| {
                         recurse_lazy::<FIRST>(
                             next,
                             chance_infosets,
@@ -291,7 +297,8 @@ fn recurse_lazy<const FIRST: bool>(
                             child_reach,
                             key,
                         )
-                    })
+                    },
+                )
             }
             (PlayerNum::Two, true) | (PlayerNum::One, false) => {
                 let info = external_player_infosets[player.infoset].borrow();
@@ -398,7 +405,9 @@ fn recurse_par<const FIRST: bool>(
                         )
                     })
                     .collect();
-                info_cell.borrow_mut().finish_visit(lazy, discounts, reach, &utils)
+                info_cell
+                    .borrow_mut()
+                    .finish_visit(lazy, discounts, reach, &utils)
             }
             (PlayerNum::Two, true) | (PlayerNum::One, false) => {
                 let info = external_player_infosets[player.infoset].borrow();
@@ -553,13 +562,15 @@ pub(crate) fn solve_external_single(
                 reg_one = player_one
                     .iter()
                     .map(|info| {
-                        info.borrow_mut().catch_up_bound(lazy.cum_log_pos, lazy.cum_log_neg, it)
+                        info.borrow_mut()
+                            .catch_up_bound(lazy.cum_log_pos, lazy.cum_log_neg, it)
                     })
                     .sum();
                 reg_two = player_two
                     .iter()
                     .map(|info| {
-                        info.borrow_mut().catch_up_bound(lazy.cum_log_pos, lazy.cum_log_neg, it)
+                        info.borrow_mut()
+                            .catch_up_bound(lazy.cum_log_pos, lazy.cum_log_neg, it)
                     })
                     .sum();
                 if f64::max(reg_one, reg_two) < max_reg {
@@ -589,7 +600,9 @@ mod tests {
 
     mod eager {
         use super::super::CachedInfoset;
-        use super::super::data::{Discounts, RegretInfoset, SampledChance, SampleKey, should_check, SolveInfo};
+        use super::super::data::{
+            Discounts, RegretInfoset, SampleKey, SampledChance, SolveInfo, should_check,
+        };
         use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
         use std::cell::RefCell;
 
@@ -599,7 +612,12 @@ mod tests {
             /// `reach` is the active player's own reach probability to this infoset (the product of
             /// their action probabilities along the path); the average strategy accumulates this
             /// player's strategy weighted by `reach`.
-            fn recurse_active(&mut self, player: &Player, reach: f64, rec: impl Fn(&Node, f64) -> f64) -> f64 {
+            fn recurse_active(
+                &mut self,
+                player: &Player,
+                reach: f64,
+                rec: impl Fn(&Node, f64) -> f64,
+            ) -> f64 {
                 let RegretInfoset {
                     strat,
                     cum_regret,
@@ -628,7 +646,8 @@ mod tests {
 
             /// Regret match the next strategy and discount the cumulative regret (eager)
             fn advance(&mut self, discounts: &Discounts) -> f64 {
-                let bound = discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
+                let bound =
+                    discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
                 discounts.discount_average_strat(&mut self.reg.cum_strat);
                 bound
             }
@@ -805,9 +824,9 @@ mod tests {
         }
     }
 
-    type Game = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
+    type GameTree = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
 
-    fn simple_game() -> Game {
+    fn simple_game() -> GameTree {
         let root = Node::Chance(Chance {
             outcomes: vec![
                 Node::Player(Player {
@@ -829,7 +848,7 @@ mod tests {
         (root, chance, players)
     }
 
-    fn even_or_odd() -> Game {
+    fn even_or_odd() -> GameTree {
         let root = Node::Player(Player {
             num: PlayerNum::One,
             actions: vec![
@@ -889,11 +908,25 @@ mod tests {
             let ([reg_one, reg_two], [strat_one, strat_two]) = if eager {
                 eager::solve_external_eager(&root, &chance, [&*one, &*two], 10_000, 0.005, &params)
             } else {
-                super::solve_external_single(&root, &chance, [&*one, &*two], 10_000, 0.005, &params, 1)
-                    .unwrap()
+                super::solve_external_single(
+                    &root,
+                    &chance,
+                    [&*one, &*two],
+                    10_000,
+                    0.005,
+                    &params,
+                    1,
+                )
+                .unwrap()
             };
-            assert!((strat_one[1] - 0.5).abs() < 0.05, "{strat_one:?} eager={eager}");
-            assert!((strat_two[0] - 0.5).abs() < 0.05, "{strat_two:?} eager={eager}");
+            assert!(
+                (strat_one[1] - 0.5).abs() < 0.05,
+                "{strat_one:?} eager={eager}"
+            );
+            assert!(
+                (strat_two[0] - 0.5).abs() < 0.05,
+                "{strat_two:?} eager={eager}"
+            );
             assert!(reg_one < 0.05, "eager={eager}");
             assert!(reg_two < 0.05, "eager={eager}");
         }
@@ -919,11 +952,23 @@ mod tests {
             for fork_depth in [1, 3, 5] {
                 let params = SolveParams { fork_depth, ..base };
                 let forked = super::solve_external_single(
-                    &root, &chance, [&*one, &*two], 5000, 0.0, &params, threads,
+                    &root,
+                    &chance,
+                    [&*one, &*two],
+                    5000,
+                    0.0,
+                    &params,
+                    threads,
                 )
                 .unwrap();
-                assert_eq!(serial.0, forked.0, "regrets differ at {threads} threads, depth {fork_depth}");
-                assert_eq!(serial.1, forked.1, "strategies differ at {threads} threads, depth {fork_depth}");
+                assert_eq!(
+                    serial.0, forked.0,
+                    "regrets differ at {threads} threads, depth {fork_depth}"
+                );
+                assert_eq!(
+                    serial.1, forked.1,
+                    "strategies differ at {threads} threads, depth {fork_depth}"
+                );
             }
         }
     }

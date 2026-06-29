@@ -11,7 +11,7 @@
 //!
 //! This module contains [Builder] and [`OptBuilder`]. The only difference is that the latter allows
 //! pushing optional values with guaranteed uniqueness (no key).
-use indexmap::{map, IndexMap};
+use indexmap::{IndexMap, map};
 use std::hash::Hash;
 use std::iter::FusedIterator;
 
