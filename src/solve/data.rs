@@ -48,11 +48,10 @@ impl TryRng for DetRng {
     }
 
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-        let mut chunks = dst.chunks_exact_mut(8);
-        for chunk in &mut chunks {
-            chunk.copy_from_slice(&self.step().to_le_bytes());
+        let (chunks, rem) = dst.as_chunks_mut::<8>();
+        for chunk in chunks {
+            *chunk = self.step().to_le_bytes();
         }
-        let rem = chunks.into_remainder();
         if !rem.is_empty() {
             let bytes = self.step().to_le_bytes();
             rem.copy_from_slice(&bytes[..rem.len()]);
