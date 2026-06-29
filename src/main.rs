@@ -1,15 +1,18 @@
-mod auto;
 mod gambit;
 mod json;
 
-use cfr::{PlayerNum, RegretParams, SolveMethod, SolveParams};
+use cfr::{Game, GameTree, PlayerNum, RegretParams, SolveMethod, SolveParams};
+use gambit::{GambitError, GambitNode};
+use gambit_parser::ExtensiveFormGame;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt::{self, Display, Formatter};
 use std::fs::File;
+use std::hash::Hash;
 use std::io;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Method {
@@ -132,8 +135,8 @@ impl<I, A, S, T, N> From<I> for Strategy
 where
     I: IntoIterator<Item = (S, A)>,
     A: IntoIterator<Item = (T, N)>,
-    S: AsRef<str>,
-    T: AsRef<str>,
+    S: Display,
+    T: Display,
     N: Borrow<f64>,
 {
     fn from(named_strategies: I) -> Self {
@@ -141,11 +144,11 @@ where
         for (info, actions) in named_strategies {
             assert!(
                 map.insert(
-                    info.as_ref().to_owned(),
+                    info.to_string(),
                     actions
                         .into_iter()
                         .filter(|(_, p)| p.borrow() > &0.0)
-                        .map(|(a, p)| (a.as_ref().to_owned(), *p.borrow()))
+                        .map(|(a, p)| (a.to_string(), *p.borrow()))
                         .collect()
                 )
                 .is_none(),
@@ -169,23 +172,111 @@ struct Output {
 
 fn main() {
     let args = Args::parse();
-    let (game, sum) = if args.input == "-" {
-        let mut inp = io::stdin().lock();
-        match args.input_format {
-            InputFormat::Json => json::from_reader(&mut inp),
-            InputFormat::Gambit => gambit::from_reader(&mut inp),
-            InputFormat::Auto => auto::from_reader(&mut inp),
-        }
+    let mut buff = String::new();
+    if args.input == "-" {
+        io::stdin().lock().read_to_string(&mut buff).unwrap();
     } else {
-        let mut inp = BufReader::new(File::open(&args.input).unwrap());
-        match args.input_format {
-            InputFormat::Json => json::from_reader(&mut inp),
-            InputFormat::Auto if args.input.ends_with(".json") => json::from_reader(&mut inp),
-            InputFormat::Gambit => gambit::from_reader(&mut inp),
-            InputFormat::Auto if args.input.ends_with(".efg") => gambit::from_reader(&mut inp),
-            InputFormat::Auto => auto::from_reader(&mut inp),
-        }
+        BufReader::new(File::open(&args.input).unwrap())
+            .read_to_string(&mut buff)
+            .unwrap();
+    }
+    let out = match args.input_format {
+        InputFormat::Json => solve_json(&buff, &args),
+        InputFormat::Gambit => solve_gambit(&buff, &args),
+        InputFormat::Auto if args.input.ends_with(".json") => solve_json(&buff, &args),
+        InputFormat::Auto if args.input.ends_with(".efg") => solve_gambit(&buff, &args),
+        InputFormat::Auto => solve_auto(&buff, &args),
+    }
+    .unwrap();
+    if args.output == "-" {
+        serde_json::to_writer(io::stdout(), &out).unwrap();
+    } else {
+        serde_json::to_writer(File::create(args.output).unwrap(), &out).unwrap();
     };
+}
+
+/// A user-facing failure from reading or solving the input game.
+enum CliError {
+    /// The input wasn't valid json.
+    ParseJson,
+    /// The input wasn't a valid gambit `.efg` file.
+    ParseGambit,
+    /// The gambit game couldn't be read as a two-player zero-sum game.
+    Gambit(GambitError),
+    /// The game violated a structural invariant the solver requires.
+    Materialize,
+    /// Auto-detection matched no known format.
+    UnknownFormat,
+}
+
+impl Display for CliError {
+    fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            CliError::ParseJson => write!(
+                out,
+                "couldn't parse json game definition : https://github.com/erikbrinkman/cfr#json-error"
+            ),
+            CliError::ParseGambit => write!(
+                out,
+                "couldn't parse gambit game definition : https://github.com/erikbrinkman/cfr#gambit-error"
+            ),
+            CliError::Gambit(err) => Display::fmt(err, out),
+            CliError::Materialize => write!(
+                out,
+                "couldn't extract a compact game representation due to problems with the structure : https://github.com/erikbrinkman/cfr#game-error"
+            ),
+            CliError::UnknownFormat => write!(
+                out,
+                "couldn't parse any known format; try specifying your format with `--input-format` : https://github.com/erikbrinkman/cfr#auto-error"
+            ),
+        }
+    }
+}
+
+// surface the Display message, not the variant, when `main` unwraps a failure
+impl fmt::Debug for CliError {
+    fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, out)
+    }
+}
+
+/// Parse a json game (the `&State` is the game) and solve it.
+fn solve_json(buff: &str, args: &Args) -> Result<Output, CliError> {
+    let state: json::State = serde_json::from_str(buff).map_err(|_| CliError::ParseJson)?;
+    solve_game(&state, 0.0, args)
+}
+
+/// Parse a gambit game (the [`GambitNode`] cursor keeps borrowing the parsed tree) and solve it.
+fn solve_gambit(buff: &str, args: &Args) -> Result<Output, CliError> {
+    let parsed = ExtensiveFormGame::try_from(buff).map_err(|_| CliError::ParseGambit)?;
+    let game = GambitNode::try_from(&parsed).map_err(CliError::Gambit)?;
+    let sum = game.sum();
+    solve_game(game, sum, args)
+}
+
+/// Try each known input format in turn.
+fn solve_auto(buff: &str, args: &Args) -> Result<Output, CliError> {
+    if let Ok(state) = serde_json::from_str::<json::State>(buff) {
+        solve_game(&state, 0.0, args)
+    } else if let Ok(parsed) = ExtensiveFormGame::try_from(buff) {
+        let game = GambitNode::try_from(&parsed).map_err(CliError::Gambit)?;
+        let sum = game.sum();
+        solve_game(game, sum, args)
+    } else {
+        Err(CliError::UnknownFormat)
+    }
+}
+
+/// Materialize a [`Game`] into a tree, solve it, and format the result. `sum` offsets the reported
+/// utilities by the game's constant-sum value.
+fn solve_game<G>(game: G, sum: f64, args: &Args) -> Result<Output, CliError>
+where
+    G: Game,
+    G::Infoset: Eq + Hash + Display,
+    G::Action: Eq + Hash + Display,
+    G::ChanceInfoset: Eq + Hash,
+{
+    let game = GameTree::from_game(game).map_err(|_| CliError::Materialize)?;
     let max_iters = if args.max_iters == 0 {
         u64::MAX
     } else {
@@ -209,38 +300,58 @@ fn main() {
             },
         )
         .unwrap();
-    let mut info = strategies.get_info();
-    let mut pruned_strats = strategies.clone();
-    pruned_strats.truncate(args.clip_threshold);
-    let pruned_info = pruned_strats.get_info();
-    if pruned_info.regret() < info.regret() {
-        strategies = pruned_strats;
-        info = pruned_info;
-    }
+    // build the unpruned strategy (converting labels to owned strings) before truncating in place,
+    // so we never have to clone `Strategies`; only rebuild from the pruned tree if it's better
+    let info = strategies.get_info();
     let [one, two] = strategies.as_named();
-    let out = Output {
+    let unpruned = [Strategy::from(one), Strategy::from(two)];
+    strategies.truncate(args.clip_threshold);
+    let pruned_info = strategies.get_info();
+    let (info, [player_one_strategy, player_two_strategy]) =
+        if pruned_info.regret() < info.regret() {
+            let [one, two] = strategies.as_named();
+            (pruned_info, [Strategy::from(one), Strategy::from(two)])
+        } else {
+            (info, unpruned)
+        };
+    Ok(Output {
         regret: info.regret(),
         player_one_utility: info.player_utility(PlayerNum::One) + sum,
         player_two_utility: info.player_utility(PlayerNum::Two) - sum,
         player_one_regret: info.player_regret(PlayerNum::One),
         player_two_regret: info.player_regret(PlayerNum::Two),
-        player_one_strategy: one.into(),
-        player_two_strategy: two.into(),
-    };
-    if args.output == "-" {
-        serde_json::to_writer(io::stdout(), &out).unwrap();
-    } else {
-        serde_json::to_writer(File::create(args.output).unwrap(), &out).unwrap();
-    };
+        player_one_strategy,
+        player_two_strategy,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
-    use clap::CommandFactory;
+    use super::{Args, CliError, solve_auto};
+    use clap::{CommandFactory, Parser};
+
+    fn default_args() -> Args {
+        Args::parse_from(["cfr"])
+    }
 
     #[test]
     fn test_cli() {
-        Args::command().debug_assert()
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn auto_detects_json() {
+        solve_auto(r#"{ "terminal": 0.0 }"#, &default_args()).unwrap();
+    }
+
+    #[test]
+    fn auto_detects_gambit() {
+        solve_auto(r#"EFG 2 R "" { "" "" } t "" 1 { 0 0 }"#, &default_args()).unwrap();
+    }
+
+    #[test]
+    fn auto_rejects_unknown() {
+        let err = solve_auto("random", &default_args()).unwrap_err();
+        assert!(matches!(err, CliError::UnknownFormat));
     }
 }

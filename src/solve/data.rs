@@ -3,7 +3,7 @@
 use core::convert::Infallible;
 use logaddexp::LogAddExp;
 use rand::TryRng;
-use rand_distr::{weighted::WeightedAliasIndex, Distribution};
+use rand_distr::{Distribution, weighted::WeightedAliasIndex};
 
 /// The splitmix64 increment (the golden-ratio gamma constant)
 const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -292,8 +292,7 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn regret_match(&self, cum_reg: &mut [f32], strat: &mut [f32])
-    {
+    pub(super) fn regret_match(&self, cum_reg: &mut [f32], strat: &mut [f32]) {
         debug_assert_eq!(cum_reg.len(), strat.len());
         let norm: f64 = cum_reg
             .iter_mut()
@@ -355,7 +354,6 @@ impl RegretParams {
             (numer - denom).exp()
         }
     }
-
 }
 
 /// The average strategy discount for a single iteration
@@ -422,8 +420,7 @@ impl<'a> Discounts<'a> {
     /// strategy, applies the discount, and tracks the running maximum used for the bound. The rare
     /// all-non-positive case (where the strategy is chosen by the `no_positive` policy rather than
     /// proportionally to regret) falls back to the standalone primitives.
-    pub(super) fn advance_infoset(&self, cum_reg: &mut [f32], strat: &mut [f32]) -> f64
-    {
+    pub(super) fn advance_infoset(&self, cum_reg: &mut [f32], strat: &mut [f32]) -> f64 {
         let positive_norm: f64 = cum_reg
             .iter_mut()
             .map(|&mut v| f64::from(v))
@@ -458,8 +455,7 @@ impl<'a> Discounts<'a> {
     }
 
     /// Discount cumulative regret with the precomputed factors
-    pub(super) fn discount_cum_regret(&self, cum_reg: &mut [f32])
-    {
+    pub(super) fn discount_cum_regret(&self, cum_reg: &mut [f32]) {
         for reg in cum_reg.iter_mut() {
             if *reg > 0.0 {
                 *reg = (f64::from(*reg) * self.pos) as f32;
@@ -483,8 +479,7 @@ impl<'a> Discounts<'a> {
     }
 
     /// The regret bound contributed by an infoset given its cumulative regret
-    pub(super) fn regret_bound(&self, cum_reg: &mut [f32]) -> f64
-    {
+    pub(super) fn regret_bound(&self, cum_reg: &mut [f32]) -> f64 {
         2.0 * f64::max(
             cum_reg
                 .iter_mut()
@@ -561,13 +556,21 @@ mod tests {
         assert_eq!(regs, [0.5, -0.5]);
 
         let mut regs = [1.0, -1.0];
-        Discounts::new(&RegretParams::new(f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0), 2, 2)
-            .discount_cum_regret(&mut regs);
+        Discounts::new(
+            &RegretParams::new(f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0),
+            2,
+            2,
+        )
+        .discount_cum_regret(&mut regs);
         assert_eq!(regs, [1.0, 0.0]);
 
         let mut regs = [1.0, -1.0];
-        Discounts::new(&RegretParams::new(f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0), 2, 2)
-            .discount_cum_regret(&mut regs);
+        Discounts::new(
+            &RegretParams::new(f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0),
+            2,
+            2,
+        )
+        .discount_cum_regret(&mut regs);
         assert_eq!(regs, [0.0, -1.0]);
 
         let mut regs = [1.0, -1.0];

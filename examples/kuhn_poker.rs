@@ -1,123 +1,148 @@
-//! An example implementation of IntoGameNode for Kuhn Poker
-use cfr::{Game, GameNode, IntoGameNode, PlayerNum, SolveMethod, SolveParams};
+//! An example implementation of the [`cfr::Game`] trait for Kuhn Poker
+use cfr::{
+    Game, GameTree, Moves, NodeType, Outcomes, PlayerNum, SolveMethod, SolveParams,
+};
 use clap::Parser;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum Impossible {}
+use std::convert::Infallible;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 enum Action {
     Fold,
-    Call,
-    Raise,
+    Call,  // check or call
+    Raise, // bet or raise
 }
 
+/// A node in Kuhn poker. Chance deals player one's card, then -- after player one's first action --
+/// player two's card from the remaining cards; a player's infoset is `(their card, raise pending)`.
+/// Each variant carries exactly its node's data, so the carriers never inspect a phase.
+#[derive(Debug, Clone, Copy)]
 enum Kuhn {
-    Terminal(f64),
-    Deal(Vec<(f64, Kuhn)>),
-    Gambler(PlayerNum, (usize, bool), Vec<(Action, Kuhn)>),
+    DealOne(usize),              // num_cards
+    OneFirst(usize, usize),      // num_cards, one_card
+    DealTwo(usize, usize, bool), // num_cards, one_card, one_raised
+    TwoAct(usize, usize, bool),  // one_card, two_card, one_raised
+    OneSecond(usize, usize),     // one_card, two_card
+    Done(f64),
 }
 
-impl IntoGameNode for Kuhn {
-    type PlayerInfo = (usize, bool);
-    type Action = Action;
-    type ChanceInfo = Impossible;
-    type Outcomes = Vec<(f64, Kuhn)>;
-    type Actions = Vec<(Action, Kuhn)>;
+/// The terminal where the higher card wins `stake` for player one.
+fn showdown(one_card: usize, two_card: usize, stake: f64) -> Kuhn {
+    Kuhn::Done(if one_card > two_card { stake } else { -stake })
+}
 
-    fn into_game_node(self) -> GameNode<Self> {
+/// A deal chance node's outcomes (the carrier for [`Game::Chance`]).
+#[derive(Debug)]
+enum Deal {
+    One(usize),              // num_cards
+    Two(usize, usize, bool), // num_cards, one_card, one_raised
+}
+
+/// A player decision's moves (the carrier for [`Game::Player`]).
+#[derive(Debug)]
+enum Decide {
+    OneFirst(usize, usize),     // num_cards, one_card
+    TwoAct(usize, usize, bool), // one_card, two_card, one_raised
+    OneSecond(usize, usize),    // one_card, two_card
+}
+
+impl Game for Kuhn {
+    type Action = Action;
+    type Infoset = (usize, bool);
+    type ChanceInfoset = Infallible; // deals are never correlated, so chance nodes are unique
+    type Chance = Deal;
+    type Player = Decide;
+
+    fn into_node(self) -> NodeType<Self> {
         match self {
-            Kuhn::Terminal(payoff) => GameNode::Terminal(payoff),
-            Kuhn::Deal(outcomes) => GameNode::Chance(None, outcomes),
-            Kuhn::Gambler(num, info, actions) => GameNode::Player(num, info, actions),
+            Kuhn::Done(payoff) => NodeType::Terminal(payoff),
+            Kuhn::DealOne(num_cards) => NodeType::Chance(None, Deal::One(num_cards)),
+            Kuhn::DealTwo(num_cards, one_card, one_raised) => {
+                NodeType::Chance(None, Deal::Two(num_cards, one_card, one_raised))
+            }
+            Kuhn::OneFirst(num_cards, one_card) => {
+                NodeType::Player(PlayerNum::One, (one_card, false), Decide::OneFirst(num_cards, one_card))
+            }
+            Kuhn::TwoAct(one_card, two_card, one_raised) => NodeType::Player(
+                PlayerNum::Two,
+                (two_card, one_raised),
+                Decide::TwoAct(one_card, two_card, one_raised),
+            ),
+            Kuhn::OneSecond(one_card, two_card) => {
+                NodeType::Player(PlayerNum::One, (one_card, true), Decide::OneSecond(one_card, two_card))
+            }
         }
     }
 }
 
-fn create_kuhn_one(num_cards: usize) -> Kuhn {
+impl Outcomes<Kuhn> for Deal {
+    fn len(&self) -> usize {
+        match *self {
+            Deal::One(num_cards) => num_cards,
+            Deal::Two(num_cards, ..) => num_cards - 1, // player one's card is excluded
+        }
+    }
+
+    fn get(&self, index: usize) -> (f64, Kuhn) {
+        match *self {
+            Deal::One(num_cards) => (1.0 / num_cards as f64, Kuhn::OneFirst(num_cards, index)),
+            Deal::Two(num_cards, one_card, one_raised) => {
+                let two_card = if index < one_card { index } else { index + 1 };
+                (
+                    1.0 / (num_cards - 1) as f64,
+                    Kuhn::TwoAct(one_card, two_card, one_raised),
+                )
+            }
+        }
+    }
+}
+
+impl Moves<Kuhn> for Decide {
+    fn len(&self) -> usize {
+        2
+    }
+
+    fn action(&self, index: usize) -> Action {
+        match self {
+            Decide::OneFirst(..) | Decide::TwoAct(_, _, false) => [Action::Call, Action::Raise][index],
+            Decide::TwoAct(_, _, true) | Decide::OneSecond(..) => [Action::Call, Action::Fold][index],
+        }
+    }
+
+    fn apply(&self, index: usize) -> Kuhn {
+        let action = self.action(index);
+        match *self {
+            Decide::OneFirst(num_cards, one_card) => {
+                Kuhn::DealTwo(num_cards, one_card, action == Action::Raise)
+            }
+            Decide::TwoAct(one_card, two_card, one_raised) => {
+                if one_raised {
+                    // facing the raise: call to a showdown at 2, or fold and concede 1
+                    if action == Action::Call {
+                        showdown(one_card, two_card, 2.0)
+                    } else {
+                        Kuhn::Done(1.0)
+                    }
+                } else if action == Action::Call {
+                    showdown(one_card, two_card, 1.0) // checked down
+                } else {
+                    Kuhn::OneSecond(one_card, two_card) // raised back
+                }
+            }
+            Decide::OneSecond(one_card, two_card) => {
+                // call the re-raise (showdown at 2) or fold (lose 1)
+                if action == Action::Call {
+                    showdown(one_card, two_card, 2.0)
+                } else {
+                    Kuhn::Done(-1.0)
+                }
+            }
+        }
+    }
+}
+
+fn create_kuhn(num_cards: usize) -> GameTree<(usize, bool), Action> {
     assert!(num_cards > 1);
-    let frac = 1.0 / num_cards as f64;
-    Kuhn::Deal(
-        (0..num_cards)
-            .map(|card| {
-                let next: Vec<_> = [
-                    (Action::Call, create_kuhn_two(num_cards, card, false)),
-                    (Action::Raise, create_kuhn_two(num_cards, card, true)),
-                ]
-                .into();
-                (frac, Kuhn::Gambler(PlayerNum::One, (card, false), next))
-            })
-            .collect(),
-    )
-}
-
-fn create_kuhn_two(num_cards: usize, first: usize, one_raised: bool) -> Kuhn {
-    let frac = 1.0 / (num_cards - 1) as f64;
-    let lose_cards = 0..first;
-    let win_cards = first + 1..num_cards;
-    Kuhn::Deal(if one_raised {
-        let lose_acts = lose_cards.map(|card| {
-            let next = [
-                (Action::Call, Kuhn::Terminal(2.0)),
-                (Action::Fold, Kuhn::Terminal(1.0)),
-            ];
-            (
-                frac,
-                Kuhn::Gambler(PlayerNum::Two, (card, true), next.into()),
-            )
-        });
-        let win_acts = win_cards.map(|card| {
-            let next = [
-                (Action::Call, Kuhn::Terminal(-2.0)),
-                (Action::Fold, Kuhn::Terminal(1.0)),
-            ];
-            (
-                frac,
-                Kuhn::Gambler(PlayerNum::Two, (card, true), next.into()),
-            )
-        });
-        lose_acts.chain(win_acts).collect()
-    } else {
-        let lose_acts = lose_cards.map(|card| {
-            let raise = [
-                (Action::Call, Kuhn::Terminal(2.0)),
-                (Action::Fold, Kuhn::Terminal(-1.0)),
-            ];
-            let next = [
-                (Action::Call, Kuhn::Terminal(1.0)),
-                (
-                    Action::Raise,
-                    Kuhn::Gambler(PlayerNum::One, (first, true), raise.into()),
-                ),
-            ];
-            (
-                frac,
-                Kuhn::Gambler(PlayerNum::Two, (card, false), next.into()),
-            )
-        });
-        let win_acts = win_cards.map(|card| {
-            let raise = [
-                (Action::Call, Kuhn::Terminal(-2.0)),
-                (Action::Fold, Kuhn::Terminal(-1.0)),
-            ];
-            let next = [
-                (Action::Call, Kuhn::Terminal(-1.0)),
-                (
-                    Action::Raise,
-                    Kuhn::Gambler(PlayerNum::One, (first, true), raise.into()),
-                ),
-            ];
-            (
-                frac,
-                Kuhn::Gambler(PlayerNum::Two, (card, false), next.into()),
-            )
-        });
-        lose_acts.chain(win_acts).collect()
-    })
-}
-
-fn create_kuhn(num_cards: usize) -> Game<(usize, bool), Action> {
-    Game::from_root(create_kuhn_one(num_cards)).unwrap()
+    GameTree::from_game(Kuhn::DealOne(num_cards)).unwrap()
 }
 
 /// Use cfr to find a kuhn poker strategy
@@ -215,7 +240,6 @@ fn main() {
 mod tests {
     use super::Action;
     use cfr::{PlayerNum, RegretParams, SolveMethod, SolveParams, Strategies};
-    use rand::{rng, RngExt};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     fn infer_alpha(strat: &Strategies<(usize, bool), Action>) -> f64 {
@@ -349,7 +373,6 @@ mod tests {
         .into_par_iter()
         .flat_map(|method| [1, 2].into_par_iter().map(move |threads| (method, threads)))
         .for_each(|(method, threads)| {
-            rng().fill(&mut [0; 8]);
             let (mut strategies, bounds) = game
                 .solve(
                     method,
@@ -429,7 +452,6 @@ mod tests {
         ]
         .into_par_iter()
         .for_each(|(name, params)| {
-            rng().fill(&mut [0; 8]);
             let (mut strategies, _) = game
                 .solve(
                     SolveMethod::Full,

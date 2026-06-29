@@ -88,7 +88,14 @@ fn recurse_single(
                 strat,
                 &mut **cum_regret,
                 |next, p_next| {
-                    recurse_single(next, chance_infosets, player_infosets, key, p_chance, p_next)
+                    recurse_single(
+                        next,
+                        chance_infosets,
+                        player_infosets,
+                        key,
+                        p_chance,
+                        p_next,
+                    )
                 },
             );
             for val in &mut info.cum_regret {
@@ -114,12 +121,7 @@ fn recurse_player<'a>(
 
     let mut expected_one = 0.0;
     let mut expected = 0.0;
-    for ((next, prob), cum_reg) in player
-        .actions
-        .iter()
-        .zip(strat.iter())
-        .zip(cum_regret)
-    {
+    for ((next, prob), cum_reg) in player.actions.iter().zip(strat.iter()).zip(cum_regret) {
         let prob = f64::from(*prob);
         let mut p_next = p_player;
         *player.num.ind_mut(&mut p_next) *= prob;
@@ -241,7 +243,9 @@ pub(crate) fn solve_sampled_single(
 }
 #[cfg(test)]
 mod tests {
-    use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams, SolveParams};
+    use crate::{
+        Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, RegretParams, SolveParams,
+    };
 
     #[derive(Clone, Debug)]
     struct Pinfo(usize);
@@ -265,9 +269,9 @@ mod tests {
         }
     }
 
-    type Game = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
+    type GameTree = (Node, Box<[Cinfo]>, [Box<[Pinfo]>; 2]);
 
-    fn new_game() -> Game {
+    fn new_game() -> GameTree {
         let root = Node::Chance(Chance {
             outcomes: vec![
                 Node::Player(Player {
@@ -332,5 +336,4 @@ mod tests {
         assert!(reg_one < 0.05);
         assert!(reg_two < 0.05);
     }
-
 }
