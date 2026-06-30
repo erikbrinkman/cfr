@@ -3,10 +3,11 @@
 // is allowed module-wide. Lossy int->float casts (cast_precision_loss) are handled per-site instead.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 use super::data;
-use super::data::{Discounts, RegretInfoset, RegretParams, SampleKey, SampledChance, SolveInfo};
-use super::multinomial::Multinomial;
+use super::data::{
+    Action, Discounts, RegretInfoset, RegretParams, SampleKey, SampledChance, SolveInfo,
+};
+use super::multinomial;
 use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveError, SolveParams};
-use rand::distr::Distribution;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::UnsafeCell;
 #[cfg(debug_assertions)]
@@ -109,7 +110,7 @@ impl CachedInfoset {
     /// across every action the updating player explores -- without a shared cache -- because the
     /// same infoset draws the same way within a sweep.
     fn sample(&self, key: SampleKey, infoset: u32) -> usize {
-        Multinomial::new(&self.reg.strat).sample(&mut key.rng(infoset))
+        multinomial::sample(&mut key.rng(infoset), self.reg.strat())
     }
 
     /// Apply the deferred cumulative-regret discount for the iterations since the last catch-up
@@ -121,11 +122,11 @@ impl CachedInfoset {
     fn catch_up(&mut self, target_log_pos: f64, target_log_neg: f64) {
         let pos_factor = (target_log_pos - self.base_log_pos).exp();
         let neg_factor = (target_log_neg - self.base_log_neg).exp();
-        for reg in &mut *self.reg.cum_regret {
-            if *reg > 0.0 {
-                *reg = (f64::from(*reg) * pos_factor) as f32;
-            } else if *reg < 0.0 {
-                *reg = (f64::from(*reg) * neg_factor) as f32;
+        for action in &mut *self.reg.actions {
+            if action.regret() > 0.0 {
+                action.set_regret(action.regret() * pos_factor);
+            } else if action.regret() < 0.0 {
+                action.set_regret(action.regret() * neg_factor);
             }
         }
         self.base_log_pos = target_log_pos;
@@ -147,29 +148,19 @@ impl CachedInfoset {
         // the average accumulates this player's own strategy weighted by reach times the deferred
         // lazy weight `t^γ` (the normalizer cancels at the end)
         let avg_weight = reach * lazy.strat_weight;
-        let RegretInfoset {
-            strat,
-            cum_regret,
-            cum_strat,
-        } = &mut self.reg;
         let mut expected = 0.0;
-        for (idx, ((prob, cum_reg), cum_str)) in strat
-            .iter()
-            .zip(cum_regret.iter_mut())
-            .zip(cum_strat.iter_mut())
-            .enumerate()
-        {
-            let prob = f64::from(*prob);
+        for (idx, action) in self.reg.actions.iter_mut().enumerate() {
+            let prob = action.strat();
             let util = util_for(idx, prob);
             expected += prob * util;
-            *cum_reg += util as f32;
-            *cum_str += prob * avg_weight;
+            action.add_regret(util);
+            action.cum_strat += prob * avg_weight;
         }
-        for cum_reg in cum_regret.iter_mut() {
-            *cum_reg -= expected as f32;
+        for action in &mut *self.reg.actions {
+            action.add_regret(-expected);
         }
         // regret match for the next iteration and apply this iteration's discount
-        discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
+        discounts.advance_infoset(&mut self.reg.actions);
         // this infoset is now caught up through the current iteration's discount
         self.base_log_pos = lazy.cum_log_pos + lazy.log_pos_step;
         self.base_log_neg = lazy.cum_log_neg + lazy.log_neg_step;
@@ -214,9 +205,9 @@ impl CachedInfoset {
         let iters = it as f64;
         2.0 * f64::max(
             self.reg
-                .cum_regret
+                .actions
                 .iter()
-                .map(|&reg| f64::from(reg))
+                .map(Action::regret)
                 .fold(f64::NEG_INFINITY, f64::max),
             0.0,
         ) / iters
@@ -244,236 +235,131 @@ struct LazyState {
 /// unvisited infosets are never touched). The active player accumulates its own average strategy at
 /// its own infosets; the opponent is only sampled, so the active player's `reach` carries through
 /// opponent and chance nodes unchanged.
-#[allow(clippy::too_many_arguments)]
-fn recurse_lazy<const FIRST: bool>(
-    node: &Node,
-    chance_infosets: &[SampledChance],
-    active_player_infosets: &[InfoCell<CachedInfoset>],
-    external_player_infosets: &[InfoCell<CachedInfoset>],
-    lazy: &LazyState,
-    discounts: &Discounts,
-    reach: f64,
-    key: SampleKey,
-) -> f64 {
-    match node {
-        Node::Terminal(payoff) => {
-            if FIRST {
-                *payoff
-            } else {
-                -payoff
-            }
-        }
-        Node::Chance(chance) => {
-            let next = chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
-            recurse_lazy::<FIRST>(
-                &chance.outcomes[next],
-                chance_infosets,
-                active_player_infosets,
-                external_player_infosets,
-                lazy,
-                discounts,
-                reach,
-                key,
-            )
-        }
-        Node::Player(player) => match (player.num, FIRST) {
-            (PlayerNum::One, true) | (PlayerNum::Two, false) => {
-                let info_cell = &active_player_infosets[player.infoset];
-                #[cfg(debug_assertions)]
-                info_cell.mark_visited();
-                info_cell.borrow_mut().visit_lazy(
-                    player,
-                    lazy,
-                    discounts,
-                    reach,
-                    |next, child_reach| {
-                        recurse_lazy::<FIRST>(
-                            next,
-                            chance_infosets,
-                            active_player_infosets,
-                            external_player_infosets,
-                            lazy,
-                            discounts,
-                            child_reach,
-                            key,
-                        )
-                    },
-                )
-            }
-            (PlayerNum::Two, true) | (PlayerNum::One, false) => {
-                let info = external_player_infosets[player.infoset].borrow();
-                let next = &player.actions[info.sample(key, player.infoset as u32)];
-                recurse_lazy::<FIRST>(
-                    next,
-                    chance_infosets,
-                    active_player_infosets,
-                    external_player_infosets,
-                    lazy,
-                    discounts,
-                    reach,
-                    key,
-                )
-            }
-        },
-    }
+/// The invariant context of one external-sampling sweep.
+///
+/// Passed by shared reference so each recursive call takes only the node, reach, and sampling key
+/// that actually change as the walk descends.
+struct Sweep<'a> {
+    chance_infosets: &'a [SampledChance],
+    active_player_infosets: &'a [InfoCell<CachedInfoset>],
+    external_player_infosets: &'a [InfoCell<CachedInfoset>],
+    lazy: &'a LazyState,
+    discounts: &'a Discounts<'a>,
+    fork_depth: u32,
 }
 
-/// One lazy external sweep that forks over the active player's action subtrees
-///
-/// The action subtrees of an active node touch disjoint infosets (see [`InfoCell`]), so they run in
-/// parallel without synchronization. `depth` counts the active forks already taken on this path;
-/// once it reaches `fork_depth` the rest of the subtree runs serially via [`recurse_lazy`], bounding
-/// spawned tasks to roughly `branching`^`fork_depth`.
-#[allow(clippy::too_many_arguments)]
-fn recurse_par<const FIRST: bool>(
-    node: &Node,
-    chance_infosets: &[SampledChance],
-    active_player_infosets: &[InfoCell<CachedInfoset>],
-    external_player_infosets: &[InfoCell<CachedInfoset>],
-    lazy: &LazyState,
-    discounts: &Discounts,
-    fork_depth: u32,
-    depth: u32,
-    reach: f64,
-    key: SampleKey,
-) -> f64 {
-    match node {
-        Node::Terminal(payoff) => {
-            if FIRST {
-                *payoff
-            } else {
-                -payoff
-            }
+impl Sweep<'_> {
+    /// Run one sweep for player `FIRST`: fork over the rayon pool when `parallel`, else walk serially.
+    fn run<const FIRST: bool>(&self, parallel: bool, start: &Node, key: SampleKey) {
+        #[cfg(debug_assertions)]
+        for info_cell in self.active_player_infosets {
+            info_cell.clear_visited();
         }
-        Node::Chance(chance) => {
-            let next = chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
-            recurse_par::<FIRST>(
-                &chance.outcomes[next],
-                chance_infosets,
-                active_player_infosets,
-                external_player_infosets,
-                lazy,
-                discounts,
-                fork_depth,
-                depth,
-                reach,
-                key,
-            )
+        if parallel {
+            self.parallel::<FIRST>(start, 0, 1.0, key);
+        } else {
+            self.serial::<FIRST>(start, 1.0, key);
         }
-        Node::Player(player) => match (player.num, FIRST) {
-            (PlayerNum::One, true) | (PlayerNum::Two, false) => {
-                if depth >= fork_depth {
-                    return recurse_lazy::<FIRST>(
-                        node,
-                        chance_infosets,
-                        active_player_infosets,
-                        external_player_infosets,
-                        lazy,
-                        discounts,
-                        reach,
-                        key,
-                    );
+    }
+
+    /// Serial external-sampling walk from `node`, updating infosets in place on the way up.
+    fn serial<const FIRST: bool>(&self, node: &Node, reach: f64, key: SampleKey) -> f64 {
+        match node {
+            Node::Terminal(payoff) => {
+                if FIRST {
+                    *payoff
+                } else {
+                    -payoff
                 }
-                let info_cell = &active_player_infosets[player.infoset];
-                #[cfg(debug_assertions)]
-                info_cell.mark_visited();
-                // catch up and snapshot the per-action reach weights before the fork, so no borrow of
-                // this infoset is held across the parallel section
-                let reaches: Vec<f64> = {
-                    let info = info_cell.borrow_mut();
-                    info.catch_up(lazy.cum_log_pos, lazy.cum_log_neg);
-                    info.reg
-                        .strat
-                        .iter()
-                        .map(|prob| reach * f64::from(*prob))
-                        .collect()
-                };
-                let utils: Vec<f64> = (0..player.actions.len())
-                    .into_par_iter()
-                    .map(|idx| {
-                        recurse_par::<FIRST>(
-                            &player.actions[idx],
-                            chance_infosets,
-                            active_player_infosets,
-                            external_player_infosets,
-                            lazy,
-                            discounts,
-                            fork_depth,
-                            depth + 1,
-                            reaches[idx],
-                            key,
-                        )
-                    })
-                    .collect();
-                info_cell
-                    .borrow_mut()
-                    .finish_visit(lazy, discounts, reach, &utils)
             }
-            (PlayerNum::Two, true) | (PlayerNum::One, false) => {
-                let info = external_player_infosets[player.infoset].borrow();
-                let next = &player.actions[info.sample(key, player.infoset as u32)];
-                recurse_par::<FIRST>(
-                    next,
-                    chance_infosets,
-                    active_player_infosets,
-                    external_player_infosets,
-                    lazy,
-                    discounts,
-                    fork_depth,
-                    depth,
-                    reach,
-                    key,
-                )
+            Node::Chance(chance) => {
+                let next =
+                    self.chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                self.serial::<FIRST>(&chance.outcomes[next], reach, key)
             }
-        },
+            Node::Player(player) => match (player.num, FIRST) {
+                (PlayerNum::One, true) | (PlayerNum::Two, false) => {
+                    let info_cell = &self.active_player_infosets[player.infoset];
+                    #[cfg(debug_assertions)]
+                    info_cell.mark_visited();
+                    info_cell.borrow_mut().visit_lazy(
+                        player,
+                        self.lazy,
+                        self.discounts,
+                        reach,
+                        |next, child_reach| self.serial::<FIRST>(next, child_reach, key),
+                    )
+                }
+                (PlayerNum::Two, true) | (PlayerNum::One, false) => {
+                    let info = self.external_player_infosets[player.infoset].borrow();
+                    let next = &player.actions[info.sample(key, player.infoset as u32)];
+                    self.serial::<FIRST>(next, reach, key)
+                }
+            },
+        }
     }
-}
 
-/// Run one external-sampling sweep for player `FIRST`, forking when a pool is installed
-///
-/// Thin dispatch shared by the serial and parallel solvers: with `parallel` set, the active player's
-/// action subtrees fork over the rayon pool down to `fork_depth` levels via [`recurse_par`]; otherwise
-/// the whole sweep runs in place via [`recurse_lazy`].
-#[allow(clippy::too_many_arguments)]
-fn run_sweep<const FIRST: bool>(
-    parallel: bool,
-    fork_depth: u32,
-    start: &Node,
-    chance_infosets: &[SampledChance],
-    active_player_infosets: &[InfoCell<CachedInfoset>],
-    external_player_infosets: &[InfoCell<CachedInfoset>],
-    lazy: &LazyState,
-    discounts: &Discounts,
-    key: SampleKey,
-) {
-    #[cfg(debug_assertions)]
-    for info_cell in active_player_infosets {
-        info_cell.clear_visited();
-    }
-    if parallel {
-        recurse_par::<FIRST>(
-            start,
-            chance_infosets,
-            active_player_infosets,
-            external_player_infosets,
-            lazy,
-            discounts,
-            fork_depth,
-            0,
-            1.0,
-            key,
-        );
-    } else {
-        recurse_lazy::<FIRST>(
-            start,
-            chance_infosets,
-            active_player_infosets,
-            external_player_infosets,
-            lazy,
-            discounts,
-            1.0,
-            key,
-        );
+    /// Parallel external-sampling walk: fork the active player's action subtrees while `depth <
+    /// fork_depth`, then fall back to [`serial`](Self::serial).
+    ///
+    /// The action subtrees of an active node touch disjoint infosets (see [`InfoCell`]), so they run
+    /// in parallel without synchronization; `depth` counts the active forks already taken, bounding
+    /// spawned tasks to roughly `branching`^`fork_depth`.
+    fn parallel<const FIRST: bool>(
+        &self,
+        node: &Node,
+        depth: u32,
+        reach: f64,
+        key: SampleKey,
+    ) -> f64 {
+        match node {
+            Node::Terminal(payoff) => {
+                if FIRST {
+                    *payoff
+                } else {
+                    -payoff
+                }
+            }
+            Node::Chance(chance) => {
+                let next =
+                    self.chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                self.parallel::<FIRST>(&chance.outcomes[next], depth, reach, key)
+            }
+            Node::Player(player) => match (player.num, FIRST) {
+                (PlayerNum::One, true) | (PlayerNum::Two, false) => {
+                    if depth >= self.fork_depth {
+                        return self.serial::<FIRST>(node, reach, key);
+                    }
+                    let info_cell = &self.active_player_infosets[player.infoset];
+                    #[cfg(debug_assertions)]
+                    info_cell.mark_visited();
+                    // catch up and snapshot the per-action reach weights before the fork, so no borrow
+                    // of this infoset is held across the parallel section
+                    let reaches: Vec<f64> = {
+                        let info = info_cell.borrow_mut();
+                        info.catch_up(self.lazy.cum_log_pos, self.lazy.cum_log_neg);
+                        info.reg
+                            .strat()
+                            .map(|prob| reach * f64::from(prob))
+                            .collect()
+                    };
+                    let utils: Vec<f64> = (0..player.actions.len())
+                        .into_par_iter()
+                        .map(|idx| {
+                            self.parallel::<FIRST>(&player.actions[idx], depth + 1, reaches[idx], key)
+                        })
+                        .collect();
+                    info_cell
+                        .borrow_mut()
+                        .finish_visit(self.lazy, self.discounts, reach, &utils)
+                }
+                (PlayerNum::Two, true) | (PlayerNum::One, false) => {
+                    let info = self.external_player_infosets[player.infoset].borrow();
+                    let next = &player.actions[info.sample(key, player.infoset as u32)];
+                    self.parallel::<FIRST>(next, depth, reach, key)
+                }
+            },
+        }
     }
 }
 
@@ -532,28 +418,24 @@ pub(crate) fn solve_external_single(
             let discounts = Discounts::new(params, it, it);
             // the two sweeps sample independently (distinct sweep id in the key), but both read the
             // same pre-iteration cumulative discount, which advances once after both have run
-            run_sweep::<true>(
-                parallel,
+            Sweep {
+                chance_infosets: &chance_infosets,
+                active_player_infosets: &player_one,
+                external_player_infosets: &player_two,
+                lazy: &lazy,
+                discounts: &discounts,
                 fork_depth,
-                start,
-                &chance_infosets,
-                &player_one,
-                &player_two,
-                &lazy,
-                &discounts,
-                SampleKey::new(seed, it, 0),
-            );
-            run_sweep::<false>(
-                parallel,
+            }
+            .run::<true>(parallel, start, SampleKey::new(seed, it, 0));
+            Sweep {
+                chance_infosets: &chance_infosets,
+                active_player_infosets: &player_two,
+                external_player_infosets: &player_one,
+                lazy: &lazy,
+                discounts: &discounts,
                 fork_depth,
-                start,
-                &chance_infosets,
-                &player_two,
-                &player_one,
-                &lazy,
-                &discounts,
-                SampleKey::new(seed, it, 1),
-            );
+            }
+            .run::<false>(parallel, start, SampleKey::new(seed, it, 1));
             lazy.cum_log_pos += lazy.log_pos_step;
             lazy.cum_log_neg += lazy.log_neg_step;
             if check {
@@ -601,7 +483,7 @@ mod tests {
     mod eager {
         use super::super::CachedInfoset;
         use super::super::data::{
-            Discounts, RegretInfoset, SampleKey, SampledChance, SolveInfo, should_check,
+            Discounts, SampleKey, SampledChance, SolveInfo, should_check,
         };
         use crate::{ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
         use std::cell::RefCell;
@@ -618,37 +500,25 @@ mod tests {
                 reach: f64,
                 rec: impl Fn(&Node, f64) -> f64,
             ) -> f64 {
-                let RegretInfoset {
-                    strat,
-                    cum_regret,
-                    cum_strat,
-                } = &mut self.reg;
                 let mut expected = 0.0;
-                for (((next, prob), cum_reg), cum_str) in player
-                    .actions
-                    .iter()
-                    .zip(strat.iter())
-                    .zip(cum_regret.iter_mut())
-                    .zip(cum_strat.iter_mut())
-                {
-                    let prob = f64::from(*prob);
+                for (next, action) in player.actions.iter().zip(self.reg.actions.iter_mut()) {
+                    let prob = action.strat();
                     let util = rec(next, reach * prob);
                     expected += prob * util;
-                    *cum_reg += util as f32;
-                    *cum_str += prob * reach;
+                    action.add_regret(util);
+                    action.cum_strat += prob * reach;
                 }
                 // account for only adding utility to cum_regret
-                for cum_reg in cum_regret.iter_mut() {
-                    *cum_reg -= expected as f32;
+                for action in &mut *self.reg.actions {
+                    action.add_regret(-expected);
                 }
                 expected
             }
 
             /// Regret match the next strategy and discount the cumulative regret (eager)
             fn advance(&mut self, discounts: &Discounts) -> f64 {
-                let bound =
-                    discounts.advance_infoset(&mut self.reg.cum_regret, &mut self.reg.strat);
-                discounts.discount_average_strat(&mut self.reg.cum_strat);
+                let bound = discounts.advance_infoset(&mut self.reg.actions);
+                discounts.discount_average_strat(&mut self.reg.actions);
                 bound
             }
         }
