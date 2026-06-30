@@ -1,7 +1,7 @@
 //! Vanilla and sampled cfr implementations
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 use super::data;
-use super::data::{Discounts, RegretInfoset, SampleKey, SampledChance, SolveInfo};
+use super::data::{Action, Discounts, RegretInfoset, SampleKey, SampledChance, SolveInfo};
 use crate::{Chance, ChanceInfoset, Node, Player, PlayerInfoset, PlayerNum, SolveParams};
 use std::cell::RefCell;
 use std::iter::Zip;
@@ -37,14 +37,14 @@ trait PlayerRecurse {
 
 impl PlayerRecurse for RegretInfoset {
     fn update_cum_strat(&mut self, prob: f64) {
-        for (val, cum) in self.strat.iter().zip(self.cum_strat.iter_mut()) {
-            *cum += prob * f64::from(*val);
+        for action in &mut *self.actions {
+            action.cum_strat += prob * action.strat();
         }
     }
 
     fn advance(&mut self, discounts: &Discounts) -> f64 {
-        let bound = discounts.advance_infoset(&mut self.cum_regret, &mut self.strat);
-        discounts.discount_average_strat(&mut self.cum_strat);
+        let bound = discounts.advance_infoset(&mut self.actions);
+        discounts.discount_average_strat(&mut self.actions);
         bound
     }
 }
@@ -78,15 +78,11 @@ fn recurse_single(
             // get infoset
             let mut info = player.num.ind(&player_infosets)[player.infoset].borrow_mut();
             info.update_cum_strat(*player.num.ind(&p_player));
-            let RegretInfoset {
-                strat, cum_regret, ..
-            } = &mut *info;
             let (res, sub) = recurse_player(
                 player,
                 p_chance,
                 p_player,
-                strat,
-                &mut **cum_regret,
+                &mut info.actions,
                 |next, p_next| {
                     recurse_single(
                         next,
@@ -98,20 +94,19 @@ fn recurse_single(
                     )
                 },
             );
-            for val in &mut info.cum_regret {
-                *val -= sub as f32;
+            for action in &mut *info.actions {
+                action.add_regret(-sub);
             }
             res
         }
     }
 }
 
-fn recurse_player<'a>(
+fn recurse_player(
     player: &Player,
     p_chance: f64,
     p_player: [f64; 2],
-    strat: &[f32],
-    cum_regret: impl IntoIterator<Item = &'a mut f32>,
+    actions: &mut [Action],
     rec: impl Fn(&Node, [f64; 2]) -> f64,
 ) -> (f64, f64) {
     let mult = match (player.num, p_player) {
@@ -121,15 +116,15 @@ fn recurse_player<'a>(
 
     let mut expected_one = 0.0;
     let mut expected = 0.0;
-    for ((next, prob), cum_reg) in player.actions.iter().zip(strat.iter()).zip(cum_regret) {
-        let prob = f64::from(*prob);
+    for (next, action) in player.actions.iter().zip(actions.iter_mut()) {
+        let prob = action.strat();
         let mut p_next = p_player;
         *player.num.ind_mut(&mut p_next) *= prob;
         let util_one = rec(next, p_next);
         let util = util_one * mult;
         expected_one += prob * util_one;
         expected += util * prob;
-        *cum_reg += util as f32;
+        action.add_regret(util);
     }
     (expected_one, expected)
 }
