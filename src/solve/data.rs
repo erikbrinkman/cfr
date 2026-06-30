@@ -81,33 +81,88 @@ impl SampledChance {
     }
 }
 
+/// One action's accumulators within an infoset.
+///
+/// Field order `(f32, f32, f64)` packs to 16 bytes with no padding, so all three accumulators live
+/// in one allocation and the ones an update touches together stay in the same cache line. Cumulative
+/// regret and the current strategy are `f32` to halve their footprint (sums over them use `f64`); the
+/// average-strategy accumulator stays `f64` because it grows large (the discount weighting can be
+/// `tᵞ`) and is summed over every iteration.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Action {
+    // cumulative regret and the current strategy are f64 quantities kept as f32 for storage, reached
+    // through the accessors below; the average-strategy accumulator is f64 throughout
+    cum_regret: f32,
+    strat: f32,
+    pub(super) cum_strat: f64,
+}
+
+impl Action {
+    /// An action at strategy probability `strat`, with regret and average strategy zeroed.
+    fn with_strat(strat: f32) -> Action {
+        Action {
+            strat,
+            ..Default::default()
+        }
+    }
+
+    /// The cumulative regret (widened from its f32 storage).
+    pub(super) fn regret(&self) -> f64 {
+        self.cum_regret.into()
+    }
+
+    /// Store `value` as the cumulative regret, rounding to the f32 storage.
+    pub(super) fn set_regret(&mut self, value: f64) {
+        self.cum_regret = value as f32;
+    }
+
+    /// Add `value` to the cumulative regret in f64, rounding to f32 only on store.
+    pub(super) fn add_regret(&mut self, value: f64) {
+        self.set_regret(self.regret() + value);
+    }
+
+    /// The current strategy probability (widened from its f32 storage).
+    pub(super) fn strat(&self) -> f64 {
+        self.strat.into()
+    }
+
+    /// Store `value` as the current strategy probability, rounding to the f32 storage.
+    pub(super) fn set_strat(&mut self, value: f64) {
+        self.strat = value as f32;
+    }
+}
+
 /// A player infoset for doing regret matching and tracking regret
 ///
-/// Cumulative regret and the current strategy are stored as `f32` to halve their memory footprint
-/// and let the inner loops pack more lanes; sums over them use `f64` accumulators. The average
-/// strategy accumulator stays `f64` because it grows large (the discount weighting can be `tᵞ`) and
-/// is summed over every iteration.
+/// The per-action accumulators live in one boxed slice of [`Action`]s.
 #[derive(Debug)]
 pub struct RegretInfoset {
-    pub cum_regret: Box<[f32]>,
-    pub cum_strat: Box<[f64]>,
-    pub strat: Box<[f32]>,
+    pub(super) actions: Box<[Action]>,
 }
 
 impl RegretInfoset {
     /// Create a new regret infoset given the number of actions
     pub fn new(num_actions: usize) -> Self {
+        // (f32, f32, f64) packs to 16 bytes with no padding, so an infoset is one tight allocation
+        debug_assert_eq!(size_of::<Action>(), 16, "Action should stay packed");
+        let uniform = 1.0 / num_actions as f32;
         RegretInfoset {
-            cum_regret: vec![0.0; num_actions].into_boxed_slice(),
-            cum_strat: vec![0.0; num_actions].into_boxed_slice(),
-            strat: vec![1.0 / num_actions as f32; num_actions].into_boxed_slice(),
+            actions: (0..num_actions)
+                .map(|_| Action::with_strat(uniform))
+                .collect(),
         }
     }
 
+    /// The current per-action strategy probabilities, for sampling.
+    pub(super) fn strat(&self) -> impl ExactSizeIterator<Item = f32> + '_ {
+        self.actions.iter().map(|action| action.strat)
+    }
+
     /// Convert this into its average strategy
-    pub fn into_avg_strat(mut self) -> Box<[f64]> {
-        avg_strat(&mut self.cum_strat);
-        self.cum_strat
+    pub fn into_avg_strat(self) -> Box<[f64]> {
+        let mut avg: Box<[f64]> = self.actions.iter().map(|action| action.cum_strat).collect();
+        avg_strat(&mut avg);
+        avg
     }
 }
 
@@ -277,51 +332,53 @@ impl RegretParams {
         }
     }
 
-    pub(super) fn regret_match(&self, cum_reg: &mut [f32], strat: &mut [f32]) {
-        debug_assert_eq!(cum_reg.len(), strat.len());
-        let norm: f64 = cum_reg
-            .iter_mut()
-            .map(|&mut v| f64::from(v))
-            .filter(|v| *v > 0.0)
+    pub(super) fn regret_match(&self, actions: &mut [Action]) {
+        let norm: f64 = actions
+            .iter()
+            .map(Action::regret)
+            .filter(|value| *value > 0.0)
             .sum();
         if norm > 0.0 {
-            for (&mut reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
-                *val = if reg > 0.0 {
-                    (f64::from(reg) / norm) as f32
+            for action in actions.iter_mut() {
+                action.set_strat(if action.regret() > 0.0 {
+                    action.regret() / norm
                 } else {
                     0.0
-                }
+                });
             }
         } else if self.no_positive == f64::INFINITY {
-            let (ind, _) = cum_reg
-                .iter_mut()
+            let ind = actions
+                .iter()
                 .enumerate()
-                .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap())
-                .unwrap();
-            strat.fill(0.0);
-            strat[ind] = 1.0;
+                .max_by(|(_, l), (_, r)| l.regret().partial_cmp(&r.regret()).unwrap())
+                .unwrap()
+                .0;
+            for (i, action) in actions.iter_mut().enumerate() {
+                action.set_strat(f64::from(i == ind));
+            }
         } else if self.no_positive == 0.0 {
-            strat.fill(1.0 / strat.len() as f32);
+            let uniform = 1.0 / actions.len() as f64;
+            for action in actions.iter_mut() {
+                action.set_strat(uniform);
+            }
         } else if self.no_positive == f64::NEG_INFINITY {
-            let (ind, _) = cum_reg
-                .iter_mut()
+            let ind = actions
+                .iter()
                 .enumerate()
-                .min_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap())
-                .unwrap();
-            strat.fill(0.0);
-            strat[ind] = 1.0;
+                .min_by(|(_, l), (_, r)| l.regret().partial_cmp(&r.regret()).unwrap())
+                .unwrap()
+                .0;
+            for (i, action) in actions.iter_mut().enumerate() {
+                action.set_strat(f64::from(i == ind));
+            }
         } else {
-            let max = cum_reg
-                .iter_mut()
-                .map(|&mut v| f64::from(v))
-                .reduce(f64::max)
-                .unwrap();
-            let norm: f64 = cum_reg
-                .iter_mut()
-                .map(|&mut reg| ((f64::from(reg) - max) * self.no_positive).exp())
+            let max = actions.iter().map(Action::regret).reduce(f64::max).unwrap();
+            let norm: f64 = actions
+                .iter()
+                .map(|action| ((action.regret() - max) * self.no_positive).exp())
                 .sum();
-            for (&mut reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
-                *val = (((f64::from(reg) - max) * self.no_positive).exp() / norm) as f32;
+            for action in actions.iter_mut() {
+                action.set_strat(((action.regret() - max) * self.no_positive).exp() / norm);
             }
         }
     }
@@ -424,21 +481,17 @@ impl<'a> Discounts<'a> {
     /// strategy, applies the discount, and tracks the running maximum used for the bound. The rare
     /// all-non-positive case (where the strategy is chosen by the `no_positive` policy rather than
     /// proportionally to regret) falls back to the standalone primitives.
-    pub(super) fn advance_infoset(&self, cum_reg: &mut [f32], strat: &mut [f32]) -> f64 {
-        let positive_norm: f64 = cum_reg
-            .iter_mut()
-            .map(|&mut v| f64::from(v))
-            .filter(|v| *v > 0.0)
+    pub(super) fn advance_infoset(&self, actions: &mut [Action]) -> f64 {
+        let positive_norm: f64 = actions
+            .iter()
+            .map(Action::regret)
+            .filter(|value| *value > 0.0)
             .sum();
         if positive_norm > 0.0 {
             let mut max = f64::NEG_INFINITY;
-            for (reg, val) in cum_reg.iter_mut().zip(strat.iter_mut()) {
-                let cur = f64::from(*reg);
-                *val = if cur > 0.0 {
-                    (cur / positive_norm) as f32
-                } else {
-                    0.0
-                };
+            for action in actions.iter_mut() {
+                let cur = action.regret();
+                action.set_strat(if cur > 0.0 { cur / positive_norm } else { 0.0 });
                 let discounted = if cur > 0.0 {
                     cur * self.pos
                 } else if cur < 0.0 {
@@ -446,36 +499,40 @@ impl<'a> Discounts<'a> {
                 } else {
                     cur
                 };
-                *reg = discounted as f32;
+                action.set_regret(discounted);
                 // read back the stored f32 so the bound matches the standalone primitives exactly
-                max = f64::max(max, f64::from(*reg));
+                max = f64::max(max, action.regret());
             }
             2.0 * f64::max(max, 0.0) / self.it as f64
         } else {
-            self.params.regret_match(cum_reg, strat);
-            self.discount_cum_regret(cum_reg);
-            self.regret_bound(cum_reg)
+            self.params.regret_match(actions);
+            self.discount_cum_regret(actions);
+            self.regret_bound(actions)
         }
     }
 
     /// Discount cumulative regret with the precomputed factors
-    pub(super) fn discount_cum_regret(&self, cum_reg: &mut [f32]) {
-        for reg in cum_reg.iter_mut() {
-            if *reg > 0.0 {
-                *reg = (f64::from(*reg) * self.pos) as f32;
-            } else if *reg < 0.0 {
-                *reg = (f64::from(*reg) * self.neg) as f32;
+    pub(super) fn discount_cum_regret(&self, actions: &mut [Action]) {
+        for action in actions.iter_mut() {
+            if action.regret() > 0.0 {
+                action.set_regret(action.regret() * self.pos);
+            } else if action.regret() < 0.0 {
+                action.set_regret(action.regret() * self.neg);
             }
         }
     }
 
     /// Discount the accumulated average strategy with the precomputed factor
-    pub(super) fn discount_average_strat(&self, avg_strat: &mut [f64]) {
+    pub(super) fn discount_average_strat(&self, actions: &mut [Action]) {
         match self.strat {
-            StratDiscount::Forget => avg_strat.fill(0.0),
+            StratDiscount::Forget => {
+                for action in actions.iter_mut() {
+                    action.cum_strat = 0.0;
+                }
+            }
             StratDiscount::Scale(ratio) => {
-                for avg in avg_strat.iter_mut() {
-                    *avg *= ratio;
+                for action in actions.iter_mut() {
+                    action.cum_strat *= ratio;
                 }
             }
             StratDiscount::Keep => {}
@@ -483,11 +540,11 @@ impl<'a> Discounts<'a> {
     }
 
     /// The regret bound contributed by an infoset given its cumulative regret
-    pub(super) fn regret_bound(&self, cum_reg: &mut [f32]) -> f64 {
+    pub(super) fn regret_bound(&self, actions: &[Action]) -> f64 {
         2.0 * f64::max(
-            cum_reg
-                .iter_mut()
-                .map(|&mut r| f64::from(r))
+            actions
+                .iter()
+                .map(Action::regret)
                 .reduce(f64::max)
                 .unwrap_or(0.0),
             0.0,
@@ -514,7 +571,41 @@ impl Eq for RegretParams {}
     unused_must_use
 )]
 mod tests {
-    use super::{Discounts, RegretParams};
+    use super::{Action, Discounts, RegretParams};
+
+    fn from_regret(regrets: &[f32]) -> Vec<Action> {
+        regrets
+            .iter()
+            .map(|&cum_regret| Action {
+                cum_regret,
+                strat: 0.0,
+                cum_strat: 0.0,
+            })
+            .collect()
+    }
+
+    fn from_cum_strat(cum_strats: &[f64]) -> Vec<Action> {
+        cum_strats
+            .iter()
+            .map(|&cum_strat| Action {
+                cum_regret: 0.0,
+                strat: 0.0,
+                cum_strat,
+            })
+            .collect()
+    }
+
+    fn strats(actions: &[Action]) -> Vec<f32> {
+        actions.iter().map(|action| action.strat).collect()
+    }
+
+    fn regrets(actions: &[Action]) -> Vec<f32> {
+        actions.iter().map(|action| action.cum_regret).collect()
+    }
+
+    fn cum_strats(actions: &[Action]) -> Vec<f64> {
+        actions.iter().map(|action| action.cum_strat).collect()
+    }
 
     #[test]
     fn avg_strat() {
@@ -525,104 +616,102 @@ mod tests {
 
     #[test]
     fn regret_match() {
-        let mut regs = [1.0, 2.0, 1.0, -3.0];
-        let mut strat = [0.0; 4];
-        RegretParams::new(0.0, 0.0, 0.0, 0.0).regret_match(&mut regs, &mut strat);
-        assert_eq!(strat, [0.25, 0.5, 0.25, 0.0]);
+        let mut acts = from_regret(&[1.0, 2.0, 1.0, -3.0]);
+        RegretParams::new(0.0, 0.0, 0.0, 0.0).regret_match(&mut acts);
+        assert_eq!(strats(&acts), [0.25, 0.5, 0.25, 0.0]);
 
-        let mut regs = [-1.0, -2.0];
-        let mut strat = [0.0; 2];
+        let mut acts = from_regret(&[-1.0, -2.0]);
 
-        RegretParams::new(0.0, 0.0, 0.0, 0.0).regret_match(&mut regs, &mut strat);
-        assert_eq!(strat, [0.5, 0.5]);
+        RegretParams::new(0.0, 0.0, 0.0, 0.0).regret_match(&mut acts);
+        assert_eq!(strats(&acts), [0.5, 0.5]);
 
-        RegretParams::new(0.0, 0.0, 0.0, f64::INFINITY).regret_match(&mut regs, &mut strat);
-        assert_eq!(strat, [1.0, 0.0]);
+        RegretParams::new(0.0, 0.0, 0.0, f64::INFINITY).regret_match(&mut acts);
+        assert_eq!(strats(&acts), [1.0, 0.0]);
 
-        RegretParams::new(0.0, 0.0, 0.0, f64::NEG_INFINITY).regret_match(&mut regs, &mut strat);
-        assert_eq!(strat, [0.0, 1.0]);
+        RegretParams::new(0.0, 0.0, 0.0, f64::NEG_INFINITY).regret_match(&mut acts);
+        assert_eq!(strats(&acts), [0.0, 1.0]);
 
-        RegretParams::new(0.0, 0.0, 0.0, 1.0).regret_match(&mut regs, &mut strat);
-        let [a, b] = strat;
-        assert!((0.6..0.9).contains(&a));
-        assert!((0.1..0.4).contains(&b));
+        RegretParams::new(0.0, 0.0, 0.0, 1.0).regret_match(&mut acts);
+        let strat = strats(&acts);
+        assert!((0.6..0.9).contains(&strat[0]));
+        assert!((0.1..0.4).contains(&strat[1]));
 
-        RegretParams::new(0.0, 0.0, 0.0, -1.0).regret_match(&mut regs, &mut strat);
-        let [a, b] = strat;
-        assert!((0.1..0.4).contains(&a));
-        assert!((0.6..0.9).contains(&b));
+        RegretParams::new(0.0, 0.0, 0.0, -1.0).regret_match(&mut acts);
+        let strat = strats(&acts);
+        assert!((0.1..0.4).contains(&strat[0]));
+        assert!((0.6..0.9).contains(&strat[1]));
     }
 
     #[test]
     fn discount_regs() {
-        let mut regs = [1.0, -1.0];
-        Discounts::new(&RegretParams::new(0.0, 0.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut regs);
-        assert_eq!(regs, [0.5, -0.5]);
+        let mut acts = from_regret(&[1.0, -1.0]);
+        Discounts::new(&RegretParams::new(0.0, 0.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut acts);
+        assert_eq!(regrets(&acts), [0.5, -0.5]);
 
-        let mut regs = [1.0, -1.0];
+        let mut acts = from_regret(&[1.0, -1.0]);
         Discounts::new(
             &RegretParams::new(f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.0),
             2,
             2,
         )
-        .discount_cum_regret(&mut regs);
-        assert_eq!(regs, [1.0, 0.0]);
+        .discount_cum_regret(&mut acts);
+        assert_eq!(regrets(&acts), [1.0, 0.0]);
 
-        let mut regs = [1.0, -1.0];
+        let mut acts = from_regret(&[1.0, -1.0]);
         Discounts::new(
             &RegretParams::new(f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0),
             2,
             2,
         )
-        .discount_cum_regret(&mut regs);
-        assert_eq!(regs, [0.0, -1.0]);
+        .discount_cum_regret(&mut acts);
+        assert_eq!(regrets(&acts), [0.0, -1.0]);
 
-        let mut regs = [1.0, -1.0];
-        Discounts::new(&RegretParams::new(1.0, 1.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut regs);
-        let [a, b] = regs;
-        assert!((0.6..0.9).contains(&a), "{}", a);
-        assert!((-0.9..-0.6).contains(&b), "{}", b);
+        let mut acts = from_regret(&[1.0, -1.0]);
+        Discounts::new(&RegretParams::new(1.0, 1.0, 0.0, 0.0), 2, 2).discount_cum_regret(&mut acts);
+        let regret = regrets(&acts);
+        assert!((0.6..0.9).contains(&regret[0]), "{}", regret[0]);
+        assert!((-0.9..-0.6).contains(&regret[1]), "{}", regret[1]);
     }
 
     #[test]
     fn discount_average_strat() {
-        let mut cum_strat = [1.0, 2.0];
+        let mut acts = from_cum_strat(&[1.0, 2.0]);
         Discounts::new(&RegretParams::new(0.0, 0.0, 0.0, 0.0), 1, 1)
-            .discount_average_strat(&mut cum_strat);
-        assert_eq!(cum_strat, [1.0, 2.0]);
+            .discount_average_strat(&mut acts);
+        assert_eq!(cum_strats(&acts), [1.0, 2.0]);
 
-        let mut cum_strat = [1.0, 2.0];
-        Discounts::new(&RegretParams::lcfr(), 1, 1).discount_average_strat(&mut cum_strat);
-        assert_eq!(cum_strat, [0.5, 1.0]);
+        let mut acts = from_cum_strat(&[1.0, 2.0]);
+        Discounts::new(&RegretParams::lcfr(), 1, 1).discount_average_strat(&mut acts);
+        assert_eq!(cum_strats(&acts), [0.5, 1.0]);
 
-        let mut cum_strat = [1.0, 2.0];
-        Discounts::new(&RegretParams::cfr_plus(), 1, 1).discount_average_strat(&mut cum_strat);
-        assert_eq!(cum_strat, [0.25, 0.5]);
+        let mut acts = from_cum_strat(&[1.0, 2.0]);
+        Discounts::new(&RegretParams::cfr_plus(), 1, 1).discount_average_strat(&mut acts);
+        assert_eq!(cum_strats(&acts), [0.25, 0.5]);
 
-        let mut cum_strat = [1.0, 2.0];
-        Discounts::new(&RegretParams::lcfr(), 2, 2).discount_average_strat(&mut cum_strat);
-        let [a, b] = cum_strat;
-        assert!((0.6..0.9).contains(&a), "{}", a);
-        assert!((1.1..1.9).contains(&b), "{}", b);
+        let mut acts = from_cum_strat(&[1.0, 2.0]);
+        Discounts::new(&RegretParams::lcfr(), 2, 2).discount_average_strat(&mut acts);
+        let cum_strat = cum_strats(&acts);
+        assert!((0.6..0.9).contains(&cum_strat[0]), "{}", cum_strat[0]);
+        assert!((1.1..1.9).contains(&cum_strat[1]), "{}", cum_strat[1]);
 
         let params = RegretParams::lcfr();
-        let mut cum_strat = [0.0];
+        let mut acts = from_cum_strat(&[0.0]);
         for t in 1..=5 {
-            cum_strat[0] += 1.0;
-            Discounts::new(&params, t, t).discount_average_strat(&mut cum_strat);
+            acts[0].cum_strat += 1.0;
+            Discounts::new(&params, t, t).discount_average_strat(&mut acts);
         }
         let expected = (1..=5).sum::<usize>() as f64 / (5 + 1) as f64;
-        assert!((cum_strat[0] - expected).abs() < 1e-6, "{}", cum_strat[0]);
+        assert!((cum_strats(&acts)[0] - expected).abs() < 1e-6, "{}", cum_strats(&acts)[0]);
     }
 
     #[test]
     fn regret_bound() {
-        let mut regs = [1.0, 2.0, 1.0, -3.0];
-        let res = Discounts::new(&RegretParams::vanilla(), 1, 1).regret_bound(&mut regs);
+        let acts = from_regret(&[1.0, 2.0, 1.0, -3.0]);
+        let res = Discounts::new(&RegretParams::vanilla(), 1, 1).regret_bound(&acts);
         assert_eq!(res, 4.0);
-        let res = Discounts::new(&RegretParams::vanilla(), 2, 2).regret_bound(&mut regs);
+        let res = Discounts::new(&RegretParams::vanilla(), 2, 2).regret_bound(&acts);
         assert_eq!(res, 2.0);
-        let res = Discounts::new(&RegretParams::vanilla(), 4, 4).regret_bound(&mut regs);
+        let res = Discounts::new(&RegretParams::vanilla(), 4, 4).regret_bound(&acts);
         assert_eq!(res, 1.0);
     }
 
@@ -649,19 +738,20 @@ mod tests {
                 for case in &cases {
                     let discounts = Discounts::new(params, it, it);
 
-                    let mut fused_reg = case.clone();
-                    let mut fused_strat = vec![0.0; case.len()];
-                    let fused_bound =
-                        discounts.advance_infoset(&mut fused_reg[..], &mut fused_strat);
+                    let mut fused = from_regret(case);
+                    let fused_bound = discounts.advance_infoset(&mut fused);
 
-                    let mut reg = case.clone();
-                    let mut strat = vec![0.0; case.len()];
-                    params.regret_match(&mut reg[..], &mut strat);
-                    discounts.discount_cum_regret(&mut reg[..]);
-                    let bound = discounts.regret_bound(&mut reg[..]);
+                    let mut acts = from_regret(case);
+                    params.regret_match(&mut acts);
+                    discounts.discount_cum_regret(&mut acts);
+                    let bound = discounts.regret_bound(&acts);
 
-                    assert_eq!(fused_strat, strat, "strat {params:?} it={it} {case:?}");
-                    assert_eq!(fused_reg, reg, "cum_regret {params:?} it={it} {case:?}");
+                    assert_eq!(strats(&fused), strats(&acts), "strat {params:?} it={it} {case:?}");
+                    assert_eq!(
+                        regrets(&fused),
+                        regrets(&acts),
+                        "cum_regret {params:?} it={it} {case:?}"
+                    );
                     assert_eq!(fused_bound, bound, "bound {params:?} it={it} {case:?}");
                 }
             }
