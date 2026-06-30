@@ -10,6 +10,7 @@ keywords = ["counterfactual", "regret", "incomplete", "information", "game"]
 [dependencies]
 by_address = "1.0"
 clap = { version = "4.0", features = ["derive", "wrap_help"], optional = true }
+dashmap = "6.1"
 gambit-parser = { version = "0.3", optional = true }
 indexmap = "2.0"
 rand = "0.10"

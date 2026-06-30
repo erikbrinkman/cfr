@@ -1,24 +1,10 @@
 //! Common data structures for solving games
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+use crate::splitmix::{GAMMA, finalize, fold};
 use core::convert::Infallible;
 use logaddexp::LogAddExp;
 use rand::TryRng;
 use rand_distr::{Distribution, weighted::WeightedAliasIndex};
-
-/// The splitmix64 increment (the golden-ratio gamma constant)
-const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// The splitmix64 finalizer that scrambles a state word into an output
-fn finalize(mut z: u64) -> u64 {
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// Fold a value into a running splitmix64 state (mix in the value, then finalize)
-fn fold(state: u64, value: u64) -> u64 {
-    finalize((state ^ value).wrapping_add(SPLITMIX_GAMMA))
-}
 
 /// A deterministic, seedable counter-based RNG (splitmix64) for sampling
 ///
@@ -31,7 +17,7 @@ pub(super) struct DetRng(u64);
 
 impl DetRng {
     fn step(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
+        self.0 = self.0.wrapping_add(GAMMA);
         finalize(self.0)
     }
 }
@@ -352,6 +338,25 @@ impl RegretParams {
             let denom = numer.ln_add_exp(0.0);
             (numer - denom).exp()
         }
+    }
+
+    /// The `(positive-regret, negative-regret, average-strategy)` discount factors for iteration
+    /// `it`. This lets the tree-free solver apply the same DCFR discounting the materialized solver
+    /// does, without depending on its f32 storage internals.
+    pub(crate) fn iteration_factors(&self, it: u64) -> (f64, f64, f64) {
+        let strat = if self.strat == f64::INFINITY {
+            0.0
+        } else if self.strat > 0.0 {
+            let float = it as f64;
+            (float / (float + 1.0)).powf(self.strat)
+        } else {
+            1.0
+        };
+        (
+            RegretParams::gen_discount(it, self.pos_regret),
+            RegretParams::gen_discount(it, self.neg_regret),
+            strat,
+        )
     }
 }
 

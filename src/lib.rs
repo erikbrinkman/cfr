@@ -11,9 +11,11 @@
 //! [extensive form game](https://en.wikipedia.org/wiki/Extensive-form_game) -- a state machine that
 //! classifies each state as terminal, chance, or player and yields its child states by index. See
 //! the trait for the contracts of implementation, and the `kuhn_poker` example for a full game.
-//! To solve, build a [`GameTree`] from the game with [`GameTree::from_game`] and call
-//! [`GameTree::solve`] (exact, with regret bounds). You can get equilibrium utilities and regret
-//! from [`Strategies::get_info`].
+//! There are then two ways to solve: for games small enough to fit in memory, build a [`GameTree`]
+//! with [`GameTree::from_game`] and call [`GameTree::solve`] (exact, with regret bounds); for games
+//! whose tree is too large to fit in memory, drive [`LazySolver`] directly, which keeps only a
+//! per-infoset regret table. You can get equilibrium utilities and regret from
+//! [`Strategies::get_info`].
 //!
 //! # Examples
 //!
@@ -74,12 +76,17 @@
 
 mod compact;
 mod error;
+mod history;
+mod lazy;
 mod regret;
 mod solve;
 mod split;
+mod splitmix;
 
 use compact::{Builder, OptBuilder};
 pub use error::{GameError, SolveError, StratError};
+pub use history::{Digest, History};
+pub use lazy::LazySolver;
 pub use solve::RegretParams;
 use solve::{external, vanilla};
 use split::{split_by, split_by_mut};
@@ -109,6 +116,14 @@ pub enum PlayerNum {
 }
 
 impl PlayerNum {
+    /// The player's index into a two-element array (`One` = 0, `Two` = 1).
+    fn index(self) -> usize {
+        match self {
+            PlayerNum::One => 0,
+            PlayerNum::Two => 1,
+        }
+    }
+
     fn ind<T>(self, arr: &[T; 2]) -> &T {
         match (self, arr) {
             (PlayerNum::One, [first, _]) => first,
@@ -346,7 +361,9 @@ impl<I, A> Eq for GameTree<I, A> {}
 
 impl<I: Hash + Eq, A: Hash + Eq> GameTree<I, A> {
     /// Build a [`GameTree`] from a [`Game`] state machine, so the exact (full-tree) solvers and
-    /// their regret bounds apply. Only suitable for games small enough to fit in memory.
+    /// their regret bounds apply. Only suitable for games small enough to fit in memory; for larger
+    /// games drive [`LazySolver`] directly. The same trait thus defines a game once for either
+    /// solver -- and materializing a small game cross-checks the tree-free solver against exact CFR.
     ///
     /// This is a single validating pass: the builder walks [`into_node`][Game::into_node]
     /// recursively, so no intermediate tree is materialized -- each node's children are visited and
