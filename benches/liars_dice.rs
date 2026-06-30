@@ -1,94 +1,78 @@
 #![feature(test, never_type)]
 extern crate test;
 
-use cfr::{Game, Moves, NodeType, Outcomes, PlayerNum, SolveMethod, SolveParams, GameTree};
+use cfr::{
+    Digest, Game, GameTree, History, LazySolver, Moves, NodeType, Outcomes, PlayerNum, SolveMethod,
+    SolveParams,
+};
 use num_integer::{binomial, multinomial};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::rc::Rc;
+use std::fmt::Debug;
+use std::hash::Hash;
 use test::Bencher;
 
-/// `D` = number of die faces.
-#[derive(Debug, Clone, PartialEq)]
-enum State<const D: usize> {
+/// How an infoset is keyed, so the same liar's-dice game can be solved with either primitive.
+///
+/// The implementor doubles as the running per-bid accumulator (`Exact` needs none -- the `History`
+/// already lives in `PlayState` for move generation), so the benches compare the two infoset-key
+/// primitives head to head on one game.
+trait InfoKey<const D: usize>: Clone + Default + Debug {
+    /// The resulting [`Game::Infoset`] key.
+    type Key: Clone + Eq + Hash + Send + Sync + Debug;
+
+    /// Record one more bid in the running history.
+    fn push(&mut self, bid: (u8, u8));
+    /// Finalize the infoset key for the acting player, whose private dice are `dice`.
+    fn finish(&self, bids: &History<(u8, u8)>, dice: [u8; D]) -> Self::Key;
+}
+
+/// Key the infoset by the exact bid `History` (an `Arc` cons-list): O(1) clone, exact equality.
+#[derive(Clone, Default, Debug)]
+struct Exact;
+
+/// Key the infoset by an `N`-lane rolling [`Digest`] of the bids and dice: `Copy`, no allocation,
+/// lossy.
+#[derive(Clone, Default, Debug)]
+struct Hashed<const N: usize>(Digest<N>);
+
+impl<const D: usize> InfoKey<D> for Exact {
+    type Key = ([u8; D], History<(u8, u8)>);
+
+    // the `History` already lives in `PlayState`, so there is nothing extra to accumulate
+    fn push(&mut self, _bid: (u8, u8)) {}
+
+    fn finish(&self, bids: &History<(u8, u8)>, dice: [u8; D]) -> Self::Key {
+        (dice, bids.clone())
+    }
+}
+
+impl<const D: usize, const N: usize> InfoKey<D> for Hashed<N> {
+    type Key = Digest<N>;
+
+    fn push(&mut self, bid: (u8, u8)) {
+        self.0 = self.0.push(&bid);
+    }
+
+    fn finish(&self, _bids: &History<(u8, u8)>, dice: [u8; D]) -> Self::Key {
+        // fold the acting player's private dice into the running bid digest
+        self.0.push(&dice)
+    }
+}
+
+/// `D` = number of die faces, `K` = how infosets are keyed (see [`InfoKey`]).
+#[derive(Debug, Clone)]
+enum State<const D: usize, K: InfoKey<D>> {
     Init(u8), // dice per player
-    Playing(PlayState<D>),
+    Playing(PlayState<D, K>),
     Terminal(f64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct PlayState<const D: usize> {
+#[derive(Debug, Clone)]
+struct PlayState<const D: usize, K: InfoKey<D>> {
     total_dice: u8,
-    one_dice: [u8; D], // counts per face
-    two_dice: [u8; D], // counts per face
-    bids: Bids,
-}
-
-/// Bid history as a persistent stack; the shared `Rc` tail makes push and clone O(1), and each node
-/// caches the stack's rolling hash so an infoset hashes in O(1) instead of walking the chain.
-#[derive(Debug, Clone, Default)]
-struct Bids(Option<Rc<BidNode>>);
-
-#[derive(Debug)]
-struct BidNode {
-    bid: (u8, u8), // (face, count)
-    len: usize,
-    digest: u64,
-    rest: Bids,
-}
-
-impl Bids {
-    fn len(&self) -> usize {
-        self.0.as_ref().map_or(0, |node| node.len)
-    }
-
-    fn last(&self) -> Option<(u8, u8)> {
-        self.0.as_ref().map(|node| node.bid)
-    }
-
-    fn digest(&self) -> u64 {
-        self.0.as_ref().map_or(0, |node| node.digest)
-    }
-
-    fn push(&self, bid: (u8, u8)) -> Bids {
-        let mut hasher = DefaultHasher::new();
-        (self.digest(), bid).hash(&mut hasher);
-        Bids(Some(Rc::new(BidNode {
-            bid,
-            len: self.len() + 1,
-            digest: hasher.finish(),
-            rest: self.clone(),
-        })))
-    }
-}
-
-impl Hash for Bids {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.digest());
-    }
-}
-
-impl PartialEq for Bids {
-    fn eq(&self, other: &Bids) -> bool {
-        match (&self.0, &other.0) {
-            (None, None) => true,
-            // shared tail or mismatched digest settles it in O(1); else fall back to structure
-            (Some(left), Some(right)) => {
-                Rc::ptr_eq(left, right)
-                    || (left.digest == right.digest
-                        && left.bid == right.bid
-                        && left.rest == right.rest)
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Bids {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Action {
-    Challenge,
-    Bid(u8, u8), // (face, count)
+    one_dice: [u8; D],       // counts per face
+    two_dice: [u8; D],       // counts per face
+    bids: History<(u8, u8)>, // (face, count) per bid; drives move generation
+    key: K,                  // running infoset-key accumulator
 }
 
 /// Number of distinct rolls of `num` dice over `faces` faces (weak compositions of `num`).
@@ -131,21 +115,26 @@ fn nth_roll<const D: usize>(num: u8, index: usize) -> ([u8; D], u64) {
 }
 
 /// The opening play state after dealing `per_player` dice to each player.
-fn dealt<const D: usize>(per_player: u8, one_dice: [u8; D], two_dice: [u8; D]) -> State<D> {
+fn dealt<const D: usize, K: InfoKey<D>>(
+    per_player: u8,
+    one_dice: [u8; D],
+    two_dice: [u8; D],
+) -> State<D, K> {
     State::Playing(PlayState {
         total_dice: per_player * 2,
         one_dice,
         two_dice,
-        bids: Bids::default(),
+        bids: History::new(),
+        key: K::default(),
     })
 }
 
-impl<const D: usize> PlayState<D> {
+impl<const D: usize, K: InfoKey<D>> PlayState<D, K> {
     /// Apply a player action, returning the successor state.
-    fn play(&self, action: Action) -> State<D> {
+    fn play(&self, action: Action) -> State<D, K> {
         match action {
             Action::Challenge => {
-                let (card, num) = self.bids.last().unwrap();
+                let (card, num) = self.bids.head().copied().unwrap();
                 let ind = card as usize;
                 let player_ind = self.bids.len() % 2;
                 let payoff =
@@ -156,14 +145,25 @@ impl<const D: usize> PlayState<D> {
                     };
                 State::Terminal(payoff)
             }
-            Action::Bid(card, num) => State::Playing(PlayState {
-                total_dice: self.total_dice,
-                one_dice: self.one_dice,
-                two_dice: self.two_dice,
-                bids: self.bids.push((card, num)),
-            }),
+            Action::Bid(card, num) => {
+                let mut key = self.key.clone();
+                key.push((card, num));
+                State::Playing(PlayState {
+                    total_dice: self.total_dice,
+                    one_dice: self.one_dice,
+                    two_dice: self.two_dice,
+                    bids: self.bids.push((card, num)),
+                    key,
+                })
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Action {
+    Challenge,
+    Bid(u8, u8), // (face, count)
 }
 
 /// The root chance node's joint dice rolls (the carrier for [`Game::Chance`]). Holds the per-player
@@ -183,12 +183,12 @@ impl<const D: usize> RollOutcomes<D> {
     }
 }
 
-impl<const D: usize> Game for State<D> {
+impl<const D: usize, K: InfoKey<D>> Game for State<D, K> {
     type Action = Action;
-    type Infoset = ([u8; D], Bids);
+    type Infoset = K::Key;
     type ChanceInfoset = !; // the single root roll is never correlated
     type Chance = RollOutcomes<D>;
-    type Player = PlayState<D>;
+    type Player = PlayState<D, K>;
 
     fn into_node(self) -> NodeType<Self> {
         match self {
@@ -200,31 +200,34 @@ impl<const D: usize> Game for State<D> {
                 } else {
                     (PlayerNum::Two, state.two_dice)
                 };
-                let infoset = (dice, state.bids.clone());
+                let infoset = state.key.finish(&state.bids, dice);
                 NodeType::Player(num, infoset, state)
             }
         }
     }
 }
 
-impl<const D: usize> Outcomes<State<D>> for RollOutcomes<D> {
+impl<const D: usize, K: InfoKey<D>> Outcomes<State<D, K>> for RollOutcomes<D> {
     // the joint deal is two independent player rolls, so index it as (one, two) in base `single`
     fn len(&self) -> usize {
         self.single * self.single
     }
 
-    fn get(&self, index: usize) -> (f64, State<D>) {
+    fn get(&self, index: usize) -> (f64, State<D, K>) {
         let (one, one_weight) = nth_roll::<D>(self.per_player, index / self.single);
         let (two, two_weight) = nth_roll::<D>(self.per_player, index % self.single);
-        ((one_weight * two_weight) as f64, dealt(self.per_player, one, two))
+        (
+            (one_weight * two_weight) as f64,
+            dealt::<D, K>(self.per_player, one, two),
+        )
     }
 }
 
 // Legal actions in a fixed order: challenge (if a bid stands), then same-count higher-face bids,
 // then strictly-higher-count bids (every face). `len`/`action` index that order directly.
-impl<const D: usize> Moves<State<D>> for PlayState<D> {
+impl<const D: usize, K: InfoKey<D>> Moves<State<D, K>> for PlayState<D, K> {
     fn len(&self) -> usize {
-        let last_bid = self.bids.last();
+        let last_bid = self.bids.head().copied();
         let (last_face, last_count) = last_bid.unwrap_or((D as u8 - 1, 0));
         let challenge = usize::from(last_bid.is_some());
         let higher_face = (D as u8 - 1 - last_face) as usize;
@@ -233,7 +236,7 @@ impl<const D: usize> Moves<State<D>> for PlayState<D> {
     }
 
     fn action(&self, index: usize) -> Action {
-        let last_bid = self.bids.last();
+        let last_bid = self.bids.head().copied();
         let challenge = usize::from(last_bid.is_some());
         if challenge == 1 && index == 0 {
             return Action::Challenge;
@@ -249,20 +252,20 @@ impl<const D: usize> Moves<State<D>> for PlayState<D> {
         Action::Bid((bid / per_face) as u8, last_count + 1 + (bid % per_face) as u8)
     }
 
-    fn apply(&self, index: usize) -> State<D> {
+    fn apply(&self, index: usize) -> State<D, K> {
         self.play(self.action(index))
     }
 }
 
 #[bench]
 fn building_small(b: &mut Bencher) {
-    b.iter(|| test::black_box(GameTree::from_game(State::<2>::Init(3)).unwrap()));
+    b.iter(|| test::black_box(GameTree::from_game(State::<2, Exact>::Init(3)).unwrap()));
 }
 
 #[bench]
 fn small_full_single(b: &mut Bencher) {
     // 2 2-sided dice
-    let game = GameTree::from_game(State::<2>::Init(2)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(2)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::Full, 1000, 0.0, 1, SolveParams::default())
             .unwrap()
@@ -272,7 +275,7 @@ fn small_full_single(b: &mut Bencher) {
 #[bench]
 fn small_sampled_single(b: &mut Bencher) {
     // 2 2-sided dice
-    let game = GameTree::from_game(State::<2>::Init(2)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(2)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::Sampled, 1000, 0.0, 1, SolveParams::default())
             .unwrap()
@@ -282,7 +285,7 @@ fn small_sampled_single(b: &mut Bencher) {
 #[bench]
 fn small_external_single(b: &mut Bencher) {
     // 2 2-sided dice
-    let game = GameTree::from_game(State::<2>::Init(2)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(2)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::External, 1000, 0.0, 1, SolveParams::default())
             .unwrap()
@@ -292,7 +295,7 @@ fn small_external_single(b: &mut Bencher) {
 #[bench]
 fn small_full_multi(b: &mut Bencher) {
     // 2 2-sided dice, default thread count
-    let game = GameTree::from_game(State::<2>::Init(2)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(2)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::Full, 1000, 0.0, 0, SolveParams::default())
             .unwrap()
@@ -302,7 +305,7 @@ fn small_full_multi(b: &mut Bencher) {
 #[bench]
 fn small_external_multi(b: &mut Bencher) {
     // 2 2-sided dice, default thread count
-    let game = GameTree::from_game(State::<2>::Init(2)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(2)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::External, 1000, 0.0, 0, SolveParams::default())
             .unwrap()
@@ -312,10 +315,89 @@ fn small_external_multi(b: &mut Bencher) {
 #[bench]
 fn medium_external_single(b: &mut Bencher) {
     // 3 2-sided dice produces a substantially larger tree
-    let game = GameTree::from_game(State::<2>::Init(3)).unwrap();
+    let game = GameTree::from_game(State::<2, Exact>::Init(3)).unwrap();
     b.iter(|| {
         game.solve(SolveMethod::External, 200, 0.0, 1, SolveParams::default())
             .unwrap()
+    });
+}
+
+// The tree-free path keeps only a per-infoset regret table, so these pairs solve the same game and
+// iteration count with each infoset-key primitive -- the exact `History` vs the lossy `Digest` --
+// to compare them head to head.
+#[bench]
+fn small_lazy_history(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Exact>::Init(2), 1000);
+        test::black_box(solver)
+    });
+}
+
+#[bench]
+fn small_lazy_digest(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Hashed<1>>::Init(2), 1000);
+        test::black_box(solver)
+    });
+}
+
+// the wider digest halves the collision odds again for an extra lane of hashing per push
+#[bench]
+fn small_lazy_digest_wide(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Hashed<2>>::Init(2), 1000);
+        test::black_box(solver)
+    });
+}
+
+#[bench]
+fn medium_lazy_history(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Exact>::Init(3), 200);
+        test::black_box(solver)
+    });
+}
+
+#[bench]
+fn medium_lazy_digest(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Hashed<1>>::Init(3), 200);
+        test::black_box(solver)
+    });
+}
+
+#[bench]
+fn medium_lazy_digest_wide(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Hashed<2>>::Init(3), 200);
+        test::black_box(solver)
+    });
+}
+
+// 8 2-sided dice per player: a deep game (long bid histories) the lazy path explores only along
+// sampled trajectories -- the regime where History's growing Arc chains cost most against Digest's
+// flat key
+#[bench]
+fn large_lazy_history(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Exact>::Init(8), 100);
+        test::black_box(solver)
+    });
+}
+
+#[bench]
+fn large_lazy_digest(b: &mut Bencher) {
+    b.iter(|| {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&State::<2, Hashed<1>>::Init(8), 100);
+        test::black_box(solver)
     });
 }
 
