@@ -304,11 +304,62 @@ fn get_global_info(game: &ExtensiveFormGame<'_>) -> Result<GlobalInfo, GambitErr
 #[cfg(test)]
 mod tests {
     use super::{GambitError, GambitNode};
-    use cfr::GameTree;
+    use cfr::{GameTree, PlayerNum, SolveMethod, SolveParams};
     use gambit_parser::ExtensiveFormGame;
 
     fn parse(raw: &str) -> ExtensiveFormGame<'_> {
         ExtensiveFormGame::try_from(raw).unwrap()
+    }
+
+    #[test]
+    fn error_messages_render() {
+        for err in [
+            GambitError::PlayerCount(3),
+            GambitError::NonFinitePayoff,
+            GambitError::NotConstantSum,
+        ] {
+            assert!(!err.to_string().is_empty(), "{err:?} rendered empty");
+        }
+    }
+
+    #[test]
+    fn solves_matching_pennies() {
+        // player one picks a side, player two answers from one shared infoset; matching pays player
+        // one. Solving the materialized game exercises the player into_node branch, the move carrier,
+        // and the named-strategy output (GambitInfoset Display).
+        let game = parse(
+            r#"EFG 2 R "" { "" "" } p "" 1 1 "p1" { "h" "t" } 0 p "" 2 2 "p2" { "h" "t" } 0 t "" 1 { 1 -1 } t "" 2 { -1 1 } p "" 2 2 "p2" { "h" "t" } 0 t "" 3 { -1 1 } t "" 4 { 1 -1 }"#,
+        );
+        let node = GambitNode::try_from(&game).unwrap();
+        let tree = GameTree::from_game(node).unwrap();
+        let (strats, bound) = tree
+            .solve(SolveMethod::Full, 50_000, 0.0, 1, SolveParams::default())
+            .unwrap();
+        for player in [PlayerNum::One, PlayerNum::Two] {
+            assert!(
+                bound.player_regret_bound(player) < 0.02,
+                "player {player:?} not converged"
+            );
+        }
+        for named in strats.as_named() {
+            for (infoset, actions) in named {
+                assert!(!infoset.to_string().is_empty());
+                for (action, prob) in actions {
+                    let _ = action.to_string();
+                    assert!((prob - 0.5).abs() < 0.05, "not ~50/50: {prob}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn handles_chance_nodes() {
+        // a chance node exercises the chance into_node branch and the outcome carrier
+        let game = parse(
+            r#"EFG 2 R "" { "" "" } c "" 1 "ch" { "x" 1/2 "y" 1/2 } 0 t "" 1 { 1 -1 } t "" 2 { -1 1 }"#,
+        );
+        let node = GambitNode::try_from(&game).unwrap();
+        GameTree::from_game(node).unwrap();
     }
 
     #[test]
