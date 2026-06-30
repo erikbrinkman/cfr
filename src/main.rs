@@ -327,8 +327,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliError, solve_auto};
+    use super::{Args, CliError, GambitError, solve_auto, solve_gambit, solve_json};
     use clap::{CommandFactory, Parser};
+
+    // matching pennies as a json game: a converging two-player game to drive the solve path
+    const PENNIES: &str = r#"{ "player": { "player_one": true, "infoset": "p1", "actions": {
+        "h": { "player": { "player_one": false, "infoset": "p2", "actions": {
+            "h": { "terminal": 1.0 }, "t": { "terminal": -1.0 } } } },
+        "t": { "player": { "player_one": false, "infoset": "p2", "actions": {
+            "h": { "terminal": -1.0 }, "t": { "terminal": 1.0 } } } } } } }"#;
 
     fn default_args() -> Args {
         Args::parse_from(["cfr"])
@@ -353,5 +360,57 @@ mod tests {
     fn auto_rejects_unknown() {
         let err = solve_auto("random", &default_args()).unwrap_err();
         assert!(matches!(err, CliError::UnknownFormat));
+    }
+
+    #[test]
+    fn error_messages_render() {
+        let errors = [
+            CliError::ParseJson,
+            CliError::ParseGambit,
+            CliError::Gambit(GambitError::NotConstantSum),
+            CliError::Materialize,
+            CliError::UnknownFormat,
+        ];
+        for err in errors {
+            assert!(!err.to_string().is_empty());
+            // Debug delegates to Display, so the message surfaces when `main` unwraps
+            assert_eq!(format!("{err:?}"), err.to_string());
+        }
+    }
+
+    #[test]
+    fn reports_input_errors() {
+        let args = default_args();
+        assert!(matches!(solve_json("not json", &args), Err(CliError::ParseJson)));
+        assert!(matches!(
+            solve_gambit("not gambit", &args),
+            Err(CliError::ParseGambit)
+        ));
+        // parses as gambit but has three players
+        assert!(matches!(
+            solve_gambit(r#"EFG 2 R "" { "" "" "" } t "" 1 { 0 0 0 }"#, &args),
+            Err(CliError::Gambit(_))
+        ));
+        // parses as json but isn't a valid game (a zero-probability lone chance outcome)
+        let bad = r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#;
+        assert!(matches!(solve_json(bad, &args), Err(CliError::Materialize)));
+    }
+
+    #[test]
+    fn solves_across_methods_and_discounts() {
+        for method in ["full", "sampled", "external"] {
+            for discount in ["vanilla", "lcfr", "cfr-plus", "dcfr", "dcfr-prune"] {
+                let args = Args::parse_from(["cfr", "-m", method, "-d", discount, "-t", "50"]);
+                let out = solve_json(PENNIES, &args).unwrap();
+                assert!(out.regret.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn clip_threshold_runs_the_pruning_path() {
+        let args = Args::parse_from(["cfr", "-c", "0.1", "-t", "200"]);
+        let out = solve_json(PENNIES, &args).unwrap();
+        assert!(out.regret.is_finite());
     }
 }
