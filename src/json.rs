@@ -91,7 +91,24 @@ impl<'a> Moves<&'a State> for &'a IndexMap<String, State> {
 
 #[cfg(test)]
 mod tests {
-    use cfr::{GameTree, PlayerNum, SolveMethod, SolveParams};
+    use cfr::{GameTree, LazySolver, PlayerNum, SolveMethod, SolveParams};
+
+    #[test]
+    fn lazy_solver_walks_the_game() {
+        // the tree-free solver drives `&State` on demand, exercising the Moves/Outcomes
+        // len/get/apply that GameTree materialization (which goes through `iter`) never calls
+        let state: super::State = serde_json::from_str(
+            r#"{ "chance": { "outcomes": {
+                "deal": { "prob": 1.0, "state": { "player": { "player_one": true, "infoset": "p1",
+                    "actions": { "h": { "terminal": 1.0 }, "t": { "terminal": -1.0 } } } } } } } }"#,
+        )
+        .unwrap();
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&&state, 500);
+        // player one always prefers heads (payoff 1 vs -1)
+        let strat = solver.average(PlayerNum::One, &"p1").unwrap();
+        assert!(strat[0] > 0.9, "should favor heads: {strat:?}");
+    }
 
     #[test]
     fn parses_terminal() {
