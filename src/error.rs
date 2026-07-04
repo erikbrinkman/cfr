@@ -417,8 +417,6 @@ mod strat_errors {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
 pub enum SolveError {
-    /// Returned when the requested number of threads was too large
-    ThreadOverflow,
     /// Returned when a multi-threaded solver couldn't create a thread pool
     ThreadSpawnError,
 }
