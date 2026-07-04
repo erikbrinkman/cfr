@@ -18,25 +18,47 @@ Usage
 To use the library part of this crate, add the following to your `Cargo.toml`.
 ```toml
 [dependencies]
-cfr = { version = "0.1.0", default-features = false }
+cfr = { version = "0.5.0", default-features = false }
 ```
 
 Then implement
-[`IntoGameNode`](https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html), for
-a type that represents a node in your game tree (or alternatively can generate
-new nodes).
+[`Game`](https://docs.rs/cfr/latest/cfr/trait.Game.html) for a type that
+represents a state in your game tree. `into_node` classifies each state as
+terminal, chance, or player, and the [`Outcomes`] / [`Moves`] carriers yield its
+child states by index. See the
+[kuhn_poker example](https://github.com/erikbrinkman/cfr/blob/main/examples/kuhn_poker.rs)
+for a full game.
 
-Finally execute:
+There are two ways to solve. For games small enough to fit in memory, build a
+[`GameTree`] and solve it exactly (with regret bounds):
 ```rust
-use cfr::{Game, IntoGameNode};
-struct MyData { ... }
-impl IntoGameNode for MyData { ... }
-let game = Game::from_root(...)?;
-let strategies = game.solve_external();
+use cfr::{GameTree, SolveMethod, SolveParams};
+let game = GameTree::from_game(root)?;
+let (strategies, regret_bound) = game.solve(
+    SolveMethod::External, // sampling method
+    10_000,                // max iterations
+    0.0,                   // early-termination regret
+    0,                     // threads (0 = all cores)
+    SolveParams::default(),
+)?;
 let info = strategies.get_info();
 let regret = info.regret();
 let [player_one, player_two] = strategies.as_named();
 ```
+
+For games whose tree is too large to materialize, drive
+[`LazySolver`](https://docs.rs/cfr/latest/cfr/struct.LazySolver.html) directly on
+the same [`Game`] -- it keeps only a per-infoset regret table:
+```rust
+use cfr::LazySolver;
+let mut solver = LazySolver::new(min_payoff, max_payoff);
+solver.run(&root, 10_000);
+let strategy = solver.average(player, &infoset);
+```
+
+[`Outcomes`]: https://docs.rs/cfr/latest/cfr/trait.Outcomes.html
+[`Moves`]: https://docs.rs/cfr/latest/cfr/trait.Moves.html
+[`GameTree`]: https://docs.rs/cfr/latest/cfr/struct.GameTree.html
 
 ### Binary
 
@@ -53,12 +75,13 @@ regrets and the strategy found in json format.
 ```bash
 $ cfr -i game_file
 {
-  "expected_one_utility": 0.05555555727916178,
+  "regret": 8.061797025377127e-05,
+  "player_one_utility": 0.05555555727916178,
+  "player_two_utility": -0.05555555727916178,
   "player_one_regret": 1.186075528125663e-06,
   "player_two_regret": 8.061797025377127e-05,
-  "regret": 8.061797025377127e-05,
   "player_one_strategy": { ... },
-  "player_two_regret": { ... }
+  "player_two_strategy": { ... }
 }
 ```
 
@@ -136,7 +159,7 @@ Examples
 --------
 
 If implementing
-[IntoGameNode](https://docs.rs/cfr/latest/cfr/trait.IntoGameNode.html) is
+[Game](https://docs.rs/cfr/latest/cfr/trait.Game.html) is
 confusing for your game, here are more complicated examples of games that don't
 quite fit in the documentation:
 
