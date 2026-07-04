@@ -1,7 +1,7 @@
 mod gambit;
 mod json;
 
-use cfr::{Game, GameTree, PlayerNum, RegretParams, SolveMethod, SolveParams};
+use cfr::{Game, GameError, GameTree, PlayerNum, RegretParams, SolveMethod, SolveParams};
 use gambit::{GambitError, GambitNode};
 use gambit_parser::ExtensiveFormGame;
 use clap::{Parser, ValueEnum};
@@ -197,14 +197,15 @@ fn main() {
 
 /// A user-facing failure from reading or solving the input game.
 enum CliError {
-    /// The input wasn't valid json.
-    ParseJson,
-    /// The input wasn't a valid gambit `.efg` file.
-    ParseGambit,
+    /// The input wasn't valid json; carries serde_json's line/column detail.
+    ParseJson(serde_json::Error),
+    /// The input wasn't a valid gambit `.efg` file; carries the parser's rendered message (which
+    /// borrows the input, so it's captured as an owned string).
+    ParseGambit(String),
     /// The gambit game couldn't be read as a two-player zero-sum game.
     Gambit(GambitError),
     /// The game violated a structural invariant the solver requires.
-    Materialize,
+    Materialize(GameError),
     /// Auto-detection matched no known format.
     UnknownFormat,
 }
@@ -212,18 +213,18 @@ enum CliError {
 impl Display for CliError {
     fn fmt(&self, out: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            CliError::ParseJson => write!(
+            CliError::ParseJson(err) => write!(
                 out,
-                "couldn't parse json game definition : https://github.com/erikbrinkman/cfr#json-error"
+                "couldn't parse json game definition: {err} : https://github.com/erikbrinkman/cfr#json-error"
             ),
-            CliError::ParseGambit => write!(
+            CliError::ParseGambit(err) => write!(
                 out,
-                "couldn't parse gambit game definition : https://github.com/erikbrinkman/cfr#gambit-error"
+                "couldn't parse gambit game definition: {err} : https://github.com/erikbrinkman/cfr#gambit-error"
             ),
             CliError::Gambit(err) => Display::fmt(err, out),
-            CliError::Materialize => write!(
+            CliError::Materialize(err) => write!(
                 out,
-                "couldn't extract a compact game representation due to problems with the structure : https://github.com/erikbrinkman/cfr#game-error"
+                "couldn't extract a compact game representation due to problems with the structure ({err}) : https://github.com/erikbrinkman/cfr#game-error"
             ),
             CliError::UnknownFormat => write!(
                 out,
@@ -242,13 +243,14 @@ impl fmt::Debug for CliError {
 
 /// Parse a json game (the `&State` is the game) and solve it.
 fn solve_json(buff: &str, args: &Args) -> Result<Output, CliError> {
-    let state: json::State = serde_json::from_str(buff).map_err(|_| CliError::ParseJson)?;
+    let state: json::State = serde_json::from_str(buff).map_err(CliError::ParseJson)?;
     solve_game(&state, 0.0, args)
 }
 
 /// Parse a gambit game (the [`GambitNode`] cursor keeps borrowing the parsed tree) and solve it.
 fn solve_gambit(buff: &str, args: &Args) -> Result<Output, CliError> {
-    let parsed = ExtensiveFormGame::try_from(buff).map_err(|_| CliError::ParseGambit)?;
+    let parsed =
+        ExtensiveFormGame::try_from(buff).map_err(|err| CliError::ParseGambit(err.to_string()))?;
     let game = GambitNode::try_from(&parsed).map_err(CliError::Gambit)?;
     let sum = game.sum();
     solve_game(game, sum, args)
@@ -276,7 +278,7 @@ where
     G::Action: Eq + Hash + Display,
     G::ChanceInfoset: Eq + Hash,
 {
-    let game = GameTree::from_game(game).map_err(|_| CliError::Materialize)?;
+    let game = GameTree::from_game(game).map_err(CliError::Materialize)?;
     let max_iters = if args.max_iters == 0 {
         u64::MAX
     } else {
@@ -327,7 +329,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, CliError, GambitError, solve_auto, solve_gambit, solve_json};
+    use super::{Args, CliError, GameError, GambitError, solve_auto, solve_gambit, solve_json};
     use clap::{CommandFactory, Parser};
 
     // matching pennies as a json game: a converging two-player game to drive the solve path
@@ -364,11 +366,12 @@ mod tests {
 
     #[test]
     fn error_messages_render() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let errors = [
-            CliError::ParseJson,
-            CliError::ParseGambit,
+            CliError::ParseJson(json_err),
+            CliError::ParseGambit("error parsing game at: 'oops'".to_owned()),
             CliError::Gambit(GambitError::NotConstantSum),
-            CliError::Materialize,
+            CliError::Materialize(GameError::ImperfectRecall),
             CliError::UnknownFormat,
         ];
         for err in errors {
@@ -381,10 +384,13 @@ mod tests {
     #[test]
     fn reports_input_errors() {
         let args = default_args();
-        assert!(matches!(solve_json("not json", &args), Err(CliError::ParseJson)));
+        assert!(matches!(
+            solve_json("not json", &args),
+            Err(CliError::ParseJson(_))
+        ));
         assert!(matches!(
             solve_gambit("not gambit", &args),
-            Err(CliError::ParseGambit)
+            Err(CliError::ParseGambit(_))
         ));
         // parses as gambit but has three players
         assert!(matches!(
@@ -393,7 +399,10 @@ mod tests {
         ));
         // parses as json but isn't a valid game (a zero-probability lone chance outcome)
         let bad = r#"{ "chance": { "outcomes": { "a": { "prob": 0.0, "state": { "terminal": 0.0 } } } } }"#;
-        assert!(matches!(solve_json(bad, &args), Err(CliError::Materialize)));
+        assert!(matches!(
+            solve_json(bad, &args),
+            Err(CliError::Materialize(_))
+        ));
     }
 
     #[test]
