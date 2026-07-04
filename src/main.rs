@@ -317,7 +317,7 @@ where
     Ok(Output {
         regret: info.regret(),
         player_one_utility: info.player_utility(PlayerNum::One) + sum,
-        player_two_utility: info.player_utility(PlayerNum::Two) - sum,
+        player_two_utility: info.player_utility(PlayerNum::Two) + sum,
         player_one_regret: info.player_regret(PlayerNum::One),
         player_two_regret: info.player_regret(PlayerNum::Two),
         player_one_strategy,
@@ -405,6 +405,25 @@ mod tests {
                 assert!(out.regret.is_finite());
             }
         }
+    }
+
+    #[test]
+    fn reports_both_constant_sum_utilities() {
+        // a constant-sum-4 game (no decisions): chance pays player one 3 or 1 with equal odds, so
+        // player one expects 2.0 and -- since payoffs sum to 4 -- player two also expects 2.0. The
+        // constant-sum offset must be added back to *both* reported utilities.
+        let game = r#"EFG 2 R "" { "" "" } c "" 1 "c" { "x" 1/2 "y" 1/2 } 0 t "" 1 { 3 1 } t "" 2 { 1 3 }"#;
+        let out = solve_gambit(game, &default_args()).unwrap();
+        assert!(
+            (out.player_one_utility - 2.0).abs() < 1e-9,
+            "player one: {}",
+            out.player_one_utility
+        );
+        assert!(
+            (out.player_two_utility - 2.0).abs() < 1e-9,
+            "player two: {}",
+            out.player_two_utility
+        );
     }
 
     #[test]
