@@ -55,9 +55,23 @@ impl SampleKey {
         SampleKey(fold(fold(seed, iteration), sweep))
     }
 
-    /// A fresh deterministic RNG for the given infoset
-    pub(super) fn rng(self, infoset: u32) -> DetRng {
-        DetRng(fold(self.0, u64::from(infoset)))
+    /// A fresh deterministic RNG for a chance infoset.
+    pub(super) fn chance_rng(self, infoset: u32) -> DetRng {
+        self.rng(0, infoset)
+    }
+
+    /// A fresh deterministic RNG for a player infoset.
+    ///
+    /// Chance and player infosets are independent dense 0-based ranges, so keying both off the bare
+    /// index would give a chance node and an opponent node that share an index bit-identical streams
+    /// -- correlating their draws and biasing external-sampling estimates. A distinct `domain` per
+    /// kind keeps the two key spaces disjoint.
+    pub(super) fn player_rng(self, infoset: u32) -> DetRng {
+        self.rng(1, infoset)
+    }
+
+    fn rng(self, domain: u64, infoset: u32) -> DetRng {
+        DetRng(fold(fold(self.0, domain), u64::from(infoset)))
     }
 }
 

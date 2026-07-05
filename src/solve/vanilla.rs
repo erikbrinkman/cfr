@@ -24,7 +24,7 @@ impl ChanceRecurse for FullChance<'_> {
 
 impl ChanceRecurse for SampledChance {
     fn next_nodes<'b>(&self, chance: &'b Chance, key: SampleKey) -> ChanceIter<'_, 'b> {
-        let ind = self.sample(&mut key.rng(chance.infoset as u32));
+        let ind = self.sample(&mut key.chance_rng(chance.infoset as u32));
         [1.0].iter().zip(chance.outcomes[ind..=ind].iter())
     }
 }
