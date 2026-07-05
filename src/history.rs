@@ -101,6 +101,19 @@ impl<T> Clone for History<T> {
     }
 }
 
+impl<T> Drop for History<T> {
+    fn drop(&mut self) {
+        // walk the chain, stopping at the first node another handle still shares (it owns the rest)
+        let mut current = self.0.take();
+        while let Some(node) = current {
+            match Arc::try_unwrap(node) {
+                Ok(mut node) => current = node.rest.0.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 impl<T> Default for History<T> {
     fn default() -> Self {
         History::new()
@@ -117,18 +130,28 @@ impl<T> Hash for History<T> {
 
 impl<T: PartialEq> PartialEq for History<T> {
     fn eq(&self, other: &History<T>) -> bool {
-        match (&self.0, &other.0) {
-            (None, None) => true,
-            // a shared tail or a digest/length mismatch settles it in O(1); otherwise fall back to a
-            // structural compare so a digest collision can't conflate distinct histories
-            (Some(left), Some(right)) => {
-                Arc::ptr_eq(left, right)
-                    || (left.digest == right.digest
-                        && left.len == right.len
-                        && left.value == right.value
-                        && left.rest == right.rest)
+        // a shared tail or a digest/length mismatch settles it in O(1); otherwise compare node-by-node
+        // so a digest collision can't conflate distinct histories
+        let mut left = &self.0;
+        let mut right = &other.0;
+        loop {
+            match (left, right) {
+                (None, None) => return true,
+                (Some(left_node), Some(right_node)) => {
+                    if Arc::ptr_eq(left_node, right_node) {
+                        return true;
+                    }
+                    if left_node.digest != right_node.digest
+                        || left_node.len != right_node.len
+                        || left_node.value != right_node.value
+                    {
+                        return false;
+                    }
+                    left = &left_node.rest.0;
+                    right = &right_node.rest.0;
+                }
+                _ => return false,
             }
-            _ => false,
         }
     }
 }
@@ -247,6 +270,26 @@ mod tests {
         let clone = history.clone();
         assert_eq!(history, clone);
         assert_eq!(history.iter().copied().collect::<Vec<_>>(), vec![2, 1]);
+    }
+
+    #[test]
+    fn deep_history_drops_and_compares_without_overflow() {
+        // a recursive Drop or eq would overflow the stack at this depth; the iterative impls handle
+        // it. History targets games with astronomically long play sequences, so this is realistic.
+        const DEPTH: u64 = 500_000;
+        let deep = |extra: u64| {
+            let mut history = History::new();
+            for value in 0..DEPTH + extra {
+                history = history.push(value);
+            }
+            history
+        };
+        let left = deep(0);
+        let right = deep(0); // independent and unshared, so eq must walk the whole chain
+        assert_eq!(left, right);
+        assert_ne!(left, deep(1)); // differing length is caught without deep recursion
+        drop(left);
+        drop(right);
     }
 
     #[test]
