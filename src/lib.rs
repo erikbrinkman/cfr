@@ -1097,9 +1097,10 @@ impl<'a, I, A> Strategies<'a, I, A> {
 
     /// Get the distance between this strategy and another strategy
     ///
-    /// This computes the avg of the l-`p` earth movers distance between the strategies for each
-    /// player, thus the value is between 0 and 1 where 0 represents identical strategies, and 1
-    /// represents strategies that share no support.
+    /// This computes, per player, the average over infosets of the l-`p` distance between the two
+    /// action distributions, each halved so a fully disjoint pair of distributions reads as 1. The
+    /// result is thus between 0 and 1, where 0 represents identical strategies and 1 strategies that
+    /// share no support. For `p == 1` this is the (mean) total-variation distance.
     ///
     /// This is only a valid distance if `p` is at least 1, which should also be the default
     /// setting.
@@ -1120,12 +1121,26 @@ impl<'a, I, A> Strategies<'a, I, A> {
             .iter()
             .zip(other.probs.iter())
             .zip(self.game.player_infosets.iter())
-            .map(|((left, right), info)| {
-                let mut dist = 0.0;
-                for (left_val, right_val) in left.iter().zip(right.iter()) {
-                    dist += (left_val - right_val).abs().powf(p);
+            .map(|((left, right), infos)| {
+                let num_infosets = infos.len();
+                if num_infosets == 0 {
+                    return 0.0;
                 }
-                dist / info.len() as f64
+                let lens = || infos.iter().map(PlayerInfosetData::num_actions);
+                let total: f64 = split_by(left, lens())
+                    .zip(split_by(right, lens()))
+                    .map(|(left_strat, right_strat)| {
+                        let sum: f64 = left_strat
+                            .iter()
+                            .zip(right_strat.iter())
+                            .map(|(left_val, right_val)| (left_val - right_val).abs().powf(p))
+                            .sum();
+                        // halve the l-p total (so disjoint support gives 1) before the p-th root, so
+                        // each infoset contributes a value in [0, 1]
+                        (0.5 * sum).powf(1.0 / p)
+                    })
+                    .sum();
+                total / num_infosets as f64
             })
             .collect();
         dists.try_into().unwrap()
@@ -1397,6 +1412,32 @@ mod tests {
 
         let cloned = game.from_named(fast.as_named()).unwrap();
         assert_eq!(fast, cloned);
+    }
+
+    #[test]
+    fn distance_is_bounded() {
+        let game = create_game();
+        // player one's "y" and player two's "z" flip to disjoint support between left and right
+        let left = game
+            .from_named([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 0.0)])],
+                vec![("z", vec![("b", 1.0), ("c", 0.0)])],
+            ])
+            .unwrap();
+        let right = game
+            .from_named([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 0.0), ("d", 1.0)])],
+                vec![("z", vec![("b", 0.0), ("c", 1.0)])],
+            ])
+            .unwrap();
+        // identical strategies are distance 0
+        assert_eq!(left.distance(&left, 1.0), [0.0; 2]);
+        // disjoint support saturates at 1 for any p >= 1 (previously this returned 2)
+        for p in [1.0, 2.0, 3.0] {
+            let [one, two] = left.distance(&right, p);
+            assert!((one - 1.0).abs() < 1e-9, "p={p} player one distance {one}");
+            assert!((two - 1.0).abs() < 1e-9, "p={p} player two distance {two}");
+        }
     }
 
     #[test]
