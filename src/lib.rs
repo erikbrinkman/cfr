@@ -398,6 +398,13 @@ impl<I: Hash + Eq, A: Hash + Eq> GameTree<I, A> {
                 .map(|(infoset, builder)| PlayerInfosetData::new(infoset, builder))
                 .collect::<Box<[_]>>()
         });
+        // an infoset can't appear as both a single- and multi-action node
+        for (singles, multis) in single_infosets.iter().zip(player_infosets.iter()) {
+            let multi_keys: HashSet<&I> = multis.iter().map(|data| &data.infoset).collect();
+            if singles.keys().any(|key| multi_keys.contains(key)) {
+                return Err(GameError::ActionsNotEqual);
+            }
+        }
         // the solver keys its sampler on u32 infoset ids (see `key.rng(infoset as u32)`), so every
         // infoset index has to fit in a u32
         let fits_u32 = |len: usize| u32::try_from(len).is_ok();
