@@ -44,6 +44,14 @@ pub struct GambitInfoset<'a> {
     name: &'a EscapedStr,
 }
 
+impl GambitInfoset<'_> {
+    /// The infoset number -- a per-player identifier that, unlike the name, is always unique.
+    #[must_use]
+    pub fn number(&self) -> u64 {
+        self.id
+    }
+}
+
 impl PartialEq for GambitInfoset<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
