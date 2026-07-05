@@ -110,7 +110,7 @@ impl CachedInfoset {
     /// across every action the updating player explores -- without a shared cache -- because the
     /// same infoset draws the same way within a sweep.
     fn sample(&self, key: SampleKey, infoset: u32) -> usize {
-        multinomial::sample(&mut key.rng(infoset), self.reg.strat())
+        multinomial::sample(&mut key.player_rng(infoset), self.reg.strat())
     }
 
     /// Apply the deferred cumulative-regret discount for the iterations since the last catch-up
@@ -274,7 +274,7 @@ impl Sweep<'_> {
             }
             Node::Chance(chance) => {
                 let next =
-                    self.chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                    self.chance_infosets[chance.infoset].sample(&mut key.chance_rng(chance.infoset as u32));
                 self.serial::<FIRST>(&chance.outcomes[next], reach, key)
             }
             Node::Player(player) => match (player.num, FIRST) {
@@ -322,7 +322,7 @@ impl Sweep<'_> {
             }
             Node::Chance(chance) => {
                 let next =
-                    self.chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                    self.chance_infosets[chance.infoset].sample(&mut key.chance_rng(chance.infoset as u32));
                 self.parallel::<FIRST>(&chance.outcomes[next], depth, reach, key)
             }
             Node::Player(player) => match (player.num, FIRST) {
@@ -541,7 +541,7 @@ mod tests {
                 }
                 Node::Chance(chance) => {
                     let ind =
-                        chance_infosets[chance.infoset].sample(&mut key.rng(chance.infoset as u32));
+                        chance_infosets[chance.infoset].sample(&mut key.chance_rng(chance.infoset as u32));
                     recurse_regret::<FIRST>(
                         &chance.outcomes[ind],
                         chance_infosets,
