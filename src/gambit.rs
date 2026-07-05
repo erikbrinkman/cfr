@@ -147,7 +147,7 @@ impl<'a, 'g> Game for GambitNode<'a, 'g> {
     fn into_node(self) -> NodeType<Self> {
         match self.node {
             Node::Terminal(term) => {
-                let cum_payoff = self.cum_payoff + self.info.outcomes[&term.outcome()];
+                let cum_payoff = self.cum_payoff + outcome_bonus(&self.info, term.outcome());
                 NodeType::Terminal(cum_payoff - self.info.sum)
             }
             Node::Chance(chance) => {
@@ -237,7 +237,9 @@ fn get_global_info(game: &ExtensiveFormGame<'_>) -> Result<GlobalInfo, GambitErr
     while let Some(node) = queue.pop() {
         match node {
             Node::Terminal(term) => {
-                outcomes.insert(term.outcome(), payoff_pair(term.outcome_payoffs()));
+                if let Some(payoffs) = term.outcome_payoffs() {
+                    outcomes.insert(term.outcome(), payoff_pair(payoffs));
+                }
             }
             Node::Chance(chance) => {
                 if let Some(payoffs) = chance.outcome_payoffs() {
@@ -264,7 +266,11 @@ fn get_global_info(game: &ExtensiveFormGame<'_>) -> Result<GlobalInfo, GambitErr
     while let Some((node, mut cum)) = queue.pop() {
         match node {
             Node::Terminal(term) => {
-                let [one, two] = outcomes[&term.outcome()];
+                let [one, two] = if term.outcome() == 0 {
+                    [0.0; 2]
+                } else {
+                    outcomes[&term.outcome()]
+                };
                 cum[0] += one;
                 cum[1] += two;
                 let [one, two] = cum;
@@ -336,7 +342,7 @@ mod tests {
         // one. Solving the materialized game exercises the player into_node branch, the move carrier,
         // and the named-strategy output (GambitInfoset Display).
         let game = parse(
-            r#"EFG 2 R "" { "" "" } p "" 1 1 "p1" { "h" "t" } 0 p "" 2 2 "p2" { "h" "t" } 0 t "" 1 { 1 -1 } t "" 2 { -1 1 } p "" 2 2 "p2" { "h" "t" } 0 t "" 3 { -1 1 } t "" 4 { 1 -1 }"#,
+            r#"EFG 2 R "" { "" "" } p "" 1 1 "p1" { "h" "t" } 0 p "" 2 2 "p2" { "h" "t" } 0 t "" 1 "" { 1 -1 } t "" 2 "" { -1 1 } p "" 2 2 "p2" { "h" "t" } 0 t "" 3 "" { -1 1 } t "" 4 "" { 1 -1 }"#,
         );
         let node = GambitNode::try_from(&game).unwrap();
         let tree = GameTree::from_game(node).unwrap();
@@ -364,7 +370,17 @@ mod tests {
     fn handles_chance_nodes() {
         // a chance node exercises the chance into_node branch and the outcome carrier
         let game = parse(
-            r#"EFG 2 R "" { "" "" } c "" 1 "ch" { "x" 1/2 "y" 1/2 } 0 t "" 1 { 1 -1 } t "" 2 { -1 1 }"#,
+            r#"EFG 2 R "" { "" "" } c "" 1 "ch" { "x" 1/2 "y" 1/2 } 0 t "" 1 "" { 1 -1 } t "" 2 "" { -1 1 }"#,
+        );
+        let node = GambitNode::try_from(&game).unwrap();
+        GameTree::from_game(node).unwrap();
+    }
+
+    #[test]
+    fn handles_null_outcome_terminal() {
+        // outcome 0 is the null outcome -- zero payoff to both
+        let game = parse(
+            r#"EFG 2 R "" { "" "" } c "" 1 "ch" { "x" 1/2 "y" 1/2 } 0 t "" 0 t "" 1 "" { 0 0 }"#,
         );
         let node = GambitNode::try_from(&game).unwrap();
         GameTree::from_game(node).unwrap();
@@ -377,7 +393,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_payoffs() {
-        let game = parse(r#"EFG 2 R "" { "" "" } t "" 1 { 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 0 }"#);
+        let game = parse(r#"EFG 2 R "" { "" "" } t "" 1 "" { 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 0 }"#);
         assert!(matches!(
             GambitNode::try_from(&game),
             Err(GambitError::NonFinitePayoff)
@@ -386,7 +402,7 @@ mod tests {
 
     #[test]
     fn rejects_three_players() {
-        let game = parse(r#"EFG 2 R "" { "" "" "" } t "" 1 { 0 0 0 }"#);
+        let game = parse(r#"EFG 2 R "" { "" "" "" } t "" 1 "" { 0 0 0 }"#);
         assert!(matches!(
             GambitNode::try_from(&game),
             Err(GambitError::PlayerCount(3))
@@ -396,7 +412,7 @@ mod tests {
     #[test]
     fn rejects_non_constant_sum() {
         let game = parse(
-            r#"EFG 2 R "" { "" "" } c "" 1 "c1" { "x" 1/2 "y" 1/2 } 0 t "" 1 { 0 0 } t "" 2 { 1 1 }"#,
+            r#"EFG 2 R "" { "" "" } c "" 1 "c1" { "x" 1/2 "y" 1/2 } 0 t "" 1 "" { 0 0 } t "" 2 "" { 1 1 }"#,
         );
         assert!(matches!(
             GambitNode::try_from(&game),
@@ -408,7 +424,7 @@ mod tests {
     fn rejects_invalid_game() {
         // infoset 1 is both an ancestor and descendant of itself -- imperfect recall
         let game = parse(
-            r#"EFG 2 R "" { "" "" } p "" 1 1 "i1" { "a" "b" } 0 t "" 1 { 0 0 } p "" 1 1 "i1" { "a" "b" } 0 t "" 1 { 0 0 } t "" 1 { 0 0 }"#,
+            r#"EFG 2 R "" { "" "" } p "" 1 1 "i1" { "a" "b" } 0 t "" 1 "" { 0 0 } p "" 1 1 "i1" { "a" "b" } 0 t "" 1 "" { 0 0 } t "" 1 "" { 0 0 }"#,
         );
         let node = GambitNode::try_from(&game).unwrap();
         assert!(GameTree::from_game(node).is_err());
@@ -416,7 +432,7 @@ mod tests {
 
     #[test]
     fn constant_sum_offset() {
-        let game = parse(r#"EFG 2 R "" { "" "" } t "" 2 { 1 1 }"#);
+        let game = parse(r#"EFG 2 R "" { "" "" } t "" 2 "" { 1 1 }"#);
         assert_eq!(GambitNode::try_from(&game).unwrap().sum(), 1.0);
     }
 }

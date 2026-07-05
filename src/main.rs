@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn auto_detects_gambit() {
-        solve_auto(r#"EFG 2 R "" { "" "" } t "" 1 { 0 0 }"#, &default_args()).unwrap();
+        solve_auto(r#"EFG 2 R "" { "" "" } t "" 1 "" { 0 0 }"#, &default_args()).unwrap();
     }
 
     #[test]
@@ -436,7 +436,7 @@ mod tests {
         ));
         // parses as gambit but has three players
         assert!(matches!(
-            solve_gambit(r#"EFG 2 R "" { "" "" "" } t "" 1 { 0 0 0 }"#, &args),
+            solve_gambit(r#"EFG 2 R "" { "" "" "" } t "" 1 "" { 0 0 0 }"#, &args),
             Err(CliError::Gambit(_))
         ));
         // parses as json but isn't a valid game (a zero-probability lone chance outcome)
@@ -460,7 +460,7 @@ mod tests {
 
     // two distinct player-two infosets that share a name (here both unnamed, so both empty): keyed by
     // name they collide, keyed by number they don't
-    const SHARED_NAME_GAME: &str = r#"EFG 2 R "" { "" "" } p "" 1 1 "" { "a" "b" } 0 p "" 2 1 "" { "x" "y" } 0 t "" 1 { 1 -1 } t "" 2 { -1 1 } p "" 2 2 "" { "x" "y" } 0 t "" 3 { -1 1 } t "" 4 { 1 -1 }"#;
+    const SHARED_NAME_GAME: &str = r#"EFG 2 R "" { "" "" } p "" 1 1 "" { "a" "b" } 0 p "" 2 1 "" { "x" "y" } 0 t "" 1 "" { 1 -1 } t "" 2 "" { -1 1 } p "" 2 2 "" { "x" "y" } 0 t "" 3 "" { -1 1 } t "" 4 "" { 1 -1 }"#;
 
     #[test]
     fn duplicate_infoset_names_error_by_default() {
@@ -485,7 +485,7 @@ mod tests {
         // a constant-sum-4 game (no decisions): chance pays player one 3 or 1 with equal odds, so
         // player one expects 2.0 and -- since payoffs sum to 4 -- player two also expects 2.0. The
         // constant-sum offset must be added back to *both* reported utilities.
-        let game = r#"EFG 2 R "" { "" "" } c "" 1 "c" { "x" 1/2 "y" 1/2 } 0 t "" 1 { 3 1 } t "" 2 { 1 3 }"#;
+        let game = r#"EFG 2 R "" { "" "" } c "" 1 "c" { "x" 1/2 "y" 1/2 } 0 t "" 1 "" { 3 1 } t "" 2 "" { 1 3 }"#;
         let out = solve_gambit(game, &default_args()).unwrap();
         assert!(
             (out.player_one_utility - 2.0).abs() < 1e-9,
