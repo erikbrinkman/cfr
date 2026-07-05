@@ -88,7 +88,9 @@ impl Entry {
 /// The regret-matched strategy over an infoset's actions.
 ///
 /// Honors `params.no_positive` when no action has positive regret. Mirrors the materialized solver's
-/// matcher, in f64.
+/// matcher, in f64 -- except that a finite nonzero `no_positive` softmaxes the stored regrets before
+/// their pending lazy discount is applied, and softmax isn't scale-invariant, so it can then diverge
+/// from the eager matcher at long-unvisited infosets. No preset sets a finite nonzero `no_positive`.
 fn matched_strategy(stats: &[Stats], params: &RegretParams) -> Vec<f64> {
     let count = stats.len();
     let norm: f64 = stats
@@ -255,7 +257,7 @@ pub struct LazySolver<G: Game> {
     params: RegretParams,
     cum_log_pos: f64, // running sum of ln(positive-regret discount) over completed iterations
     cum_log_neg: f64, // running sum of ln(negative-regret discount) over completed iterations
-    swing: f64,       // max_payoff - min_payoff, the per-iteration regret bound for pruning
+    swing: f64,       // per-iteration regret bound for pruning, or 0 when pruning is disarmed
 }
 
 // manual impl: the regret tables can't be `Debug` without `Infoset: Eq + Hash + Debug`, so summarize
@@ -296,10 +298,16 @@ where
         LazySolver {
             table: [Table::default(), Table::default()],
             iter: 0,
+            // regret-based pruning stays sound only when negative cumulative regret grows
+            // sub-linearly, i.e. when the negative-regret discount β < 1; a zero swing disarms it.
+            swing: if params.neg_regret < 1.0 {
+                max_payoff - min_payoff
+            } else {
+                0.0
+            },
             params,
             cum_log_pos: 0.0,
             cum_log_neg: 0.0,
-            swing: max_payoff - min_payoff,
         }
     }
 
@@ -847,5 +855,158 @@ mod tests {
                 "serial vs parallel diverged for {player:?}"
             );
         }
+    }
+
+    #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
+    enum Action {
+        Fold,
+        Call,
+        Raise,
+    }
+
+    /// Kuhn poker with `num_cards` cards: chance deals player one a card, then -- after player one
+    /// acts -- player two a card from the rest. A player's infoset is `(held card, facing a raise)`.
+    /// Its dominated actions accrue persistent negative regret, exercising pruning at a depth the
+    /// 2-action games above can't reach.
+    #[derive(Debug, Clone, Copy)]
+    enum Kuhn {
+        DealOne(usize),              // num_cards
+        OneFirst(usize, usize),      // num_cards, one_card
+        DealTwo(usize, usize, bool), // num_cards, one_card, one_raised
+        TwoAct(usize, usize, bool),  // one_card, two_card, one_raised
+        OneSecond(usize, usize),     // one_card, two_card
+        Done(f64),
+    }
+
+    /// The terminal where the higher card wins `stake` for player one.
+    fn showdown(one_card: usize, two_card: usize, stake: f64) -> Kuhn {
+        Kuhn::Done(if one_card > two_card { stake } else { -stake })
+    }
+
+    enum Deal {
+        One(usize),              // num_cards
+        Two(usize, usize, bool), // num_cards, one_card, one_raised
+    }
+
+    enum Decide {
+        OneFirst(usize, usize),     // num_cards, one_card
+        TwoAct(usize, usize, bool), // one_card, two_card, one_raised
+        OneSecond(usize, usize),    // one_card, two_card
+    }
+
+    impl Game for Kuhn {
+        type Action = Action;
+        type Infoset = (usize, bool);
+        type ChanceInfoset = Infallible;
+        type Chance = Deal;
+        type Player = Decide;
+
+        fn into_node(self) -> NodeType<Self> {
+            match self {
+                Kuhn::Done(payoff) => NodeType::Terminal(payoff),
+                Kuhn::DealOne(num_cards) => NodeType::Chance(None, Deal::One(num_cards)),
+                Kuhn::DealTwo(num_cards, one_card, one_raised) => {
+                    NodeType::Chance(None, Deal::Two(num_cards, one_card, one_raised))
+                }
+                Kuhn::OneFirst(num_cards, one_card) => {
+                    NodeType::Player(PlayerNum::One, (one_card, false), Decide::OneFirst(num_cards, one_card))
+                }
+                Kuhn::TwoAct(one_card, two_card, one_raised) => NodeType::Player(
+                    PlayerNum::Two,
+                    (two_card, one_raised),
+                    Decide::TwoAct(one_card, two_card, one_raised),
+                ),
+                Kuhn::OneSecond(one_card, two_card) => {
+                    NodeType::Player(PlayerNum::One, (one_card, true), Decide::OneSecond(one_card, two_card))
+                }
+            }
+        }
+    }
+
+    impl Outcomes<Kuhn> for Deal {
+        fn len(&self) -> usize {
+            match *self {
+                Deal::One(num_cards) => num_cards,
+                Deal::Two(num_cards, ..) => num_cards - 1, // player one's card is excluded
+            }
+        }
+        #[allow(clippy::cast_precision_loss)] // num_cards is a handful
+        fn get(&self, index: usize) -> (f64, Kuhn) {
+            match *self {
+                Deal::One(num_cards) => (1.0 / num_cards as f64, Kuhn::OneFirst(num_cards, index)),
+                Deal::Two(num_cards, one_card, one_raised) => {
+                    let two_card = if index < one_card { index } else { index + 1 };
+                    (1.0 / (num_cards - 1) as f64, Kuhn::TwoAct(one_card, two_card, one_raised))
+                }
+            }
+        }
+    }
+
+    impl Moves<Kuhn> for Decide {
+        fn len(&self) -> usize {
+            2
+        }
+        fn action(&self, index: usize) -> Action {
+            match self {
+                Decide::OneFirst(..) | Decide::TwoAct(_, _, false) => [Action::Call, Action::Raise][index],
+                Decide::TwoAct(_, _, true) | Decide::OneSecond(..) => [Action::Call, Action::Fold][index],
+            }
+        }
+        fn apply(&self, index: usize) -> Kuhn {
+            let action = self.action(index);
+            match *self {
+                Decide::OneFirst(num_cards, one_card) => {
+                    Kuhn::DealTwo(num_cards, one_card, action == Action::Raise)
+                }
+                Decide::TwoAct(one_card, two_card, one_raised) => {
+                    if one_raised {
+                        // facing the raise: call to a showdown at 2, or fold and concede 1
+                        if action == Action::Call { showdown(one_card, two_card, 2.0) } else { Kuhn::Done(1.0) }
+                    } else if action == Action::Call {
+                        showdown(one_card, two_card, 1.0) // checked down
+                    } else {
+                        Kuhn::OneSecond(one_card, two_card) // raised back
+                    }
+                }
+                Decide::OneSecond(one_card, two_card) => {
+                    // call the re-raise (showdown at 2) or fold (lose 1)
+                    if action == Action::Call { showdown(one_card, two_card, 2.0) } else { Kuhn::Done(-1.0) }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vanilla_converges_on_kuhn() {
+        // vanilla disarms pruning, so every action stays live and the average converges. Scored as
+        // true exploitability on the materialized tree, since the solver's own regret bound is only a
+        // Monte-Carlo estimate.
+        const CARDS: usize = 3;
+        let mut solver = LazySolver::with_params(RegretParams::vanilla(), -2.0, 2.0);
+        solver.run(&Kuhn::DealOne(CARDS), 400_000);
+
+        let tree = GameTree::from_game(Kuhn::DealOne(CARDS)).unwrap();
+        #[allow(clippy::type_complexity)]
+        let named = |player: PlayerNum| -> Vec<((usize, bool), Vec<(Action, f64)>)> {
+            let mut strat = Vec::new();
+            for card in 0..CARDS {
+                for raised in [false, true] {
+                    let info = (card, raised);
+                    let avg = solver.average(player, &info).unwrap_or_else(|| vec![0.5, 0.5]);
+                    // move 0 is always Call; move 1 is Raise acting first, Fold facing a raise
+                    let second = if raised { Action::Fold } else { Action::Raise };
+                    strat.push((info, vec![(Action::Call, avg[0]), (second, avg[1])]));
+                }
+            }
+            strat
+        };
+        let strats = tree
+            .from_named([named(PlayerNum::One), named(PlayerNum::Two)])
+            .unwrap();
+        let exploitability = strats.get_info().regret();
+        assert!(
+            exploitability < 0.01,
+            "vanilla did not converge on kuhn: exploitability {exploitability}"
+        );
     }
 }
