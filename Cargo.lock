@@ -237,9 +237,9 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "gambit-parser"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05d1860143af2f144db79781a3b584f466a99f379930bc732298af8b01b3612f"
+checksum = "488eea84f8acdabe5337a9a594bc22d58d9263ed80270e682292d2ae12fc11fe"
 dependencies = [
  "nom",
  "num-bigint",
