@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install nightly toolchain
       run: rustup toolchain install nightly --component clippy
     - name: Install stable toolchain
@@ -34,3 +34,5 @@ jobs:
       run: cargo test --doc --verbose
     - name: Run lints
       run: cargo +nightly clippy --verbose --all-targets --all-features -- -D warnings
+    - name: Check doc warnings
+      run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
