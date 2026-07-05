@@ -2,10 +2,13 @@
 name = "cfr"
 version = "0.6.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Counterfactual regret minimization solver for two-player zero-sum incomplete-information games"
 repository = "https://github.com/erikbrinkman/cfr"
+documentation = "https://docs.rs/cfr"
 license = "MIT"
 keywords = ["counterfactual", "regret", "incomplete", "information", "game"]
+categories = ["algorithms", "mathematics", "command-line-utilities"]
 
 [dependencies]
 by_address = "1.0"

@@ -229,12 +229,6 @@ struct LazyState {
     strat_weight: f64,
 }
 
-/// The active/external/chance recursion for a lazy single-threaded external iteration
-///
-/// Mirrors [`recurse_regret`] but folds the active-player infoset update into the visit (so
-/// unvisited infosets are never touched). The active player accumulates its own average strategy at
-/// its own infosets; the opponent is only sampled, so the active player's `reach` carries through
-/// opponent and chance nodes unchanged.
 /// The invariant context of one external-sampling sweep.
 ///
 /// Passed by shared reference so each recursive call takes only the node, reach, and sampling key
