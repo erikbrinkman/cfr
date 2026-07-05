@@ -63,12 +63,12 @@ impl Discount {
 /// Counterfactual regret minimization solver for two-player zero-sum incomplete-information games
 ///
 /// This program reads a two-player zero-sum perfect-recall extensive-form game in several formats
-/// and then uses veriants of counterfactual regret minimization to find approximate nash
+/// and then uses variants of counterfactual regret minimization to find approximate nash
 /// equilibria. The result will be a json object like:
 ///
-/// `{ "expected_one_utility": <number> , "player_one_regret": <number>, "player_two_regret":
-/// <number>, "regret": <number>, "player_one_strategy": <strat>, "player_two_strategy": <strat>
-/// }`
+/// `{ "regret": <number>, "player_one_utility": <number>, "player_two_utility": <number>,
+/// "player_one_regret": <number>, "player_two_regret": <number>, "player_one_strategy": <strat>,
+/// "player_two_strategy": <strat> }`
 ///
 /// where strats will be mapping from infosets, to actions to probabilities. Zero probability
 /// actions will be omitted.
