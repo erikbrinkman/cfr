@@ -1085,8 +1085,11 @@ impl<'a, I, A> Strategies<'a, I, A> {
                 infos.iter().map(PlayerInfosetData::num_actions),
             ) {
                 let total: f64 = strat.iter().filter(|p| p > &&thresh).sum();
-                for p in strat.iter_mut() {
-                    *p = if *p > thresh { *p / total } else { 0.0 }
+                // skip when nothing clears the threshold, rather than zeroing it into a non-distribution
+                if total > 0.0 {
+                    for p in strat.iter_mut() {
+                        *p = if *p > thresh { *p / total } else { 0.0 };
+                    }
                 }
             }
         }
@@ -1396,6 +1399,27 @@ mod tests {
 
         let cloned = game.from_named(fast.as_named()).unwrap();
         assert_eq!(fast, cloned);
+    }
+
+    #[test]
+    fn truncate_keeps_infoset_when_nothing_clears_threshold() {
+        let game = create_game();
+        // both multi-action infosets are an even 50/50 split
+        let mut strat = game
+            .from_named([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 1.0)])],
+                vec![("z", vec![("b", 1.0), ("c", 1.0)])],
+            ])
+            .unwrap();
+        // a threshold above every action's probability: nothing survives it, so the infosets must be
+        // left untouched rather than collapsed to an all-zero distribution
+        strat.truncate(0.6);
+        for named in strat.as_named() {
+            for (infoset, actions) in named {
+                let total: f64 = actions.map(|(_, prob)| prob).sum();
+                assert!((total - 1.0).abs() < 1e-9, "infoset {infoset} zeroed: {total}");
+            }
+        }
     }
 
     #[test]

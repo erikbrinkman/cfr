@@ -127,11 +127,9 @@ struct Args {
     #[clap(short, long, value_parser, default_value = "-")]
     output: String,
 
-    /// Key gambit infosets by number instead of name
+    /// Key gambit infosets by their always-unique number instead of name
     ///
-    /// Gambit infoset names needn't be unique and may be empty, so by default `cfr` keys the output
-    /// by name and errors if two infosets share one. This keys by the infoset number instead, which
-    /// is always unique. Ignored for the json format, whose infosets are already uniquely named.
+    /// The default keys by name, which errors when distinct infosets share one.
     #[clap(long, value_parser)]
     infoset_numbers: bool,
 }
