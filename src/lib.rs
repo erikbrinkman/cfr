@@ -1262,7 +1262,7 @@ impl<'a, I, A> Iterator for NamedStrategyIter<'a, I, A> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.probs.len() + self.singles.len();
+        let len = self.info.len() + self.singles.len();
         (len, Some(len))
     }
 }
@@ -1299,17 +1299,15 @@ impl<'a, A> Iterator for NamedStrategyActionIter<'a, A> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = match &self.iter {
-            ActionType::Data(zip) => zip.len(),
-            ActionType::Single(once) => once.len(),
-        };
-        (len, Some(len))
+        // the Data arm filters zero-probability actions, so only an upper bound is known
+        match &self.iter {
+            ActionType::Data(zip) => (0, Some(zip.len())),
+            ActionType::Single(once) => once.size_hint(),
+        }
     }
 }
 
 impl<A> FusedIterator for NamedStrategyActionIter<'_, A> {}
-
-impl<A> ExactSizeIterator for NamedStrategyActionIter<'_, A> {}
 
 #[cfg(test)]
 #[allow(clippy::float_cmp, unused_must_use)]
@@ -1399,6 +1397,34 @@ mod tests {
 
         let cloned = game.from_named(fast.as_named()).unwrap();
         assert_eq!(fast, cloned);
+    }
+
+    #[test]
+    fn named_iter_sizes_are_honest() {
+        let game = create_game();
+        // player one's multi infoset "y" has a zero-probability action "d"
+        let strat = game
+            .from_named([
+                vec![("x", vec![("a", 1.0)]), ("y", vec![("c", 1.0), ("d", 0.0)])],
+                vec![("z", vec![("b", 1.0), ("c", 1.0)])],
+            ])
+            .unwrap();
+        let [one, two] = strat.as_named();
+        // player one has two infosets (single "x" + multi "y"); the exact size must match the yield
+        assert_eq!(one.len(), 2); // len() borrows
+        assert_eq!(two.len(), 1);
+        assert_eq!(one.count(), 2); // count() consumes
+        assert_eq!(two.count(), 1);
+        // the action iter drops the zero-probability action, so its yield stays within the size hint
+        let [one, _] = strat.as_named();
+        for (infoset, actions) in one {
+            let (lower, upper) = actions.size_hint();
+            let yielded = actions.count();
+            assert!(
+                lower <= yielded && yielded <= upper.unwrap(),
+                "{infoset}: {yielded} outside [{lower}, {upper:?}]"
+            );
+        }
     }
 
     #[test]
