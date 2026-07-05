@@ -268,6 +268,28 @@ mod game_errors {
     }
 
     #[test]
+    fn actions_not_equal_single_vs_multi() {
+        // infoset "x" has one action under the first outcome and two under the second -- inconsistent
+        // action sets recorded in separate single/multi maps, which must still be rejected
+        let mixed_game = chance(
+            None,
+            vec![
+                (0.5, player(PlayerNum::One, "x", vec![("a", terminal(0.0))])),
+                (
+                    0.5,
+                    player(
+                        PlayerNum::One,
+                        "x",
+                        vec![("a", terminal(0.0)), ("b", terminal(0.0))],
+                    ),
+                ),
+            ],
+        );
+        let err = GameTree::from_game(mixed_game).unwrap_err();
+        assert_eq!(err, GameError::ActionsNotEqual);
+    }
+
+    #[test]
     fn actions_not_unique() {
         let dup_game = player(
             PlayerNum::One,
