@@ -51,16 +51,23 @@ struct Stats {
 /// One infoset's per-action accumulators.
 ///
 /// A single boxed slice (never resized after creation), so the `(regret, strat_sum, skip_until)` an
-/// update touches together are contiguous and each infoset costs one allocation.
+/// update touches together are contiguous and each infoset costs one allocation. `base_log_pos` and
+/// `base_log_neg` record the global cumulative log-discounts at this infoset's last visit, so a later
+/// visit can catch its cumulative regret up for the iterations it was never reached (see
+/// [`commit_update`]).
 #[derive(Debug, Clone)]
 struct Entry {
     stats: Box<[Stats]>,
+    base_log_pos: f64,
+    base_log_neg: f64,
 }
 
 impl Entry {
     fn new(actions: usize) -> Self {
         Entry {
             stats: vec![Stats::default(); actions].into_boxed_slice(),
+            base_log_pos: 0.0,
+            base_log_neg: 0.0,
         }
     }
 
@@ -140,35 +147,95 @@ fn is_pruned(strat: &[f64], skip_until: &[u64], i: usize, iter: u64) -> bool {
     strat[i] == 0.0 && iter < skip_until[i]
 }
 
-/// Apply one iteration's regret/strategy contributions to the explored actions of an infoset,
-/// discount them (positive regret by `pos`, negative by `neg`, the strategy sum by `strat`), and
-/// refresh each explored action's skip horizon. Pruned actions are left frozen so their (negative)
-/// regret -- and hence their zero probability -- is preserved across the skipped iterations.
+/// Apply one iteration's regret/strategy contributions to an infoset and discount it.
+///
+/// The infoset may have gone unvisited for many iterations (external sampling didn't reach it), so
+/// first *catch up* every action's cumulative regret for those iterations: its sign is fixed across
+/// the gap (discounting is sign-preserving), so scale by the positive- or negative-regret catch-up
+/// factor accordingly. Then fold in this iteration's contributions (explored actions only) and apply
+/// this iteration's discount to *every* action, so pruned actions are discounted rather than frozen.
+/// The average strategy accumulates the deferred `tᵞ` weight directly, which needs no catch-up.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // horizon: floor of a non-negative ratio
 fn commit_update(
     entry: &mut Entry,
     regret_delta: &[f64],
     strat_delta: &[f64],
     explored: &[bool],
-    (pos, neg, strat): (f64, f64, f64),
+    discount: &Discount,
     iter: u64,
     swing: f64,
 ) {
-    for (i, stat) in entry.stats.iter_mut().enumerate() {
-        if !explored[i] {
-            continue;
+    let pos_catch = (discount.cum_log_pos - entry.base_log_pos).exp();
+    let neg_catch = (discount.cum_log_neg - entry.base_log_neg).exp();
+    for stat in &mut *entry.stats {
+        if stat.regret > 0.0 {
+            stat.regret *= pos_catch;
+        } else if stat.regret < 0.0 {
+            stat.regret *= neg_catch;
         }
-        stat.regret += regret_delta[i];
-        stat.regret *= if stat.regret > 0.0 { pos } else { neg };
-        stat.strat_sum += strat_delta[i];
-        stat.strat_sum *= strat;
-        // a still-negative action can be skipped until its regret could plausibly reach zero again,
-        // which takes at least |regret| / swing iterations (regret moves by at most `swing` each)
-        stat.skip_until = if stat.regret < 0.0 && swing > 0.0 {
-            iter + (stat.regret.abs() / swing) as u64
+    }
+    for (i, stat) in entry.stats.iter_mut().enumerate() {
+        if explored[i] {
+            stat.regret += regret_delta[i];
+            stat.strat_sum += strat_delta[i] * discount.strat_weight;
+        }
+        stat.regret *= if stat.regret > 0.0 {
+            discount.pos
+        } else if stat.regret < 0.0 {
+            discount.neg
         } else {
-            0
+            1.0
         };
+        // only re-arm the skip horizon for actions actually explored this iteration; refreshing it for
+        // a pruned action every visit would push its horizon out forever and never re-explore it. A
+        // still-negative explored action can be skipped until its regret could plausibly reach zero
+        // again, which takes at least |regret| / swing iterations (regret moves by at most `swing`).
+        if explored[i] {
+            stat.skip_until = if stat.regret < 0.0 && swing > 0.0 {
+                iter + (stat.regret.abs() / swing) as u64
+            } else {
+                0
+            };
+        }
+    }
+    // this infoset is now caught up through the current iteration's discount
+    entry.base_log_pos = discount.cum_log_pos + discount.log_pos_step;
+    entry.base_log_neg = discount.cum_log_neg + discount.log_neg_step;
+}
+
+/// One iteration's deferred-discount context, shared across both traversers of that iteration.
+///
+/// `cum_log_pos`/`cum_log_neg` are the running sums of `ln(discount)` over the iterations strictly
+/// before this one; `log_pos_step`/`log_neg_step` are this iteration's contributions to them.
+#[derive(Clone, Copy)]
+struct Discount {
+    cum_log_pos: f64,
+    cum_log_neg: f64,
+    pos: f64,          // this iteration's positive-regret discount factor
+    neg: f64,          // this iteration's negative-regret discount factor
+    log_pos_step: f64, // ln(pos)
+    log_neg_step: f64, // ln(neg)
+    strat_weight: f64, // this iteration's average-strategy weight tᵞ
+}
+
+/// The deferred-discount context for iteration `iter`, given the running cumulative log-discounts.
+#[allow(clippy::cast_precision_loss)] // iter only loses precision past 2^53 iterations
+fn iteration_discount(
+    params: &RegretParams,
+    iter: u64,
+    cum_log_pos: f64,
+    cum_log_neg: f64,
+) -> Discount {
+    let (pos, neg, _) = params.iteration_factors(iter);
+    Discount {
+        cum_log_pos,
+        cum_log_neg,
+        pos,
+        neg,
+        log_pos_step: pos.ln(),
+        log_neg_step: neg.ln(),
+        // discounting the average by `(t/(t+1))^γ` each iteration equals weighting iteration t by t^γ
+        strat_weight: (iter as f64).powf(params.strat),
     }
 }
 
@@ -186,8 +253,9 @@ pub struct LazySolver<G: Game> {
     table: [Table<G::Infoset>; 2],
     iter: u64,
     params: RegretParams,
-    factors: (f64, f64, f64), // this iteration's (pos, neg, strat) discounts
-    swing: f64,               // max_payoff - min_payoff, the per-iteration regret bound for pruning
+    cum_log_pos: f64, // running sum of ln(positive-regret discount) over completed iterations
+    cum_log_neg: f64, // running sum of ln(negative-regret discount) over completed iterations
+    swing: f64,       // max_payoff - min_payoff, the per-iteration regret bound for pruning
 }
 
 // manual impl: the regret tables can't be `Debug` without `Infoset: Eq + Hash + Debug`, so summarize
@@ -200,7 +268,6 @@ where
         fmt.debug_struct("LazySolver")
             .field("iter", &self.iter)
             .field("params", &self.params)
-            .field("factors", &self.factors)
             .field("swing", &self.swing)
             .field("infosets", &self.infosets())
             .finish_non_exhaustive()
@@ -230,7 +297,8 @@ where
             table: [Table::default(), Table::default()],
             iter: 0,
             params,
-            factors: (1.0, 1.0, 1.0),
+            cum_log_pos: 0.0,
+            cum_log_neg: 0.0,
             swing: max_payoff - min_payoff,
         }
     }
@@ -259,11 +327,14 @@ where
                 // iter: iteration count, only loses precision past 2^53 iterations
                 #[allow(clippy::cast_precision_loss)]
                 let iters = self.iter as f64;
+                let entry = entry.value();
+                // infosets are discounted lazily, so catch each up to the current iteration before
+                // reading its regret (positive regret is all that survives the max with 0)
+                let pos_catch = (self.cum_log_pos - entry.base_log_pos).exp();
                 let max_regret = entry
-                    .value()
                     .stats
                     .iter()
-                    .map(|stat| stat.regret)
+                    .map(|stat| if stat.regret > 0.0 { stat.regret * pos_catch } else { stat.regret })
                     .fold(0.0, f64::max);
                 2.0 * max_regret / iters
             })
@@ -282,7 +353,7 @@ where
     {
         for _ in 0..iters {
             self.iter += 1;
-            self.factors = self.params.iteration_factors(self.iter);
+            let discount = iteration_discount(&self.params, self.iter, self.cum_log_pos, self.cum_log_neg);
             for traverser in 0..2 {
                 Traversal {
                     table: &self.table,
@@ -290,11 +361,13 @@ where
                     cut: 0,
                     iter: self.iter,
                     params: &self.params,
-                    factors: self.factors,
+                    discount,
                     swing: self.swing,
                 }
                 .run(root.clone(), 1.0, 0, 0);
             }
+            self.cum_log_pos += discount.log_pos_step;
+            self.cum_log_neg += discount.log_neg_step;
         }
     }
 
@@ -330,7 +403,8 @@ where
         pool.install(|| {
             for _ in 0..iters {
                 self.iter += 1;
-                let factors = params.iteration_factors(self.iter);
+                let discount =
+                    iteration_discount(&params, self.iter, self.cum_log_pos, self.cum_log_neg);
                 for traverser in 0..2 {
                     Traversal {
                         table: &self.table,
@@ -338,11 +412,13 @@ where
                         cut,
                         iter: self.iter,
                         params: &params,
-                        factors,
+                        discount,
                         swing,
                     }
                     .run(root.clone(), 1.0, 0, 0);
                 }
+                self.cum_log_pos += discount.log_pos_step;
+                self.cum_log_neg += discount.log_neg_step;
             }
         });
         Ok(())
@@ -442,7 +518,7 @@ struct Traversal<'a, G: Game> {
     cut: u32, // fork the traverser's action subtrees while shallower than this
     iter: u64,
     params: &'a RegretParams,
-    factors: (f64, f64, f64), // this iteration's (pos, neg, strat) discounts
+    discount: Discount, // this iteration's deferred-discount context
     swing: f64,
 }
 
@@ -518,7 +594,7 @@ where
                     &regret_delta,
                     &strat_delta,
                     &explored,
-                    self.factors,
+                    &self.discount,
                     self.iter,
                     self.swing,
                 );
@@ -532,7 +608,7 @@ where
 mod tests {
     use super::LazySolver;
     use crate::{
-        Game, GameTree, Moves, NodeType, PlayerNum, RegretParams, SolveMethod, SolveParams,
+        Game, GameTree, Moves, NodeType, Outcomes, PlayerNum, RegretParams, SolveMethod, SolveParams,
     };
     use std::convert::Infallible;
 
@@ -649,6 +725,110 @@ mod tests {
             (one[0] - 0.5).abs() < 0.1,
             "player one not ~50/50 with pruning: {one:?}"
         );
+    }
+
+    /// A game gated by a lopsided chance node: 90% reaches the "common" copy of a biased 2x2 matrix
+    /// game, 10% the "rare" copy (distinct infosets). Both copies share the equilibrium where each
+    /// player plays their first action with probability 0.4. The rare infosets are visited a tenth as
+    /// often, exercising the deferred-discount catch-up path; the test guards that they still
+    /// converge, cross-checked against the exact full-tree solver.
+    #[derive(Debug, Clone)]
+    enum Gate {
+        Root,
+        One(bool),       // rare?
+        Two(bool, bool), // rare?, player one's (hidden) action
+        Done(f64),
+    }
+
+    struct GateChance;
+
+    impl Outcomes<Gate> for GateChance {
+        fn len(&self) -> usize {
+            2
+        }
+        fn get(&self, index: usize) -> (f64, Gate) {
+            if index == 0 {
+                (0.9, Gate::One(false))
+            } else {
+                (0.1, Gate::One(true))
+            }
+        }
+    }
+
+    impl Game for Gate {
+        type Action = bool;
+        type Infoset = &'static str;
+        type ChanceInfoset = Infallible;
+        type Chance = GateChance;
+        type Player = Gate;
+
+        fn into_node(self) -> NodeType<Self> {
+            match self {
+                Gate::Root => NodeType::Chance(None, GateChance),
+                Gate::One(rare) => {
+                    let info = if rare { "one_rare" } else { "one_common" };
+                    NodeType::Player(PlayerNum::One, info, Gate::One(rare))
+                }
+                Gate::Two(rare, first) => {
+                    // player two is blind to player one's action (same infoset for both)
+                    let info = if rare { "two_rare" } else { "two_common" };
+                    NodeType::Player(PlayerNum::Two, info, Gate::Two(rare, first))
+                }
+                Gate::Done(payoff) => NodeType::Terminal(payoff),
+            }
+        }
+    }
+
+    impl Moves<Gate> for Gate {
+        fn len(&self) -> usize {
+            2
+        }
+        fn action(&self, index: usize) -> bool {
+            index == 0
+        }
+        fn apply(&self, index: usize) -> Gate {
+            let choice = index == 0;
+            match self {
+                Gate::One(rare) => Gate::Two(*rare, choice),
+                Gate::Two(_, first) => {
+                    // player-one payoff of the 2x2 game with mixed equilibrium at p = 0.4
+                    let payoff = match (*first, choice) {
+                        (true, true) => 2.0,
+                        (false, false) => 1.0,
+                        _ => -1.0,
+                    };
+                    Gate::Done(payoff)
+                }
+                Gate::Root | Gate::Done(_) => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn rarely_visited_infoset_still_converges() {
+        let mut solver = LazySolver::new(-1.0, 1.0);
+        solver.run(&Gate::Root, 400_000);
+        // both the frequently- and rarely-visited player-one infosets must reach p ~= 0.4
+        for info in ["one_common", "one_rare"] {
+            let strat = solver.average(PlayerNum::One, &info).unwrap();
+            assert!(
+                (strat[0] - 0.4).abs() < 0.1,
+                "{info} did not converge to 0.4: {strat:?}"
+            );
+        }
+        // and the exact full-tree solver agrees on the equilibrium, cross-checking the target
+        let game = GameTree::from_game(Gate::Root).unwrap();
+        let (strats, _) = game
+            .solve(SolveMethod::Full, 50_000, 0.0, 1, SolveParams::default())
+            .unwrap();
+        let [one, _] = strats.as_named();
+        for (info, actions) in one {
+            for (action, prob) in actions {
+                if *action {
+                    assert!((prob - 0.4).abs() < 0.02, "{info} exact solve: {prob}");
+                }
+            }
+        }
     }
 
     #[test]
