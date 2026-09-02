@@ -1,60 +1,35 @@
+# Publish a tagged release to crates.io, then the GitHub release; keep the name release.yml for crates.io trusted publishing.
 name: release
-
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: Version bump type
+      tag:
+        description: "Release tag to publish (e.g. v0.3.0)"
         required: true
-        type: choice
-        options: [patch, minor, major]
+        type: string
+
+permissions:
+  contents: write # create the GitHub release
+  id-token: write # trusted publishing to crates.io
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gate:
-    uses: ./.github/workflows/rust.yml
-
-  release:
-    needs: gate
+  publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      id-token: write
     steps:
-    - uses: actions/checkout@v7
-    - uses: Swatinem/rust-cache@v2
-    - name: Install cargo-edit
-      run: cargo install cargo-edit --locked
-    - name: Bump version
-      id: version
-      run: |
-        cargo set-version --bump ${{ inputs.bump }}
-        VERSION=$(cargo pkgid | sed 's/.*#//')
-        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-    - name: Commit and tag
-      env:
-        VERSION: ${{ steps.version.outputs.version }}
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add Cargo.toml Cargo.lock
-        git commit -m "v${VERSION}"
-        git tag -a "v${VERSION}" -m "v${VERSION}"
-
-    # publish before pushing — a failed publish leaves no remote trace
-    - name: Authenticate with crates.io
-      uses: rust-lang/crates-io-auth-action@v1
-      id: auth
-    - name: Publish
-      run: cargo publish
-      env:
-        CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-    - name: Push
-      run: git push --follow-tags
-    - name: Create GitHub release
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: gh release create "v${{ steps.version.outputs.version }}" --generate-notes
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ inputs.tag }}" --generate-notes --verify-tag
