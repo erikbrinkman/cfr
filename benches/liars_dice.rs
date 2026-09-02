@@ -1,4 +1,4 @@
-#![feature(test, never_type)]
+#![feature(test)]
 extern crate test;
 
 use cfr::{
@@ -249,7 +249,10 @@ impl<const D: usize, K: InfoKey<D>> Moves<State<D, K>> for PlayState<D, K> {
         }
         let bid = bid - higher_face;
         let per_face = (self.total_dice - last_count) as usize;
-        Action::Bid((bid / per_face) as u8, last_count + 1 + (bid % per_face) as u8)
+        Action::Bid(
+            (bid / per_face) as u8,
+            last_count + 1 + (bid % per_face) as u8,
+        )
     }
 
     fn apply(&self, index: usize) -> State<D, K> {
@@ -412,7 +415,10 @@ mod tests {
         let mut seen = HashSet::new();
         for index in 0..single {
             let (counts, weight) = nth_roll::<D>(num, index);
-            assert_eq!(u8::try_from(counts.iter().map(|&c| usize::from(c)).sum::<usize>()), Ok(num));
+            assert_eq!(
+                u8::try_from(counts.iter().map(|&c| usize::from(c)).sum::<usize>()),
+                Ok(num)
+            );
             assert_eq!(weight, multinomial(&counts.map(u64::from)));
             assert!(seen.insert(counts), "duplicate roll at index {index}");
         }
