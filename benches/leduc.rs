@@ -1,4 +1,4 @@
-#![feature(test, never_type)]
+#![feature(test)]
 extern crate test;
 
 use cfr::{
@@ -119,13 +119,13 @@ struct Hand<K: InfoKey> {
     one_card: u8,
     two_card: u8,
     public: Option<u8>,
-    round: usize,      // 0 (pre-board) or 1 (post-board)
-    paid: [u32; 2],    // total contributions, including antes
-    commit: [u32; 2],  // this-round contributions
-    bets: u8,          // bet/raise count this round
-    acted: bool,       // whether a move has been made this round
-    to_act: usize,     // 0 = player one, 1 = player two
-    key: K,            // running infoset-key accumulator
+    round: usize,     // 0 (pre-board) or 1 (post-board)
+    paid: [u32; 2],   // total contributions, including antes
+    commit: [u32; 2], // this-round contributions
+    bets: u8,         // bet/raise count this round
+    acted: bool,      // whether a move has been made this round
+    to_act: usize,    // 0 = player one, 1 = player two
+    key: K,           // running infoset-key accumulator
 }
 
 impl<K: InfoKey> Hand<K> {
@@ -253,9 +253,9 @@ impl<K: InfoKey> Outcomes<Leduc<K>> for Deal<K> {
         match self {
             // every ordered pair of ranks (the weights in `get` account for the copies)
             Deal::Hands(spec) => usize::from(spec.ranks) * usize::from(spec.ranks),
-            Deal::Public(hand) => {
-                (0..hand.spec.ranks).filter(|&rank| hand.copies_left(rank) > 0).count()
-            }
+            Deal::Public(hand) => (0..hand.spec.ranks)
+                .filter(|&rank| hand.copies_left(rank) > 0)
+                .count(),
         }
     }
 
