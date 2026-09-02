@@ -1,6 +1,6 @@
 [package]
 name = "cfr"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Counterfactual regret minimization solver for two-player zero-sum incomplete-information games"
