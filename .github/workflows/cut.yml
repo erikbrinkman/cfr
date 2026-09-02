@@ -1,0 +1,51 @@
+# Cut a release: the sole writer to main -- bump + tag, then dispatch release off the tag.
+name: cut
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write # push the bump + tag
+  actions: write # dispatch release
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    uses: ./.github/workflows/rust.yml
+
+  cut:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main # the branch tip, not the dispatch SHA
+          fetch-depth: 0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release
+      - name: Bump, tag, and trigger release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo release version "${{ inputs.bump }}" --execute --no-confirm
+          version=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "v${version}"
+          # branch first, tag second (never --follow-tags): a moved main is rejected before the tag exists
+          git push origin HEAD:main
+          git tag -a "v${version}" -m "v${version}"
+          git push origin "v${version}"
+          # token-pushed tags don't fire on:push, so dispatch instead
+          gh workflow run release.yml --ref main -f tag="v${version}"
